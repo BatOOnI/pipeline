@@ -3,6 +3,7 @@ import subprocess
 import config
 from contracts import Observation
 
+
 def write_file(path, content):
     parent = os.path.dirname(path)
     if parent:
@@ -18,6 +19,7 @@ def write_file(path, content):
 
     return Observation(True, f"Wrote {path}", changed=(old != content))
 
+
 def normalize_cmd_platform(cmd):
     if isinstance(cmd, list):
         fixed = []
@@ -27,14 +29,17 @@ def normalize_cmd_platform(cmd):
                     x = "python"
             fixed.append(x)
         return fixed
+
     if isinstance(cmd, str):
         return cmd.replace("python3", "python")
+
     return cmd
+
 
 def run_cmd(cmd, cwd=None):
     cmd = normalize_cmd_platform(cmd)
+
     try:
-        # Important: give closed stdin / empty input so interactive CLI apps can exit on EOF
         if isinstance(cmd, list):
             result = subprocess.run(
                 cmd,
@@ -63,8 +68,8 @@ def run_cmd(cmd, cwd=None):
             details=((result.stdout or "") + "\n" + (result.stderr or ""))[:4000]
         )
     except subprocess.TimeoutExpired as e:
-        out = (e.stdout or "") if hasattr(e, "stdout") else ""
-        err = (e.stderr or "") if hasattr(e, "stderr") else ""
+        out = e.stdout or ""
+        err = e.stderr or ""
         return Observation(
             False,
             f"CMD TIMEOUT: {cmd}",

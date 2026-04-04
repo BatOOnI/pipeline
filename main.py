@@ -1,5 +1,4 @@
-from agent_loop import run
+from gui import launch
 
 if __name__ == "__main__":
-    task = input("Task: ")
-    run(task)
+    launch()

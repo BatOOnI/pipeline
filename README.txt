@@ -1,7 +1,20 @@
-v1.8 CLI run and logging fix
+Pipeline GUI v1
 
-Changes:
-- Interactive CLI apps are now run with empty stdin + timeout, so they can exit on EOF instead of hanging forever.
-- Prompt explicitly tells model to include run_cmd when the user asks to run the program.
-- All console output is saved to pipeline_log.txt.
-- run.bat ends with pause again, so the window stays open.
+What is inside:
+- Tkinter GUI
+- modular files
+- provider selection: LM Studio / OpenAI
+- prompt box
+- start / stop
+- live log
+- open log / open project folder
+- Git tools:
+  - init
+  - commit
+  - push
+  - tag + push
+
+Notes:
+- repo default URL is set to https://github.com/BatOOnI/pipeline
+- interactive CLI apps are run with EOF + timeout, so they do not hang forever
+- output is saved to pipeline_log.txt

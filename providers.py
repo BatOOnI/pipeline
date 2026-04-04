@@ -1,14 +1,17 @@
 import requests
 import config
 
+
 def _safe_extract_content(data):
     try:
         return data["choices"][0]["message"]["content"]
     except Exception:
         raise Exception(f"Bad model response shape: {data}")
 
-def call_model(prompt):
+
+def call_model(prompt: str) -> str:
     provider = config.PROVIDER.lower().strip()
+
     if provider == "lmstudio":
         payload = {
             "model": config.LMSTUDIO_MODEL,
@@ -21,7 +24,8 @@ def call_model(prompt):
 
     if provider == "openai":
         if not config.OPENAI_API_KEY.strip():
-            raise Exception("OPENAI_API_KEY is empty in config.py")
+            raise Exception("OPENAI_API_KEY is empty in config.py / GUI field")
+
         headers = {
             "Authorization": f"Bearer {config.OPENAI_API_KEY}",
             "Content-Type": "application/json"

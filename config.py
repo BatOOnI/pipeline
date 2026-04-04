@@ -3,7 +3,7 @@ PROVIDER = "lmstudio"  # "lmstudio" or "openai"
 # LM Studio
 LMSTUDIO_URL = "http://127.0.0.1:1235/v1/chat/completions"
 LMSTUDIO_MODEL = "openai/gpt-oss-20b"
-LMSTUDIO_TIMEOUT = 120
+LMSTUDIO_TIMEOUT = 600
 
 # OpenAI
 OPENAI_API_KEY = ""

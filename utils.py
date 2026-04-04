@@ -2,7 +2,6 @@ import os
 import sys
 import subprocess
 
-
 def ensure_gitignore(repo_dir):
     path = os.path.join(repo_dir, ".gitignore")
     entries = [
@@ -27,7 +26,6 @@ def ensure_gitignore(repo_dir):
                     f.write("\n")
                 f.write(entry + "\n")
                 existing += entry + "\n"
-
 
 def open_path(path):
     try:

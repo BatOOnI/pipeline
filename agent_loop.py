@@ -5,7 +5,6 @@ from providers import call_model
 from parser import parse_response
 from executor import write_file, run_cmd
 
-
 class Tee:
     def __init__(self, *streams):
         self.streams = streams
@@ -18,7 +17,6 @@ class Tee:
     def flush(self):
         for s in self.streams:
             s.flush()
-
 
 def normalize_rel_path(rel_path: str) -> str:
     rel_path = (rel_path or "").replace("/", os.sep).replace("\\", os.sep).strip()
@@ -34,7 +32,6 @@ def normalize_rel_path(rel_path: str) -> str:
                 changed = True
     return rel_path or "app.py"
 
-
 def normalize_cmd_paths(cmd):
     def fix_one(p):
         if not isinstance(p, str):
@@ -48,9 +45,8 @@ def normalize_cmd_paths(cmd):
         return [fix_one(x) for x in cmd]
     return fix_one(cmd)
 
-
 def build_prompt(user_prompt, history):
-    hist = "\n".join(history[-8:]) if history else "None"
+    hist = "\n".join(history[-10:]) if history else "None"
     return f'''
 You are a coding agent.
 
@@ -84,6 +80,7 @@ Rules:
 - For Python commands on Windows, use "python", not "python3"
 - If the user asked to run the program, include run_cmd
 - Interactive CLI programs should still be run once; the executor handles non-interactive stdin/EOF safely
+- If a previous attempt failed, fix it instead of repeating the same broken action
 - If task is complete, return:
 {{
   "plan": "done",
@@ -91,7 +88,6 @@ Rules:
   "actions": []
 }}
 '''.strip()
-
 
 def run(prompt, logger=print, stop_checker=None):
     os.makedirs(config.PROJECT_ROOT, exist_ok=True)
@@ -107,7 +103,9 @@ def run(prompt, logger=print, stop_checker=None):
                 logger(str(msg))
 
         history = []
+        seen = set()
         consecutive_parse_errors = 0
+        empty_done_retry_used = False
 
         for i in range(config.MAX_ITERATIONS):
             if stop_checker and stop_checker():
@@ -126,22 +124,30 @@ def run(prompt, logger=print, stop_checker=None):
                 log(msg)
                 history.append(msg)
                 consecutive_parse_errors += 1
-                if consecutive_parse_errors >= 2:
+                if consecutive_parse_errors >= config.MAX_PARSE_ERRORS:
                     log("STOP: repeated parse errors")
                     break
                 continue
 
             actions = data.get("actions", [])
+            plan = str(data.get("plan", ""))
+
             if not actions:
+                if config.ALLOW_EMPTY_DONE_RETRY and not empty_done_retry_used and i == 0 and "done" in plan.lower():
+                    empty_done_retry_used = True
+                    msg = "EMPTY DONE TOO EARLY -> RETRY. You did nothing yet."
+                    log(msg)
+                    history.append(msg)
+                    continue
                 log("DONE")
                 break
 
-            total_actions = len(actions)
             executed_count = 0
-            had_failure = False
             had_run_cmd = False
+            last_action_ok = True
+            any_success = False
 
-            for a in actions:
+            for idx, a in enumerate(actions):
                 if stop_checker and stop_checker():
                     log("STOP REQUESTED")
                     return log_path
@@ -151,8 +157,16 @@ def run(prompt, logger=print, stop_checker=None):
 
                 if t == "write_file":
                     rel_path = normalize_rel_path(args.get("path", ""))
+                    content = args.get("content", "")
+                    key = ("write_file", rel_path, content)
+
+                    if key in seen:
+                        log(f"SKIP DUP: write_file {rel_path}")
+                        continue
+                    seen.add(key)
+
                     full_path = os.path.join(config.PROJECT_ROOT, rel_path)
-                    obs = write_file(full_path, args.get("content", ""))
+                    obs = write_file(full_path, content)
 
                 elif t == "run_cmd":
                     if not config.AUTO_RUN_COMMANDS:
@@ -160,11 +174,18 @@ def run(prompt, logger=print, stop_checker=None):
                         continue
                     had_run_cmd = True
                     cmd = normalize_cmd_paths(args.get("cmd", ""))
+                    key = ("run_cmd", repr(cmd))
+                    if key in seen:
+                        log(f"SKIP DUP: run_cmd {cmd}")
+                        continue
+                    seen.add(key)
+
                     obs = run_cmd(cmd, cwd=config.PROJECT_ROOT)
 
                 else:
                     log(f"UNKNOWN ACTION: {t}")
-                    had_failure = True
+                    last_action_ok = False
+                    history.append(f"UNKNOWN ACTION: {t}")
                     continue
 
                 executed_count += 1
@@ -174,17 +195,26 @@ def run(prompt, logger=print, stop_checker=None):
 
                 history.append(obs.summary + (" | " + obs.details if obs.details else ""))
 
-                if not obs.ok:
-                    had_failure = True
+                last_action_ok = bool(obs.ok)
+                any_success = any_success or bool(obs.ok)
 
-            all_actions_executed = (executed_count == total_actions) or (not config.AUTO_RUN_COMMANDS and executed_count > 0)
+            if executed_count == 0:
+                log("NO EXECUTED ACTIONS -> STOP")
+                break
 
-            if all_actions_executed and not had_failure:
+            # Key fix:
+            # if final action succeeded, treat iteration as successful even if an earlier
+            # intentional failing step happened first and was then fixed in the same iteration.
+            if last_action_ok:
                 if had_run_cmd:
                     log("SUCCESSFUL RUN -> STOP")
                 else:
                     log("SUCCESSFUL WRITE -> STOP")
                 break
+
+            if any_success:
+                log("PARTIAL PROGRESS -> CONTINUE")
+                continue
 
         log(f"LOG SAVED TO: {log_path}")
         return log_path

@@ -1,20 +1,9 @@
-Pipeline GUI v1
+Pipeline GUI v2
 
-What is inside:
-- Tkinter GUI
-- modular files
-- provider selection: LM Studio / OpenAI
-- prompt box
-- start / stop
-- live log
-- open log / open project folder
-- Git tools:
-  - init
-  - commit
-  - push
-  - tag + push
-
-Notes:
-- repo default URL is set to https://github.com/BatOOnI/pipeline
-- interactive CLI apps are run with EOF + timeout, so they do not hang forever
-- output is saved to pipeline_log.txt
+Fixes added:
+- dedup for repeated write_file / run_cmd
+- skip same-content writes
+- early fake 'done' retry once
+- final successful action in same iteration now ends task correctly
+- GUI kept modular
+- Git panel kept

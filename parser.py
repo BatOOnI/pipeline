@@ -1,13 +1,11 @@
 import json
 import re
 
-
 def _strip_code_fences(text: str) -> str:
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text)
     return text.strip()
-
 
 def _extract_bracketed(text: str) -> str:
     text = _strip_code_fences(text)
@@ -28,7 +26,6 @@ def _extract_bracketed(text: str) -> str:
         raise Exception("PARSE_ERROR: no JSON object or array found")
 
     return max(candidates, key=len)
-
 
 def _convert_legacy_array_format(data):
     actions = []
@@ -54,9 +51,7 @@ def _convert_legacy_array_format(data):
                 cmd = ""
             actions.append({
                 "type": "run_cmd",
-                "args": {
-                    "cmd": cmd
-                }
+                "args": {"cmd": cmd}
             })
 
     return {
@@ -64,7 +59,6 @@ def _convert_legacy_array_format(data):
         "reasoning_short": "legacy array normalized",
         "actions": actions
     }
-
 
 def parse_response(text: str):
     raw = _extract_bracketed(text)

@@ -3,7 +3,7 @@ PROVIDER = "lmstudio"  # "lmstudio" or "openai"
 # LM Studio
 LMSTUDIO_URL = "http://127.0.0.1:1235/v1/chat/completions"
 LMSTUDIO_MODEL = "openai/gpt-oss-20b"
-LMSTUDIO_TIMEOUT = 600
+LMSTUDIO_TIMEOUT = 120
 
 # OpenAI
 OPENAI_API_KEY = ""
@@ -15,6 +15,10 @@ PROJECT_ROOT = "TEST"
 RUN_TIMEOUT = 15
 LOG_FILE = "pipeline_log.txt"
 AUTO_RUN_COMMANDS = True
+
+# Guards
+MAX_PARSE_ERRORS = 2
+ALLOW_EMPTY_DONE_RETRY = True
 
 # Git defaults
 DEFAULT_REMOTE_URL = "https://github.com/BatOOnI/pipeline"

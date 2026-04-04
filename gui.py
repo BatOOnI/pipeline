@@ -11,11 +11,10 @@ from git_tools import (
 )
 from utils import ensure_gitignore, open_path
 
-
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Pipeline GUI v1")
+        self.root.title("Pipeline GUI v2")
         self.root.geometry("980x760")
 
         self.worker = None
@@ -44,7 +43,6 @@ class App:
 
     def _build_ui(self):
         pad = {"padx": 6, "pady": 4}
-
         top = ttk.Frame(self.root)
         top.pack(fill="x", padx=8, pady=8)
 
@@ -86,7 +84,6 @@ class App:
 
         self.status_label = ttk.Label(btn_row, text="Idle")
         self.status_label.pack(side="left", padx=6)
-
         ttk.Button(btn_row, text="Start", command=self.start_pipeline).pack(side="left", padx=6)
         ttk.Button(btn_row, text="Stop", command=self.stop_pipeline).pack(side="left", padx=6)
         ttk.Button(btn_row, text="Open Log", command=self.open_log).pack(side="left", padx=6)
@@ -239,7 +236,6 @@ class App:
         tag_name = self.tag_var.get().strip() or "v1.0-working"
         ok, msg = git_tag(repo_dir, tag_name)
         self._git_log("git tag+push", ok, msg)
-
 
 def launch():
     root = tk.Tk()

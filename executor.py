@@ -3,7 +3,6 @@ import subprocess
 import config
 from contracts import Observation
 
-
 def write_file(path, content):
     parent = os.path.dirname(path)
     if parent:
@@ -14,11 +13,13 @@ def write_file(path, content):
         with open(path, "r", encoding="utf-8") as f:
             old = f.read()
 
+    if old == content:
+        return Observation(True, f"SKIP SAME FILE {path}", changed=False)
+
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
 
-    return Observation(True, f"Wrote {path}", changed=(old != content))
-
+    return Observation(True, f"Wrote {path}", changed=True)
 
 def normalize_cmd_platform(cmd):
     if isinstance(cmd, list):
@@ -34,7 +35,6 @@ def normalize_cmd_platform(cmd):
         return cmd.replace("python3", "python")
 
     return cmd
-
 
 def run_cmd(cmd, cwd=None):
     cmd = normalize_cmd_platform(cmd)

@@ -1,4 +1,5 @@
 @echo off
 cd /d "%~dp0"
-python -m pip install pygame --quiet
+python -m pip install --upgrade pip
+python -m pip install pygame
 pause

@@ -204,6 +204,8 @@ def _normalize_action_object(item):
         args = dict(args)
         if "content" not in args and "new_content" in args:
             args["content"] = args.get("new_content", "")
+        if "content_b64" not in args and "new_content_b64" in args:
+            args["content_b64"] = args.get("new_content_b64", "")
         if "line_number" not in args and "line" in args:
             args["line_number"] = args.get("line")
         if "line_number" not in args and isinstance(args.get("target"), int):
@@ -215,6 +217,8 @@ def _normalize_action_object(item):
         args = dict(args)
         if "content" not in args and "new_content" in args:
             args["content"] = args.get("new_content", "")
+        if "content_b64" not in args and "new_content_b64" in args:
+            args["content_b64"] = args.get("new_content_b64", "")
         if "start_line" not in args and isinstance(args.get("start"), int):
             args["start_line"] = args.get("start")
         if "end_line" not in args and isinstance(args.get("end"), int):

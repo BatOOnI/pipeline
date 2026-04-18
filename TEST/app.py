@@ -46,29 +46,25 @@ class SnakeGame:
             if event.type == pygame.QUIT:
                 pygame.quit()
                 sys.exit()
-
-            if event.type == pygame.KEYDOWN:
-                # ESC toggles pause
-                if event.key == pygame.K_ESCAPE:
-                    self.paused = not getattr(self, "paused", False)
-
-                # Restart immediately after game over
-                if self.game_over and event.key == pygame.K_r:
+            elif event.type == pygame.KEYDOWN and not self.game_over:
+                new_dir = None
+                if event.key == pygame.K_UP:
+                    new_dir = UP
+                elif event.key == pygame.K_DOWN:
+                    new_dir = DOWN
+                elif event.key == pygame.K_LEFT:
+                    new_dir = LEFT
+                elif event.key == pygame.K_RIGHT:
+                    new_dir = RIGHT
+                if new_dir and new_dir != OPPOSITE[self.direction]:
+                    self.direction = new_dir
+            elif event.type == pygame.KEYDOWN and self.game_over:
+                if event.key == pygame.K_r:
                     self.reset()
-                    self.paused = False
-                    return
+                elif event.key == pygame.K_ESCAPE:
+                    pygame.quit()
+                    sys.exit()
 
-                if self.paused or self.game_over:
-                    return
-
-                if event.key == pygame.K_UP and self.direction != DOWN:
-                    self.direction = UP
-                elif event.key == pygame.K_DOWN and self.direction != UP:
-                    self.direction = DOWN
-                elif event.key == pygame.K_LEFT and self.direction != RIGHT:
-                    self.direction = LEFT
-                elif event.key == pygame.K_RIGHT and self.direction != LEFT:
-                    self.direction = RIGHT
     def update(self):
         if self.game_over:
             return
@@ -104,16 +100,9 @@ class SnakeGame:
         pygame.draw.rect(self.screen, (255, 0, 0), rect)
 
     def draw_score(self):
-        # Score + current speed HUD
-        speed_text = f"Speed: {self.speed}"
-        score_text = f"Score: {self.score}"
-        self.screen.blit(self.font.render(score_text, True, (255, 255, 255)), (10, 10))
-        self.screen.blit(self.font.render(speed_text, True, (255, 255, 255)), (10, 45))
+        text = self.font.render(f"Score: {self.score}", True, (255, 255, 255))
+        self.screen.blit(text, (10, 10))
 
-        # Optional pause indicator
-        if getattr(self, "paused", False) and not self.game_over:
-            pause_text = "Paused (ESC to resume)"
-            self.screen.blit(self.font.render(pause_text, True, (255, 255, 0)), (WINDOW_WIDTH // 2 - 200, WINDOW_HEIGHT // 2 - 20))
     def draw_game_over(self):
         overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 180))
@@ -126,39 +115,6 @@ class SnakeGame:
         self.screen.blit(msg3, ((WINDOW_WIDTH - msg3.get_width()) // 2, WINDOW_HEIGHT // 2 + 20))
 
     def run(self):
-        # Ensure pause attribute exists
-        if not hasattr(self, "paused"):
-            self.paused = False
-
-        while True:
-            self.handle_input()
-
-            # If paused, still render current frame
-            if getattr(self, "paused", False) and not self.game_over:
-                self.screen.fill((0, 0, 0))
-                self.draw_grid()
-                self.draw_snake()
-                self.draw_food()
-                self.draw_score()
-                pygame.display.flip()
-                self.clock.tick(self.speed)
-                continue
-
-            if not self.game_over:
-                self.update()
-
-            # Render
-            self.screen.fill((0, 0, 0))
-            self.draw_grid()
-            self.draw_snake()
-            self.draw_food()
-            self.draw_score()
-
-            if self.game_over:
-                self.draw_game_over()
-
-            pygame.display.flip()
-            self.clock.tick(self.speed)
         while True:
             self.handle_input()
             self.update()

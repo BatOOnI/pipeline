@@ -739,6 +739,8 @@ def build_instruction_bits(
             "- Use patch_lines only as a legacy fallback.",
             "- Use write_file only for small full-file rewrites.",
             "- If full rewrite is needed for a large file, use chunked rewrite protocol: begin_file_rewrite, then append_file_chunk parts in order, then finalize_file_rewrite.",
+            "- For medium/large code payloads with quotes/newlines, prefer safe transport fields: content_b64 / old_b64 / new_b64.",
+            "- Keep small/simple edits as plain text when safe; use b64 for bigger blocks to avoid JSON escaping failures.",
             "- For Python replace_block on methods/classes, return a complete valid block body with correct indentation.",
             "- Do not return truncated or partial method fragments.",
             "- Prefer fewer, self-contained method/class replacements over many tiny risky edits.",
@@ -1040,6 +1042,7 @@ def _normalize_action(action, state):
             "args": {
                 "path": _sanitize_action_path(args.get("path"), state),
                 "content": str(args.get("content", "")),
+                "content_b64": args.get("content_b64"),
             },
         }
 
@@ -1050,6 +1053,8 @@ def _normalize_action(action, state):
                 "path": _sanitize_action_path(args.get("path"), state),
                 "old": str(args.get("old", "")),
                 "new": str(args.get("new", "")),
+                "old_b64": args.get("old_b64"),
+                "new_b64": args.get("new_b64"),
             },
         }
 
@@ -1074,6 +1079,7 @@ def _normalize_action(action, state):
                 "path": _sanitize_action_path(args.get("path"), state),
                 "anchor": str(args.get("anchor", fallback_anchor)),
                 "content": str(args.get("content", args.get("new_content", ""))),
+                "content_b64": args.get("content_b64", args.get("new_content_b64")),
                 "line_number": args.get("line_number", args.get("line")),
             },
         }
@@ -1092,6 +1098,7 @@ def _normalize_action(action, state):
                 "start_anchor": str(args.get("start_anchor", start_fallback)),
                 "end_anchor": str(args.get("end_anchor", end_fallback)),
                 "content": str(args.get("content", args.get("new_content", ""))),
+                "content_b64": args.get("content_b64", args.get("new_content_b64")),
                 "start_line": args.get("start_line"),
                 "end_line": args.get("end_line"),
             },
@@ -1113,6 +1120,7 @@ def _normalize_action(action, state):
                 "path": _sanitize_action_path(args.get("path"), state),
                 "part": args.get("part", args.get("index")),
                 "content": str(args.get("content", args.get("chunk", ""))),
+                "content_b64": args.get("content_b64"),
             },
         }
 
@@ -1164,6 +1172,7 @@ def _execute_action(action, state, project_root_override=None):
             project_root=project_root,
             patch_mode=(state.mode == "patch"),
             allow_create=(state.mode != "patch"),
+            content_b64=args.get("content_b64"),
         )
 
     if action_type == "replace_in_file":
@@ -1172,6 +1181,8 @@ def _execute_action(action, state, project_root_override=None):
             args.get("old", ""),
             args.get("new", ""),
             project_root=project_root,
+            old_b64=args.get("old_b64"),
+            new_b64=args.get("new_b64"),
         )
 
     if action_type == "insert_before":
@@ -1181,6 +1192,7 @@ def _execute_action(action, state, project_root_override=None):
             args.get("content", ""),
             project_root=project_root,
             line_number=args.get("line_number"),
+            content_b64=args.get("content_b64"),
         )
 
     if action_type == "insert_after":
@@ -1190,6 +1202,7 @@ def _execute_action(action, state, project_root_override=None):
             args.get("content", ""),
             project_root=project_root,
             line_number=args.get("line_number"),
+            content_b64=args.get("content_b64"),
         )
 
     if action_type == "replace_block":
@@ -1202,6 +1215,7 @@ def _execute_action(action, state, project_root_override=None):
             start_line=args.get("start_line"),
             end_line=args.get("end_line"),
             new_content=args.get("new_content"),
+            content_b64=args.get("content_b64"),
         )
 
     if action_type == "patch_lines":
@@ -1228,6 +1242,7 @@ def _execute_action(action, state, project_root_override=None):
             args.get("part"),
             args.get("content", ""),
             project_root=project_root,
+            content_b64=args.get("content_b64"),
         )
 
     if action_type == "finalize_file_rewrite":

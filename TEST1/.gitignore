@@ -7,3 +7,10 @@ def calc():
 if __name__ == "__main__":
   print(griet())
   print(calc())
+__pycache__/
+*.pyc
+.agent/
+_tmp_validation/
+pipeline_log.txt
+.env
+.venv/

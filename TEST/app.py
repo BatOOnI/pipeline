@@ -24,19 +24,7 @@ class SnakeGame:
         pygame.display.set_caption("Snake")
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont(None, 36)
-        self.high_score = self.load_high_score()
         self.reset()
-
-    def load_high_score(self):
-        try:
-            with open("highscore.txt", "r") as f:
-                return int(f.read().strip())
-        except:
-            return 0
-
-    def save_high_score(self):
-        with open("highscore.txt", "w") as f:
-            f.write(str(self.high_score))
 
     def reset(self):
         self.snake = [(GRID_WIDTH // 2, GRID_HEIGHT // 2)]
@@ -46,7 +34,6 @@ class SnakeGame:
         self.fruits_eaten = 0
         self.speed = FPS_START
         self.game_over = False
-        self.paused = False
 
     def spawn_food(self):
         while True:
@@ -59,65 +46,44 @@ class SnakeGame:
             if event.type == pygame.QUIT:
                 pygame.quit()
                 sys.exit()
+            elif event.type == pygame.KEYDOWN and not self.game_over:
+                new_dir = None
+                if event.key == pygame.K_UP:
+                    new_dir = UP
+                elif event.key == pygame.K_DOWN:
+                    new_dir = DOWN
+                elif event.key == pygame.K_LEFT:
+                    new_dir = LEFT
+                elif event.key == pygame.K_RIGHT:
+                    new_dir = RIGHT
+                if new_dir and new_dir != OPPOSITE[self.direction]:
+                    self.direction = new_dir
+            elif event.type == pygame.KEYDOWN and self.game_over:
+                if event.key == pygame.K_r:
+                    self.reset()
+                elif event.key == pygame.K_ESCAPE:
+                    pygame.quit()
+                    sys.exit()
 
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    # Toggle pause
-                    self.paused = not getattr(self, "paused", False)
-                    if self.paused:
-                        self.game_over = False
-                    continue
-
-                if getattr(self, "paused", False):
-                    # Ignore direction changes while paused
-                    continue
-
-                if event.key == pygame.K_UP and self.direction != DOWN:
-                    self.direction = UP
-                elif event.key == pygame.K_DOWN and self.direction != UP:
-                    self.direction = DOWN
-                elif event.key == pygame.K_LEFT and self.direction != RIGHT:
-                    self.direction = LEFT
-                elif event.key == pygame.K_RIGHT and self.direction != LEFT:
-                    self.direction = RIGHT
     def update(self):
-        # Move snake
-        self.snake.insert(0, (self.snake[0][0] + self.direction[0], self.snake[0][1] + self.direction[1]))
-
-        # Wrap around walls (instead of game over)
-        x, y = self.snake[0]
-        if x < 0:
-            x = GRID_WIDTH - 1
-        elif x >= GRID_WIDTH:
-            x = 0
-        if y < 0:
-            y = GRID_HEIGHT - 1
-        elif y >= GRID_HEIGHT:
-            y = 0
-        self.snake[0] = (x, y)
-
-        # Check self collision
-        if self.snake[0] in self.snake[1:]:
-            self.game_over = True
-            self.paused = False
+        if self.game_over:
             return
-
-        # Check food
-        if self.snake[0] == self.food:
+        head_x, head_y = self.snake[0]
+        dir_x, dir_y = self.direction
+        new_head = ((head_x + dir_x) % GRID_WIDTH, (head_y + dir_y) % GRID_HEIGHT)
+        if new_head in self.snake:
+            self.game_over = True
+            return
+        self.snake.insert(0, new_head)
+        if new_head == self.food:
             self.score += 1
-            if self.score > self.high_score:
-                self.high_score = self.score
-                self.save_high_score()
-            self.spawn_food()
-
-            # Increase speed gradually
-            self.speed = min(30, self.speed + 1)
+            self.fruits_eaten += 1
+            self.food = self.spawn_food()
+            if self.fruits_eaten % SPEED_INCREASE_INTERVAL == 0:
+                self.speed += 1
         else:
             self.snake.pop()
 
-        # If paused, don't advance game state further
-        if getattr(self, "paused", False):
-            return
     def draw_grid(self):
         for x in range(0, WINDOW_WIDTH, CELL_SIZE):
             pygame.draw.line(self.screen, (40, 40, 40), (x, 0), (x, WINDOW_HEIGHT))
@@ -126,53 +92,29 @@ class SnakeGame:
 
     def draw_snake(self):
         for segment in self.snake:
-            rect = pygame.Rect(segment[0] * CELL_SIZE, segment[1] * CELL_SIZE, CELL_SIZE, CELL_SIZE)
+            rect = pygame.Rect(segment[0]*CELL_SIZE, segment[1]*CELL_SIZE, CELL_SIZE, CELL_SIZE)
             pygame.draw.rect(self.screen, (0, 255, 0), rect)
-            pygame.draw.rect(self.screen, (0, 200, 0), rect, 1)
 
     def draw_food(self):
-        rect = pygame.Rect(self.food[0] * CELL_SIZE, self.food[1] * CELL_SIZE, CELL_SIZE, CELL_SIZE)
+        rect = pygame.Rect(self.food[0]*CELL_SIZE, self.food[1]*CELL_SIZE, CELL_SIZE, CELL_SIZE)
         pygame.draw.rect(self.screen, (255, 0, 0), rect)
 
     def draw_score(self):
-        score_text = self.font.render(f"Score: {self.score}", True, (255, 255, 255))
-        high_score_text = self.font.render(f"High Score: {self.high_score}", True, (255, 255, 255))
-        speed_text = self.font.render(f"Speed: {self.speed}", True, (255, 255, 255))
-        self.screen.blit(score_text, (10, 10))
-        self.screen.blit(high_score_text, (10, 50))
-        self.screen.blit(speed_text, (10, 90))
+        text = self.font.render(f"Score: {self.score}", True, (255, 255, 255))
+        self.screen.blit(text, (10, 10))
 
     def draw_game_over(self):
-        # Draw PAUSE overlay when paused
-        if getattr(self, "paused", False):
-            pause_text = self.font.render("PAUSE", True, (255, 255, 255))
-            pause_rect = pause_text.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2))
-            self.screen.blit(pause_text, pause_rect)
-            return
+        overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 180))
+        self.screen.blit(overlay, (0, 0))
+        msg1 = self.font.render("Game Over", True, (255, 255, 255))
+        msg2 = self.font.render(f"Final Score: {self.score}", True, (255, 255, 255))
+        msg3 = self.font.render("Press R to Restart or Esc to Exit", True, (255, 255, 255))
+        self.screen.blit(msg1, ((WINDOW_WIDTH - msg1.get_width()) // 2, WINDOW_HEIGHT // 2 - 60))
+        self.screen.blit(msg2, ((WINDOW_WIDTH - msg2.get_width()) // 2, WINDOW_HEIGHT // 2 - 20))
+        self.screen.blit(msg3, ((WINDOW_WIDTH - msg3.get_width()) // 2, WINDOW_HEIGHT // 2 + 20))
 
-        if self.game_over:
-            self.screen.fill((0, 0, 0))
-            game_over_text = self.font.render("Game Over", True, (255, 0, 0))
-            score_text = self.font.render(f"Score: {self.score}", True, (255, 255, 255))
-            high_score_text = self.font.render(f"High Score: {self.high_score}", True, (255, 255, 255))
-
-            self.screen.blit(game_over_text, game_over_text.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 - 40)))
-            self.screen.blit(score_text, score_text.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2)))
-            self.screen.blit(high_score_text, high_score_text.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 + 40)))
     def run(self):
-        while True:
-            self.handle_input()
-            self.update()
-            self.screen.fill((0, 0, 0))
-            self.draw_grid()
-            self.draw_snake()
-            self.draw_food()
-            self.draw_score()
-            if self.game_over:
-                self.draw_game_over()
-            pygame.display.flip()
-            self.clock.tick(self.speed)
-def run(self):
         while True:
             self.handle_input()
             self.update()

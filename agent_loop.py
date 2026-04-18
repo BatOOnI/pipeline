@@ -2,17 +2,26 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import unicodedata
+import uuid
+import ast
 from dataclasses import dataclass, field
 
 import config
 from executor import (
+    append_file_chunk,
+    begin_file_rewrite,
+    finalize_file_rewrite,
     find_in_file,
+    insert_after,
+    insert_before,
     mkdir,
     patch_lines,
     read_file_snippet,
     replace_in_file,
+    replace_block,
     run_cmd,
     verify_touched_paths,
     write_file,
@@ -67,7 +76,23 @@ BLOCKED_TARGET_TOKENS = {
     "stderr",
     "stdout",
 }
-PROGRESS_TOOLS = {"write_file", "replace_in_file", "patch_lines"}
+PROGRESS_TOOLS = {
+    "write_file",
+    "replace_in_file",
+    "insert_before",
+    "insert_after",
+    "replace_block",
+    "patch_lines",
+    "finalize_file_rewrite",
+}
+ATOMIC_PATCH_FILE_ACTIONS = {
+    "write_file",
+    "replace_in_file",
+    "insert_before",
+    "insert_after",
+    "replace_block",
+    "patch_lines",
+}
 
 
 class Tee:
@@ -133,6 +158,15 @@ def _configured_root_path():
     raw = (config.PROJECT_ROOT or "TEST").strip()
     if not raw:
         raw = "TEST"
+    if os.path.isabs(raw):
+        return os.path.abspath(raw)
+    return os.path.abspath(os.path.join(os.getcwd(), raw))
+
+
+def _explicit_configured_root_path():
+    raw = str(config.PROJECT_ROOT or "").strip()
+    if not raw:
+        return ""
     if os.path.isabs(raw):
         return os.path.abspath(raw)
     return os.path.abspath(os.path.join(os.getcwd(), raw))
@@ -409,7 +443,9 @@ def _hydrate_state_from_session(state, session_data):
         return
 
     session_root = str(session_data.get("project_root", "")).strip()
-    if state.mode != "create" and session_root and os.path.isdir(session_root):
+    configured_root = _explicit_configured_root_path()
+    explicit_gui_root = bool(configured_root)
+    if not explicit_gui_root and state.mode != "create" and session_root and os.path.isdir(session_root):
         state.active_project_root = session_root
 
     state.touched_files = list(session_data.get("touched_files") or [])
@@ -463,7 +499,11 @@ def _build_state(user_prompt):
     previous_prompt = str(session_data.get("prompt") or session_data.get("goal") or "")
     prompt_changed = bool(previous_prompt and previous_prompt.strip() != (user_prompt or "").strip())
     session_root = str(session_data.get("project_root", "")).strip()
-    if mode != "create" and session_root and os.path.isdir(session_root):
+    configured_root = _explicit_configured_root_path()
+    explicit_gui_root = bool(configured_root)
+    if explicit_gui_root and (mode == "create" or os.path.isdir(configured_root)):
+        active_project_root = configured_root
+    elif mode != "create" and session_root and os.path.isdir(session_root):
         active_project_root = session_root
     else:
         active_project_root = _choose_project_root(mode)
@@ -517,6 +557,144 @@ def _compact_history(history, level):
     return truncate_middle(joined, history_chars)
 
 
+def _read_target_text(path, project_root):
+    try:
+        abs_path = os.path.abspath(os.path.join(project_root, path))
+        with open(abs_path, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except Exception:
+        return ""
+
+
+def _python_outline_items(content):
+    try:
+        tree = ast.parse(content or "")
+    except Exception:
+        return []
+
+    items = []
+    lines = (content or "").splitlines()
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            header = lines[node.lineno - 1].strip() if 0 < node.lineno <= len(lines) else f"class {node.name}"
+            items.append((node.lineno, header))
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    child_header = lines[child.lineno - 1].strip() if 0 < child.lineno <= len(lines) else f"def {child.name}"
+                    items.append((child.lineno, child_header))
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            header = lines[node.lineno - 1].strip() if 0 < node.lineno <= len(lines) else f"def {node.name}"
+            items.append((node.lineno, header))
+    return items
+
+
+def _generic_outline_items(content):
+    items = []
+    for index, raw_line in enumerate((content or "").splitlines(), 1):
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        if len(stripped) > 120:
+            continue
+        if stripped.startswith(("#", "##", "###", "[", "{", "<section", "<div", "<main", "<header", "<footer", "function ", "const ", "let ", "var ", "export ", ".",
+                               "@", "body", "if ", "for ", "while ")):
+            items.append((index, stripped))
+            continue
+        if re.match(r"^[A-Za-z0-9_.-]+\s*[:={]", stripped):
+            items.append((index, stripped))
+            continue
+    return items
+
+
+def _discover_file_outline(path, project_root, max_items=18):
+    content = _read_target_text(path, project_root)
+    if not content:
+        return []
+    extension = os.path.splitext(str(path))[1].lower()
+    if extension == ".py":
+        items = _python_outline_items(content)
+    else:
+        items = _generic_outline_items(content)
+    unique = []
+    seen = set()
+    for line_no, text in items:
+        key = (line_no, text)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((line_no, text))
+        if len(unique) >= max_items:
+            break
+    return unique
+
+
+def _discover_real_anchors(path, project_root, max_items=12):
+    outline = _discover_file_outline(path, project_root, max_items=max_items)
+    anchors = []
+    seen = set()
+    for _, text in outline:
+        if text in seen:
+            continue
+        seen.add(text)
+        anchors.append(text)
+        if len(anchors) >= max_items:
+            break
+    return anchors
+
+
+def _keyword_tokens(text):
+    lower = _normalize_prompt_text(text)
+    return [token for token in re.findall(r"[a-zA-Z_]{3,}", lower) if token not in {"the", "and", "for", "with", "this", "that", "plik", "file"}]
+
+
+def _focused_patch_snippets(path, project_root, user_prompt, max_lines):
+    content = _read_target_text(path, project_root)
+    if not content:
+        return "(snippet unavailable)"
+    lines = content.splitlines()
+    tokens = _keyword_tokens(user_prompt)
+    hit_lines = []
+    for index, line in enumerate(lines, 1):
+        lowered = _normalize_prompt_text(line)
+        if any(token in lowered for token in tokens):
+            hit_lines.append(index)
+        if len(hit_lines) >= 2:
+            break
+
+    outline = _discover_file_outline(path, project_root, max_items=8)
+    if not hit_lines and outline:
+        hit_lines = [line_no for line_no, _ in outline[:2]]
+
+    snippets = []
+    seen = set()
+    for line_no in hit_lines[:2]:
+        snippet = read_file_snippet(path, project_root=project_root, max_lines=max(12, max_lines // 2), around_line=line_no)
+        if snippet not in seen:
+            seen.add(snippet)
+            snippets.append(snippet)
+
+    if not snippets:
+        return read_file_snippet(path, project_root=project_root, max_lines=max_lines)
+    return "\n\n".join(snippets)
+
+
+def _grounded_patch_retry_context(path, project_root, user_prompt):
+    outline_items = _discover_file_outline(path, project_root, max_items=10)
+    anchor_items = _discover_real_anchors(path, project_root, max_items=8)
+    snippet = _focused_patch_snippets(path, project_root, user_prompt, max(30, config.PATCH_SNIPPET_LINES))
+    parts = [
+        "Real file outline:",
+        "\n".join(f"- L{line_no}: {text}" for line_no, text in outline_items) or "(outline unavailable)",
+        "",
+        "Real anchors from file:",
+        "\n".join(f'- "{text}"' for text in anchor_items) or "(anchors unavailable)",
+        "",
+        "Focused snippets:",
+        snippet or "(snippet unavailable)",
+    ]
+    return "\n".join(parts)
+
+
 def build_instruction_bits(
     user_prompt,
     *,
@@ -524,6 +702,8 @@ def build_instruction_bits(
     project_root="",
     target_files=None,
     active_patch_target="",
+    file_outline="",
+    real_anchors="",
     file_snippet="",
     last_error="",
     history=None,
@@ -547,14 +727,34 @@ def build_instruction_bits(
             "Return ONLY compact JSON:",
             '{"plan":"short plan","reasoning_short":"short reason","actions":[{"type":"replace_in_file","args":{"path":"app.py","old":"x","new":"y"}}]}',
             "",
-            "Allowed actions: write_file, replace_in_file, patch_lines, find_in_file, run_cmd",
+            "Allowed actions: replace_in_file, insert_before, insert_after, replace_block, begin_file_rewrite, append_file_chunk, finalize_file_rewrite, write_file, patch_lines, find_in_file, run_cmd",
             "Rules:",
             "- Default to one existing file.",
-            "- For single-file patch tasks, strongly prefer exactly one write_file action for the full corrected active target file.",
-            "- Use patch_lines only when you can return strict valid JSON with exact line numbers.",
-            "- Use write_file when a weaker local model might struggle with fragile patch_lines JSON.",
+            "- For single-file patch tasks, use patch-first strategy in this order: replace_in_file, insert_before, insert_after, replace_block, write_file fallback only if necessary.",
+            "- Prefer 1-3 small anchored edits for weaker local models.",
+            "- Use only one strategy family per iteration. Do not mix anchored edits with rewrite strategy in the same reply unless absolutely necessary.",
+            "- Use ONLY anchors that appear in the provided real outline, real anchors, or focused snippets.",
+            "- Prefer exact anchor strings copied from the provided file data. Do not invent function or method names.",
+            "- Do not use line_number, start_line, or end_line unless absolutely necessary.",
+            "- Use patch_lines only as a legacy fallback.",
+            "- Use write_file only for small full-file rewrites.",
+            "- If full rewrite is needed for a large file, use chunked rewrite protocol: begin_file_rewrite, then append_file_chunk parts in order, then finalize_file_rewrite.",
+            "- For Python replace_block on methods/classes, return a complete valid block body with correct indentation.",
+            "- Do not return truncated or partial method fragments.",
+            "- Prefer fewer, self-contained method/class replacements over many tiny risky edits.",
+            "- If replacing a Python method, include the full method implementation for that method in one coherent block.",
             "- Do not create folders or new files unless the user clearly asked for that.",
             "- Do not overwrite the whole file with a tiny fragment.",
+            "Examples:",
+            '{"type":"insert_after","args":{"path":"app.py","anchor":"def main():\\n","content":"    print(\\"ready\\")\\n"}}',
+            '{"type":"insert_before","args":{"path":"app.py","anchor":"if __name__ == \\"__main__\\":\\n","content":"\\n# launcher\\n"}}',
+            '{"type":"replace_block","args":{"path":"app.py","start_anchor":"    old = 1\\n","end_anchor":"    print(old)\\n","content":"    old = 2\\n    bonus = 3\\n"}}',
+            "",
+            "Real file outline:",
+            file_outline or "(outline unavailable)",
+            "",
+            "Real anchors from file:",
+            real_anchors or "(anchors unavailable)",
             "",
             "Target file snippet:",
             file_snippet or "(snippet unavailable)",
@@ -575,7 +775,7 @@ def build_instruction_bits(
         "Return ONLY JSON with this exact shape:",
         '{"plan":"short plan","reasoning_short":"short reason","actions":[{"type":"write_file","args":{"path":"app.py","content":"print(\\"Hello World\\")"}}]}',
         "",
-            "Allowed actions: write_file, replace_in_file, patch_lines, find_in_file, run_cmd, mkdir",
+            "Allowed actions: write_file, replace_in_file, insert_before, insert_after, replace_block, begin_file_rewrite, append_file_chunk, finalize_file_rewrite, patch_lines, find_in_file, run_cmd, mkdir",
             "Rules:",
             "- All file paths must stay inside the project root.",
             "- Prefer writing project files inside this run's folder.",
@@ -592,11 +792,18 @@ def build_instruction_bits(
 def build_prompt(user_prompt, history, state):
     snippet_lines, _, _ = _prompt_budget(state.prompt_compaction_level)
     file_snippet = ""
+    file_outline = ""
+    real_anchors = ""
     if state.mode == "patch" and state.active_patch_target:
-        file_snippet = read_file_snippet(
+        outline_items = _discover_file_outline(state.active_patch_target, state.active_project_root)
+        anchor_items = _discover_real_anchors(state.active_patch_target, state.active_project_root)
+        file_outline = "\n".join(f"- L{line_no}: {text}" for line_no, text in outline_items[:18])
+        real_anchors = "\n".join(f'- "{text}"' for text in anchor_items[:12])
+        file_snippet = _focused_patch_snippets(
             state.active_patch_target,
-            project_root=state.active_project_root,
-            max_lines=snippet_lines,
+            state.active_project_root,
+            user_prompt,
+            snippet_lines,
         )
 
     bits = build_instruction_bits(
@@ -605,6 +812,8 @@ def build_prompt(user_prompt, history, state):
         project_root=state.active_project_root,
         target_files=state.target_files,
         active_patch_target=state.active_patch_target,
+        file_outline=file_outline,
+        real_anchors=real_anchors,
         file_snippet=file_snippet,
         last_error=truncate_middle(state.last_runtime_error, 1800),
         history=history,
@@ -619,10 +828,15 @@ def build_prompt(user_prompt, history, state):
     state.prompt_compaction_level += 1
     snippet_lines, _, _ = _prompt_budget(state.prompt_compaction_level)
     if state.mode == "patch" and state.active_patch_target:
-        file_snippet = read_file_snippet(
+        outline_items = _discover_file_outline(state.active_patch_target, state.active_project_root, max_items=12)
+        anchor_items = _discover_real_anchors(state.active_patch_target, state.active_project_root, max_items=8)
+        file_outline = "\n".join(f"- L{line_no}: {text}" for line_no, text in outline_items[:12])
+        real_anchors = "\n".join(f'- "{text}"' for text in anchor_items[:8])
+        file_snippet = _focused_patch_snippets(
             state.active_patch_target,
-            project_root=state.active_project_root,
-            max_lines=snippet_lines,
+            state.active_project_root,
+            user_prompt,
+            snippet_lines,
         )
     bits = build_instruction_bits(
         user_prompt,
@@ -630,6 +844,8 @@ def build_prompt(user_prompt, history, state):
         project_root=state.active_project_root,
         target_files=state.target_files,
         active_patch_target=state.active_patch_target,
+        file_outline=truncate_middle(file_outline, limit // 5),
+        real_anchors=truncate_middle(real_anchors, limit // 6),
         file_snippet=truncate_middle(file_snippet, limit // 2),
         last_error=truncate_middle(state.last_runtime_error, limit // 5),
         history=history[-2:],
@@ -658,6 +874,115 @@ def _reset_stuck_state(state):
     state.duplicate_action_cache.clear()
     state.last_plan_fingerprint = ""
     state.stuck_iterations = 0
+
+
+def _build_atomic_patch_stage(actions, state):
+    if state.mode != "patch":
+        return None
+
+    counts = {}
+    ordered_paths = []
+    for action in actions:
+        action_type = str(action.get("type", "")).strip()
+        if action_type not in ATOMIC_PATCH_FILE_ACTIONS:
+            continue
+        rel_path = str(action.get("args", {}).get("path", "")).strip()
+        if not rel_path:
+            continue
+        counts[rel_path] = counts.get(rel_path, 0) + 1
+        if rel_path not in ordered_paths:
+            ordered_paths.append(rel_path)
+
+    staged_paths = [path for path in ordered_paths if counts.get(path, 0) > 1]
+    if not staged_paths:
+        return None
+
+    base_dir = os.path.join(state.active_project_root, ".agent", "iteration_stage")
+    os.makedirs(base_dir, exist_ok=True)
+    stage_root = os.path.join(base_dir, f"iter_{state.iteration_count}_{uuid.uuid4().hex[:8]}")
+    os.makedirs(stage_root, exist_ok=True)
+
+    for rel_path in staged_paths:
+        src = os.path.join(state.active_project_root, rel_path)
+        dst = os.path.join(stage_root, rel_path)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.exists(src):
+            shutil.copyfile(src, dst)
+
+    return {
+        "root": stage_root,
+        "paths": staged_paths,
+        "path_set": set(staged_paths),
+    }
+
+
+def _cleanup_atomic_patch_stage(stage_context):
+    if not stage_context:
+        return
+    try:
+        shutil.rmtree(stage_context.get("root", ""), ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _stage_action_project_root(action, state, stage_context):
+    if not stage_context or state.mode != "patch":
+        return state.active_project_root
+    action_type = str(action.get("type", "")).strip()
+    rel_path = str(action.get("args", {}).get("path", "")).strip()
+    if action_type in ATOMIC_PATCH_FILE_ACTIONS and rel_path in stage_context.get("path_set", set()):
+        return stage_context["root"]
+    return state.active_project_root
+
+
+def _commit_atomic_patch_stage(stage_context, state, log):
+    touched_paths = []
+    created_files = []
+    error_message = ""
+
+    if not stage_context:
+        return touched_paths, created_files, error_message
+
+    staged_verify = verify_touched_paths(
+        stage_context.get("paths", []),
+        project_root=stage_context["root"],
+        smoke_run=False,
+    )
+    if staged_verify.summary:
+        log("STAGED " + staged_verify.summary)
+    if staged_verify.details:
+        log(staged_verify.details)
+    if not staged_verify.ok:
+        error_message = staged_verify.details or staged_verify.summary
+        return touched_paths, created_files, error_message
+
+    for rel_path in stage_context.get("paths", []):
+        staged_path = os.path.join(stage_context["root"], rel_path)
+        if not os.path.exists(staged_path):
+            continue
+        with open(staged_path, "r", encoding="utf-8") as handle:
+            staged_content = handle.read()
+        existed_before = os.path.exists(os.path.join(state.active_project_root, rel_path))
+        observation = write_file(
+            rel_path,
+            staged_content,
+            project_root=state.active_project_root,
+            patch_mode=True,
+            allow_create=False,
+        )
+        if not observation.ok:
+            log(observation.summary)
+            if observation.details:
+                log(observation.details)
+            error_message = observation.details or observation.summary
+            break
+        if observation.changed:
+            log(f"ATOMIC COMMIT {rel_path}")
+            touched_paths.append(rel_path)
+            if not existed_before:
+                created_files.append(rel_path)
+
+    return touched_paths, created_files, error_message
 
 
 def _hard_rescue_handoff(state, history, log, reason):
@@ -735,7 +1060,67 @@ def _normalize_action(action, state):
                 "path": _sanitize_action_path(args.get("path"), state),
                 "start_line": args.get("start_line"),
                 "end_line": args.get("end_line"),
-                "new_content": str(args.get("new_content", "")),
+                "new_content": str(args.get("new_content", args.get("content", ""))),
+            },
+        }
+
+    if action_type in {"insert_before", "insert_after"}:
+        fallback_anchor = args.get("target", "")
+        if isinstance(fallback_anchor, int):
+            fallback_anchor = ""
+        return {
+            "type": action_type,
+            "args": {
+                "path": _sanitize_action_path(args.get("path"), state),
+                "anchor": str(args.get("anchor", fallback_anchor)),
+                "content": str(args.get("content", args.get("new_content", ""))),
+                "line_number": args.get("line_number", args.get("line")),
+            },
+        }
+
+    if action_type == "replace_block":
+        start_fallback = args.get("start", "")
+        end_fallback = args.get("end", "")
+        if isinstance(start_fallback, int):
+            start_fallback = ""
+        if isinstance(end_fallback, int):
+            end_fallback = ""
+        return {
+            "type": action_type,
+            "args": {
+                "path": _sanitize_action_path(args.get("path"), state),
+                "start_anchor": str(args.get("start_anchor", start_fallback)),
+                "end_anchor": str(args.get("end_anchor", end_fallback)),
+                "content": str(args.get("content", args.get("new_content", ""))),
+                "start_line": args.get("start_line"),
+                "end_line": args.get("end_line"),
+            },
+        }
+
+    if action_type == "begin_file_rewrite":
+        return {
+            "type": action_type,
+            "args": {
+                "path": _sanitize_action_path(args.get("path"), state),
+                "expected_parts": args.get("expected_parts", args.get("parts")),
+            },
+        }
+
+    if action_type == "append_file_chunk":
+        return {
+            "type": action_type,
+            "args": {
+                "path": _sanitize_action_path(args.get("path"), state),
+                "part": args.get("part", args.get("index")),
+                "content": str(args.get("content", args.get("chunk", ""))),
+            },
+        }
+
+    if action_type == "finalize_file_rewrite":
+        return {
+            "type": action_type,
+            "args": {
+                "path": _sanitize_action_path(args.get("path"), state),
             },
         }
 
@@ -767,10 +1152,10 @@ def _normalize_action(action, state):
     return {"type": action_type, "args": args}
 
 
-def _execute_action(action, state):
+def _execute_action(action, state, project_root_override=None):
     action_type = action.get("type")
     args = action.get("args", {})
-    project_root = state.active_project_root
+    project_root = project_root_override or state.active_project_root
 
     if action_type == "write_file":
         return write_file(
@@ -789,6 +1174,36 @@ def _execute_action(action, state):
             project_root=project_root,
         )
 
+    if action_type == "insert_before":
+        return insert_before(
+            args.get("path", ""),
+            args.get("anchor", ""),
+            args.get("content", ""),
+            project_root=project_root,
+            line_number=args.get("line_number"),
+        )
+
+    if action_type == "insert_after":
+        return insert_after(
+            args.get("path", ""),
+            args.get("anchor", ""),
+            args.get("content", ""),
+            project_root=project_root,
+            line_number=args.get("line_number"),
+        )
+
+    if action_type == "replace_block":
+        return replace_block(
+            args.get("path", ""),
+            args.get("start_anchor", ""),
+            args.get("end_anchor", ""),
+            args.get("content", ""),
+            project_root=project_root,
+            start_line=args.get("start_line"),
+            end_line=args.get("end_line"),
+            new_content=args.get("new_content"),
+        )
+
     if action_type == "patch_lines":
         return patch_lines(
             args.get("path", ""),
@@ -796,6 +1211,31 @@ def _execute_action(action, state):
             args.get("end_line"),
             args.get("new_content", ""),
             project_root=project_root,
+        )
+
+    if action_type == "begin_file_rewrite":
+        return begin_file_rewrite(
+            args.get("path", ""),
+            args.get("expected_parts"),
+            project_root=project_root,
+            patch_mode=(state.mode == "patch"),
+            allow_create=(state.mode != "patch"),
+        )
+
+    if action_type == "append_file_chunk":
+        return append_file_chunk(
+            args.get("path", ""),
+            args.get("part"),
+            args.get("content", ""),
+            project_root=project_root,
+        )
+
+    if action_type == "finalize_file_rewrite":
+        return finalize_file_rewrite(
+            args.get("path", ""),
+            project_root=project_root,
+            patch_mode=(state.mode == "patch"),
+            allow_create=(state.mode != "patch"),
         )
 
     if action_type == "find_in_file":
@@ -860,9 +1300,10 @@ def _completion_decision(state, plan, had_run_cmd, touched_paths, verify_observa
 
 def _single_file_patch_retry_note(state):
     return (
-        f"SINGLE-FILE PATCH FALLBACK: Return exactly one write_file action for "
-        f'"{state.active_patch_target or "app.py"}" containing the FULL corrected file. '
-        "Do not use patch_lines or replace_in_file in the retry."
+        f"SINGLE-FILE PATCH FALLBACK for {state.active_patch_target or 'app.py'}: "
+        "prefer anchored edits (replace_in_file, insert_before/after, replace_block). "
+        "If full rewrite is needed for a large file, use begin_file_rewrite + append_file_chunk + finalize_file_rewrite. "
+        "Use one write_file only for a small full-file rewrite."
     )
 
 
@@ -949,7 +1390,7 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None):
                 if state.mode == "patch" and state.single_file_task:
                     fallback_note = _single_file_patch_retry_note(state)
                     if fallback_note not in history[-4:]:
-                        log("PATCH PARSE FALLBACK -> REQUEST FULL FILE WRITE")
+                        log("PATCH PARSE FALLBACK -> REQUEST ANCHORED OR CHUNKED RETRY")
                         history.append(fallback_note)
                 consecutive_parse_errors += 1
                 if consecutive_parse_errors >= config.MAX_PARSE_ERRORS and _hard_rescue_handoff(state, history, log, reason=message):
@@ -1002,72 +1443,112 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None):
             touched_paths = []
             iteration_progress = False
             iteration_error = ""
+            stage_context = _build_atomic_patch_stage(actions, state)
 
-            for action in actions:
-                if stop_checker and stop_checker():
-                    log("STOP REQUESTED")
-                    return log_path
+            try:
+                for action in actions:
+                    if stop_checker and stop_checker():
+                        log("STOP REQUESTED")
+                        return log_path
 
-                action_key = json.dumps(action, ensure_ascii=False, sort_keys=True)
-                repeated_count = state.duplicate_action_cache.get(action_key, 0)
-                if repeated_count >= config.REPEAT_ACTION_LIMIT:
-                    msg = f"BLOCK REPEATED ACTION: {action.get('type')}"
-                    log(msg)
-                    history.append(msg)
-                    if state.mode == "patch":
-                        _refresh_patch_context(state)
-                    state.stuck_iterations += 1
-                    continue
+                    action_key = json.dumps(action, ensure_ascii=False, sort_keys=True)
+                    repeated_count = state.duplicate_action_cache.get(action_key, 0)
+                    if repeated_count >= config.REPEAT_ACTION_LIMIT:
+                        msg = f"BLOCK REPEATED ACTION: {action.get('type')}"
+                        log(msg)
+                        history.append(msg)
+                        if state.mode == "patch":
+                            _refresh_patch_context(state)
+                        state.stuck_iterations += 1
+                        continue
 
-                created_by_action = False
-                if action.get("type") == "write_file":
-                    rel_path = action.get("args", {}).get("path", "")
-                    abs_path = os.path.abspath(os.path.join(state.active_project_root, rel_path))
-                    created_by_action = not os.path.exists(abs_path)
+                    created_by_action = False
+                    if action.get("type") in {"write_file", "finalize_file_rewrite"}:
+                        rel_path = action.get("args", {}).get("path", "")
+                        abs_path = os.path.abspath(os.path.join(state.active_project_root, rel_path))
+                        created_by_action = not os.path.exists(abs_path)
 
-                observation = _execute_action(action, state)
-                executed_count += 1
-                log(observation.summary)
-                if observation.details:
-                    log(observation.details)
-                state.last_useful_observation_summary = observation.summary
+                    action_root = _stage_action_project_root(action, state, stage_context)
+                    staged_action = action_root != state.active_project_root
+                    observation = _execute_action(action, state, project_root_override=action_root)
+                    if staged_action:
+                        metadata = dict(observation.metadata or {})
+                        metadata["touches_file"] = False
+                        metadata["staged"] = True
+                        observation.metadata = metadata
+                        observation.summary = observation.summary + " [staged]"
 
-                history.append(_format_history_observation(observation.summary, observation.details))
+                    executed_count += 1
+                    log(observation.summary)
+                    if observation.details:
+                        log(observation.details)
+                    state.last_useful_observation_summary = observation.summary
 
-                if observation.changed and observation.tool in PROGRESS_TOOLS:
-                    iteration_progress = True
-                    state.progress_happened = True
-                    state.duplicate_action_cache.clear()
-                else:
-                    state.duplicate_action_cache[action_key] = repeated_count + 1
+                    history.append(_format_history_observation(observation.summary, observation.details))
 
-                if observation.tool == "run_cmd":
-                    had_run_cmd = True
-                    if not observation.ok:
+                    progress_signal = observation.changed and (
+                        observation.tool in PROGRESS_TOOLS
+                        or bool((observation.metadata or {}).get("progress"))
+                    )
+                    if progress_signal:
+                        iteration_progress = True
+                        state.progress_happened = True
+                        state.duplicate_action_cache.clear()
+                    else:
+                        state.duplicate_action_cache[action_key] = repeated_count + 1
+
+                    if observation.tool == "run_cmd":
+                        had_run_cmd = True
+                        if not observation.ok:
+                            iteration_error = observation.details or observation.summary
+
+                    metadata = observation.metadata or {}
+                    touches_file = False
+                    if not metadata.get("staged"):
+                        touches_file = observation.tool in PROGRESS_TOOLS or bool(metadata.get("touches_file"))
+                    if touches_file and observation.ok:
+                        rel_path = action.get("args", {}).get("path", "")
+                        if rel_path:
+                            touched_paths.append(rel_path)
+                            _append_unique(state.touched_files, rel_path)
+                            state.last_written_files.append(rel_path)
+                            if action.get("type") in {"write_file", "finalize_file_rewrite"} and created_by_action:
+                                _append_unique(state.created_files, rel_path)
+
+                    if observation.tool in {"replace_in_file", "insert_before", "insert_after", "replace_block", "patch_lines", "finalize_file_rewrite"} and not observation.ok:
+                        if state.mode == "patch":
+                            target_path = action.get("args", {}).get("path", state.active_patch_target)
+                            fresh_root = action_root if staged_action else state.active_project_root
+                            fresh = read_file_snippet(
+                                target_path,
+                                project_root=fresh_root,
+                                max_lines=config.PATCH_SNIPPET_LINES,
+                            )
+                            history.append("Fresh file snapshot after failed patch:\n" + truncate_middle(fresh, 1200))
+                            details_lower = (observation.details or "").lower()
+                            if "anchor not found" in details_lower or "missing anchor" in details_lower:
+                                grounded = _grounded_patch_retry_context(target_path, state.active_project_root, prompt)
+                                log("GROUNDING RETRY WITH REAL OUTLINE/ANCHORS")
+                                history.append("Grounded retry context after missing anchor:\n" + truncate_middle(grounded, 2200))
+
+                    if not observation.ok and not iteration_error:
                         iteration_error = observation.details or observation.summary
 
-                if observation.tool in PROGRESS_TOOLS and observation.ok:
-                    rel_path = action.get("args", {}).get("path", "")
-                    if rel_path:
+                    _save_session_state(state)
+
+                if not iteration_error:
+                    committed_paths, created_files, commit_error = _commit_atomic_patch_stage(stage_context, state, log)
+                    for rel_path in committed_paths:
                         touched_paths.append(rel_path)
                         _append_unique(state.touched_files, rel_path)
                         state.last_written_files.append(rel_path)
-                        if action.get("type") == "write_file" and created_by_action:
-                            _append_unique(state.created_files, rel_path)
-
-                if observation.tool in {"replace_in_file", "patch_lines"} and not observation.ok:
-                    if state.mode == "patch":
-                        fresh = read_file_snippet(
-                            action.get("args", {}).get("path", state.active_patch_target),
-                            project_root=state.active_project_root,
-                            max_lines=config.PATCH_SNIPPET_LINES,
-                        )
-                        history.append("Fresh file snapshot after failed patch:\n" + truncate_middle(fresh, 1200))
-
-                if not observation.ok and not iteration_error:
-                    iteration_error = observation.details or observation.summary
-
-                _save_session_state(state)
+                    for rel_path in created_files:
+                        _append_unique(state.created_files, rel_path)
+                    if commit_error:
+                        iteration_error = commit_error
+                    _save_session_state(state)
+            finally:
+                _cleanup_atomic_patch_stage(stage_context)
 
             if executed_count == 0:
                 msg = "NO EXECUTED ACTIONS"

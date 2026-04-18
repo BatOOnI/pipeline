@@ -1,10 +1,15 @@
 import ast
+import base64
+import binascii
+import hashlib
 import importlib.util
+import json
 import os
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 
 import config
 from contracts import Observation
@@ -14,6 +19,22 @@ from utils import is_subpath
 PATH_LIKE_RE = re.compile(r"[\\/]|^\.\.?$|\.[A-Za-z0-9_+-]{1,8}$")
 SHELL_TEXT_EXTENSIONS = {".bat", ".cmd", ".ps1", ".sh"}
 WINDOWS_SCRIPT_EXTENSIONS = {".bat", ".cmd", ".ps1"}
+REWRITE_STATE_DIR = os.path.join(".agent", "rewrite_state")
+
+
+def _decode_b64_text(value, field_name):
+    if value is None:
+        return None, ""
+    if not isinstance(value, str):
+        return None, f"{field_name} must be base64 string."
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        return None, f"Invalid base64 in {field_name}: {exc}"
+    try:
+        return decoded.decode("utf-8"), ""
+    except UnicodeDecodeError as exc:
+        return None, f"{field_name} is not valid UTF-8 text: {exc}"
 
 
 def _resolve_path(path, project_root=None):
@@ -97,6 +118,76 @@ def _shell_write_warning(path, content):
     return ""
 
 
+def _line_boundaries(content):
+    positions = []
+    index = 0
+    for line in content.splitlines(keepends=True):
+        start = index
+        index += len(line)
+        positions.append((start, index, line))
+    if not positions and content == "":
+        return []
+    if content and (not positions or index < len(content)):
+        positions.append((index, len(content), content[index:]))
+    return positions
+
+
+def _resolve_legacy_line_reference(content, line_number, label):
+    try:
+        line_number = int(line_number)
+    except Exception:
+        return None, None, None, f"{label} must be an integer."
+
+    boundaries = _line_boundaries(content)
+    if not boundaries:
+        return None, None, None, f"Cannot resolve {label}: file is empty."
+    if line_number < 1 or line_number > len(boundaries):
+        return None, None, None, f"Invalid {label}: valid range is 1..{len(boundaries)}."
+
+    start, end, line_text = boundaries[line_number - 1]
+    return line_text, start, end, ""
+
+
+def _rewrite_state_base(project_root):
+    root = os.path.abspath(project_root or os.getcwd())
+    base = os.path.join(root, REWRITE_STATE_DIR)
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def _rewrite_state_path(abs_path, project_root):
+    key = hashlib.sha256(os.path.normcase(abs_path).encode("utf-8")).hexdigest()
+    return os.path.join(_rewrite_state_base(project_root), f"{key}.json")
+
+
+def _load_rewrite_state(abs_path, project_root):
+    state_path = _rewrite_state_path(abs_path, project_root)
+    if not os.path.exists(state_path):
+        return None
+    try:
+        with open(state_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _save_rewrite_state(abs_path, project_root, state):
+    state_path = _rewrite_state_path(abs_path, project_root)
+    with open(state_path, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, ensure_ascii=False)
+
+
+def _clear_rewrite_state(abs_path, project_root):
+    state_path = _rewrite_state_path(abs_path, project_root)
+    try:
+        os.remove(state_path)
+    except FileNotFoundError:
+        pass
+
+
 def _looks_like_full_file_rewrite(old_content, new_content):
     old_lines = [line for line in (old_content or "").splitlines() if line.strip()]
     new_lines = [line for line in (new_content or "").splitlines() if line.strip()]
@@ -152,11 +243,17 @@ def read_file_snippet(path, project_root=None, max_lines=60, around_line=None):
     return "\n".join(snippet)
 
 
-def write_file(path, content, project_root=None, patch_mode=False, allow_create=True):
+def write_file(path, content, project_root=None, patch_mode=False, allow_create=True, content_b64=None):
     try:
         abs_path = _resolve_path(path, project_root=project_root)
     except Exception as e:
         return Observation(False, f"WRITE REJECTED {path}", changed=False, details=str(e), tool="write_file", path=str(path))
+
+    decoded, decode_error = _decode_b64_text(content_b64, "content_b64")
+    if decode_error:
+        return Observation(False, f"WRITE REJECTED {_rel_path(abs_path, project_root)}", changed=False, details=decode_error, tool="write_file", path=abs_path)
+    if decoded is not None:
+        content = decoded
 
     existed = os.path.exists(abs_path)
     if patch_mode and not existed and not allow_create:
@@ -240,12 +337,23 @@ def find_in_file(path, query, project_root=None, context_lines=3):
     )
 
 
-def replace_in_file(path, old, new, project_root=None):
+def replace_in_file(path, old, new, project_root=None, old_b64=None, new_b64=None):
     try:
         abs_path = _resolve_path(path, project_root=project_root)
         content = _read_file(abs_path)
     except Exception as e:
         return Observation(False, f"replace_in_file failed {path}", changed=False, details=str(e), tool="replace_in_file", path=str(path))
+
+    decoded_old, old_error = _decode_b64_text(old_b64, "old_b64")
+    if old_error:
+        return Observation(False, f"replace_in_file failed {_rel_path(abs_path, project_root)}", changed=False, details=old_error, tool="replace_in_file", path=abs_path)
+    decoded_new, new_error = _decode_b64_text(new_b64, "new_b64")
+    if new_error:
+        return Observation(False, f"replace_in_file failed {_rel_path(abs_path, project_root)}", changed=False, details=new_error, tool="replace_in_file", path=abs_path)
+    if decoded_old is not None:
+        old = decoded_old
+    if decoded_new is not None:
+        new = decoded_new
 
     old = str(old or "")
     new = str(new or "")
@@ -278,6 +386,475 @@ def replace_in_file(path, old, new, project_root=None):
 
     _write_text(abs_path, updated)
     return Observation(True, f"replace_in_file updated {_rel_path(abs_path, project_root)}", changed=True, tool="replace_in_file", path=abs_path)
+
+
+def insert_before(path, anchor, content, project_root=None, line_number=None, content_b64=None):
+    try:
+        abs_path = _resolve_path(path, project_root=project_root)
+        current = _read_file(abs_path)
+    except Exception as e:
+        return Observation(False, f"insert_before failed {path}", changed=False, details=str(e), tool="insert_before", path=str(path))
+
+    decoded_content, decode_error = _decode_b64_text(content_b64, "content_b64")
+    if decode_error:
+        return Observation(False, f"insert_before failed {_rel_path(abs_path, project_root)}", changed=False, details=decode_error, tool="insert_before", path=abs_path)
+    if decoded_content is not None:
+        content = decoded_content
+
+    anchor = str(anchor or "")
+    insert_text = str(content or "")
+    index = None
+    if anchor:
+        index = current.find(anchor)
+        if index < 0:
+            return Observation(
+                False,
+                f"insert_before miss {_rel_path(abs_path, project_root)}",
+                changed=False,
+                details="Anchor not found in file.",
+                tool="insert_before",
+                path=abs_path,
+            )
+    elif line_number is not None:
+        anchor, index, _, error = _resolve_legacy_line_reference(current, line_number, "line_number")
+        if error:
+            return Observation(
+                False,
+                f"insert_before failed {_rel_path(abs_path, project_root)}",
+                changed=False,
+                details=error,
+                tool="insert_before",
+                path=abs_path,
+            )
+    else:
+        return Observation(False, f"insert_before failed {_rel_path(abs_path, project_root)}", changed=False, details="Missing anchor", tool="insert_before", path=abs_path)
+
+    updated = current[:index] + insert_text + current[index:]
+    if updated == current:
+        return Observation(True, f"insert_before no-op {_rel_path(abs_path, project_root)}", changed=False, tool="insert_before", path=abs_path)
+
+    _write_text(abs_path, updated)
+    return Observation(True, f"insert_before updated {_rel_path(abs_path, project_root)}", changed=True, tool="insert_before", path=abs_path)
+
+
+def insert_after(path, anchor, content, project_root=None, line_number=None, content_b64=None):
+    try:
+        abs_path = _resolve_path(path, project_root=project_root)
+        current = _read_file(abs_path)
+    except Exception as e:
+        return Observation(False, f"insert_after failed {path}", changed=False, details=str(e), tool="insert_after", path=str(path))
+
+    decoded_content, decode_error = _decode_b64_text(content_b64, "content_b64")
+    if decode_error:
+        return Observation(False, f"insert_after failed {_rel_path(abs_path, project_root)}", changed=False, details=decode_error, tool="insert_after", path=abs_path)
+    if decoded_content is not None:
+        content = decoded_content
+
+    anchor = str(anchor or "")
+    insert_text = str(content or "")
+    insert_at = None
+    if anchor:
+        index = current.find(anchor)
+        if index < 0:
+            return Observation(
+                False,
+                f"insert_after miss {_rel_path(abs_path, project_root)}",
+                changed=False,
+                details="Anchor not found in file.",
+                tool="insert_after",
+                path=abs_path,
+            )
+        insert_at = index + len(anchor)
+    elif line_number is not None:
+        anchor, _, insert_at, error = _resolve_legacy_line_reference(current, line_number, "line_number")
+        if error:
+            return Observation(
+                False,
+                f"insert_after failed {_rel_path(abs_path, project_root)}",
+                changed=False,
+                details=error,
+                tool="insert_after",
+                path=abs_path,
+            )
+    else:
+        return Observation(False, f"insert_after failed {_rel_path(abs_path, project_root)}", changed=False, details="Missing anchor", tool="insert_after", path=abs_path)
+
+    updated = current[:insert_at] + insert_text + current[insert_at:]
+    if updated == current:
+        return Observation(True, f"insert_after no-op {_rel_path(abs_path, project_root)}", changed=False, tool="insert_after", path=abs_path)
+
+    _write_text(abs_path, updated)
+    return Observation(True, f"insert_after updated {_rel_path(abs_path, project_root)}", changed=True, tool="insert_after", path=abs_path)
+
+
+def replace_block(
+    path,
+    start_anchor,
+    end_anchor,
+    content,
+    project_root=None,
+    start_line=None,
+    end_line=None,
+    new_content=None,
+    content_b64=None,
+):
+    try:
+        abs_path = _resolve_path(path, project_root=project_root)
+        current = _read_file(abs_path)
+    except Exception as e:
+        return Observation(False, f"replace_block failed {path}", changed=False, details=str(e), tool="replace_block", path=str(path))
+
+    decoded_content, decode_error = _decode_b64_text(content_b64, "content_b64")
+    if decode_error:
+        return Observation(False, f"replace_block failed {_rel_path(abs_path, project_root)}", changed=False, details=decode_error, tool="replace_block", path=abs_path)
+    if decoded_content is not None:
+        content = decoded_content
+
+    start_anchor = str(start_anchor or "")
+    end_anchor = str(end_anchor or "")
+    replacement = str(content or new_content or "")
+    start_index = None
+    end_index = None
+
+    if start_anchor:
+        start_index = current.find(start_anchor)
+        if start_index < 0:
+            return Observation(
+                False,
+                f"replace_block miss {_rel_path(abs_path, project_root)}",
+                changed=False,
+                details="start_anchor not found.",
+                tool="replace_block",
+                path=abs_path,
+            )
+    elif start_line is not None:
+        start_anchor, start_index, _, error = _resolve_legacy_line_reference(current, start_line, "start_line")
+        if error:
+            return Observation(
+                False,
+                f"replace_block failed {_rel_path(abs_path, project_root)}",
+                changed=False,
+                details=error,
+                tool="replace_block",
+                path=abs_path,
+            )
+    else:
+        return Observation(
+            False,
+            f"replace_block failed {_rel_path(abs_path, project_root)}",
+            changed=False,
+            details="Missing start_anchor or end_anchor.",
+            tool="replace_block",
+            path=abs_path,
+        )
+
+    if end_anchor:
+        end_index = current.find(end_anchor, start_index + len(start_anchor))
+        if end_index < 0:
+            return Observation(
+                False,
+                f"replace_block miss {_rel_path(abs_path, project_root)}",
+                changed=False,
+                details="end_anchor not found after start_anchor.",
+                tool="replace_block",
+                path=abs_path,
+            )
+    elif end_line is not None:
+        end_anchor, end_index, _, error = _resolve_legacy_line_reference(current, end_line, "end_line")
+        if error:
+            return Observation(
+                False,
+                f"replace_block failed {_rel_path(abs_path, project_root)}",
+                changed=False,
+                details=error,
+                tool="replace_block",
+                path=abs_path,
+            )
+        if end_index < start_index:
+            return Observation(
+                False,
+                f"replace_block failed {_rel_path(abs_path, project_root)}",
+                changed=False,
+                details="end_line must be after start_line.",
+                tool="replace_block",
+                path=abs_path,
+            )
+    else:
+        return Observation(
+            False,
+            f"replace_block failed {_rel_path(abs_path, project_root)}",
+            changed=False,
+            details="Missing start_anchor or end_anchor.",
+            tool="replace_block",
+            path=abs_path,
+        )
+
+    # Replace the block from start_anchor up to just before end_anchor.
+    updated = current[:start_index] + replacement + current[end_index:]
+    if updated == current:
+        return Observation(True, f"replace_block no-op {_rel_path(abs_path, project_root)}", changed=False, tool="replace_block", path=abs_path)
+
+    _write_text(abs_path, updated)
+    return Observation(True, f"replace_block updated {_rel_path(abs_path, project_root)}", changed=True, tool="replace_block", path=abs_path)
+
+
+def begin_file_rewrite(path, expected_parts, project_root=None, patch_mode=False, allow_create=True):
+    try:
+        abs_path = _resolve_path(path, project_root=project_root)
+    except Exception as e:
+        return Observation(False, f"begin_file_rewrite failed {path}", changed=False, details=str(e), tool="begin_file_rewrite", path=str(path))
+
+    existed = os.path.exists(abs_path)
+    if patch_mode and not existed and not allow_create:
+        return Observation(
+            False,
+            f"begin_file_rewrite blocked {_rel_path(abs_path, project_root)}",
+            changed=False,
+            details="Patch mode cannot create new files unless explicitly requested.",
+            tool="begin_file_rewrite",
+            path=abs_path,
+        )
+
+    try:
+        expected_parts = int(expected_parts)
+    except Exception:
+        return Observation(
+            False,
+            f"begin_file_rewrite failed {_rel_path(abs_path, project_root)}",
+            changed=False,
+            details="expected_parts must be an integer.",
+            tool="begin_file_rewrite",
+            path=abs_path,
+        )
+    if expected_parts < 1 or expected_parts > 200:
+        return Observation(
+            False,
+            f"begin_file_rewrite failed {_rel_path(abs_path, project_root)}",
+            changed=False,
+            details="expected_parts must be between 1 and 200.",
+            tool="begin_file_rewrite",
+            path=abs_path,
+        )
+
+    state = {
+        "path": abs_path,
+        "expected_parts": expected_parts,
+        "parts": {},
+    }
+    _save_rewrite_state(abs_path, project_root, state)
+    return Observation(
+        True,
+        f"begin_file_rewrite {_rel_path(abs_path, project_root)} parts={expected_parts}",
+        changed=True,
+        tool="begin_file_rewrite",
+        path=abs_path,
+        metadata={"progress": True, "touches_file": False},
+    )
+
+
+def append_file_chunk(path, part, content, project_root=None, content_b64=None):
+    try:
+        abs_path = _resolve_path(path, project_root=project_root)
+    except Exception as e:
+        return Observation(False, f"append_file_chunk failed {path}", changed=False, details=str(e), tool="append_file_chunk", path=str(path))
+
+    state = _load_rewrite_state(abs_path, project_root)
+    if not state:
+        return Observation(
+            False,
+            f"append_file_chunk failed {_rel_path(abs_path, project_root)}",
+            changed=False,
+            details="Missing rewrite state. Call begin_file_rewrite first.",
+            tool="append_file_chunk",
+            path=abs_path,
+        )
+
+    try:
+        expected_parts = int(state.get("expected_parts"))
+    except Exception:
+        return Observation(
+            False,
+            f"append_file_chunk failed {_rel_path(abs_path, project_root)}",
+            changed=False,
+            details="Corrupted rewrite state: expected_parts is invalid.",
+            tool="append_file_chunk",
+            path=abs_path,
+        )
+    try:
+        part = int(part)
+    except Exception:
+        return Observation(
+            False,
+            f"append_file_chunk failed {_rel_path(abs_path, project_root)}",
+            changed=False,
+            details="part must be an integer.",
+            tool="append_file_chunk",
+            path=abs_path,
+        )
+    if part < 1 or part > expected_parts:
+        return Observation(
+            False,
+            f"append_file_chunk failed {_rel_path(abs_path, project_root)}",
+            changed=False,
+            details=f"part must be in range 1..{expected_parts}.",
+            tool="append_file_chunk",
+            path=abs_path,
+        )
+
+    parts = state.get("parts")
+    if not isinstance(parts, dict):
+        parts = {}
+    decoded_content, decode_error = _decode_b64_text(content_b64, "content_b64")
+    if decode_error:
+        return Observation(
+            False,
+            f"append_file_chunk failed {_rel_path(abs_path, project_root)}",
+            changed=False,
+            details=decode_error,
+            tool="append_file_chunk",
+            path=abs_path,
+        )
+    if decoded_content is not None:
+        content = decoded_content
+
+    chunk = str(content or "")
+    key = str(part)
+    previous = parts.get(key)
+    parts[key] = chunk
+    state["parts"] = parts
+    _save_rewrite_state(abs_path, project_root, state)
+
+    received = len(parts)
+    changed = previous != chunk
+    return Observation(
+        True,
+        f"append_file_chunk {_rel_path(abs_path, project_root)} part={part}/{expected_parts} received={received}",
+        changed=changed,
+        tool="append_file_chunk",
+        path=abs_path,
+        metadata={"progress": True, "touches_file": False},
+    )
+
+
+def finalize_file_rewrite(path, project_root=None, patch_mode=False, allow_create=True):
+    try:
+        abs_path = _resolve_path(path, project_root=project_root)
+    except Exception as e:
+        return Observation(False, f"finalize_file_rewrite failed {path}", changed=False, details=str(e), tool="finalize_file_rewrite", path=str(path))
+
+    state = _load_rewrite_state(abs_path, project_root)
+    if not state:
+        return Observation(
+            False,
+            f"finalize_file_rewrite failed {_rel_path(abs_path, project_root)}",
+            changed=False,
+            details="Missing rewrite state. Call begin_file_rewrite first.",
+            tool="finalize_file_rewrite",
+            path=abs_path,
+        )
+
+    try:
+        expected_parts = int(state.get("expected_parts"))
+    except Exception:
+        return Observation(
+            False,
+            f"finalize_file_rewrite failed {_rel_path(abs_path, project_root)}",
+            changed=False,
+            details="Corrupted rewrite state: expected_parts is invalid.",
+            tool="finalize_file_rewrite",
+            path=abs_path,
+        )
+    parts = state.get("parts")
+    if not isinstance(parts, dict):
+        parts = {}
+
+    missing = [str(index) for index in range(1, expected_parts + 1) if str(index) not in parts]
+    if missing:
+        return Observation(
+            False,
+            f"finalize_file_rewrite incomplete {_rel_path(abs_path, project_root)}",
+            changed=False,
+            details="Missing parts: " + ", ".join(missing),
+            tool="finalize_file_rewrite",
+            path=abs_path,
+        )
+
+    content = "".join(str(parts[str(index)]) for index in range(1, expected_parts + 1))
+    if not content.strip():
+        return Observation(
+            False,
+            f"finalize_file_rewrite failed {_rel_path(abs_path, project_root)}",
+            changed=False,
+            details="Assembled content is empty.",
+            tool="finalize_file_rewrite",
+            path=abs_path,
+        )
+
+    existed = os.path.exists(abs_path)
+    if patch_mode and not existed and not allow_create:
+        return Observation(
+            False,
+            f"finalize_file_rewrite blocked {_rel_path(abs_path, project_root)}",
+            changed=False,
+            details="Patch mode cannot create new files unless explicitly requested.",
+            tool="finalize_file_rewrite",
+            path=abs_path,
+        )
+
+    old_content = _read_file(abs_path) if existed else ""
+    content, normalization_note = _normalize_shell_script_content(abs_path, content)
+    if patch_mode and existed and not _looks_like_full_file_rewrite(old_content, content):
+        return Observation(
+            False,
+            f"finalize_file_rewrite rejected {_rel_path(abs_path, project_root)}",
+            changed=False,
+            details="Assembled file does not look like a full corrected file.",
+            tool="finalize_file_rewrite",
+            path=abs_path,
+        )
+
+    if existed and old_content == content:
+        _clear_rewrite_state(abs_path, project_root)
+        return Observation(
+            True,
+            f"finalize_file_rewrite no-op {_rel_path(abs_path, project_root)}",
+            changed=False,
+            tool="finalize_file_rewrite",
+            path=abs_path,
+            metadata={"touches_file": True},
+        )
+
+    parent = os.path.dirname(abs_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix=".rewrite_", suffix=".tmp", dir=parent or None, text=True)
+    os.close(tmp_fd)
+    try:
+        _write_text(tmp_path, content)
+        os.replace(tmp_path, abs_path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    _clear_rewrite_state(abs_path, project_root)
+    written_content = _read_file(abs_path)
+    details = normalization_note
+    warning = _shell_write_warning(abs_path, written_content)
+    if warning:
+        details = (details + "\n" if details else "") + warning
+    return Observation(
+        True,
+        f"finalize_file_rewrite wrote {_rel_path(abs_path, project_root)}",
+        changed=True,
+        details=details,
+        tool="finalize_file_rewrite",
+        path=abs_path,
+        metadata={"touches_file": True},
+    )
 
 
 def patch_lines(path, start_line, end_line, new_content, project_root=None):

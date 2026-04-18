@@ -63,6 +63,11 @@ def _lmstudio_models_url(lmstudio_url):
     return url.rstrip("/") + "/models"
 
 
+def _openai_use_max_completion_tokens(model_name):
+    name = (model_name or "").strip().lower()
+    return name.startswith("gpt-5")
+
+
 class ModelRequestHandle:
     def __init__(self):
         self.finished = threading.Event()
@@ -162,12 +167,16 @@ def call_model(prompt: str, provider_override=None, max_output_tokens=None, time
             "Authorization": f"Bearer {config.OPENAI_API_KEY}",
             "Content-Type": "application/json",
         }
+        model_name = config.OPENAI_MODEL
         payload = {
-            "model": config.OPENAI_MODEL,
+            "model": model_name,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0,
-            "max_tokens": max_output_tokens,
         }
+        if _openai_use_max_completion_tokens(model_name):
+            payload["max_completion_tokens"] = max_output_tokens
+        else:
+            payload["max_tokens"] = max_output_tokens
         handle = ModelRequestHandle()
         thread = threading.Thread(
             target=_request_worker,

@@ -186,20 +186,57 @@ def _normalize_action_object(item):
     action_type = item.get("type")
     if not action_type:
         return None
+    action_type = str(action_type)
 
     args = item.get("args")
     if not isinstance(args, dict):
         args = {
             key: value
             for key, value in item.items()
-            if key not in {"type", "plan", "reasoning_short"}
+            if key not in {"type", "action", "plan", "reasoning_short"}
         }
 
-    if str(action_type) == "patch_lines" and "new_content" not in args and "content" in args:
+    if action_type == "patch_lines" and "new_content" not in args and "content" in args:
         args = dict(args)
         args["new_content"] = args.get("content", "")
 
-    return {"type": str(action_type), "args": args}
+    if action_type in {"insert_before", "insert_after"}:
+        args = dict(args)
+        if "content" not in args and "new_content" in args:
+            args["content"] = args.get("new_content", "")
+        if "line_number" not in args and "line" in args:
+            args["line_number"] = args.get("line")
+        if "line_number" not in args and isinstance(args.get("target"), int):
+            args["line_number"] = args.get("target")
+        if "anchor" not in args and "target" in args and not isinstance(args.get("target"), int):
+            args["anchor"] = args.get("target", "")
+
+    if action_type == "replace_block":
+        args = dict(args)
+        if "content" not in args and "new_content" in args:
+            args["content"] = args.get("new_content", "")
+        if "start_line" not in args and isinstance(args.get("start"), int):
+            args["start_line"] = args.get("start")
+        if "end_line" not in args and isinstance(args.get("end"), int):
+            args["end_line"] = args.get("end")
+        if "start_anchor" not in args and "start" in args and not isinstance(args.get("start"), int):
+            args["start_anchor"] = args.get("start", "")
+        if "end_anchor" not in args and "end" in args and not isinstance(args.get("end"), int):
+            args["end_anchor"] = args.get("end", "")
+
+    if action_type == "begin_file_rewrite":
+        args = dict(args)
+        if "expected_parts" not in args and "parts" in args:
+            args["expected_parts"] = args.get("parts")
+
+    if action_type == "append_file_chunk":
+        args = dict(args)
+        if "part" not in args and "index" in args:
+            args["part"] = args.get("index")
+        if "content" not in args and "chunk" in args:
+            args["content"] = args.get("chunk", "")
+
+    return {"type": action_type, "args": args}
 
 
 def _normalize_root(data, active_target=None, expected_file_count=None, single_file_task=False):

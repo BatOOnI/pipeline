@@ -16,7 +16,7 @@ from git_tools import (
     git_tag,
 )
 from providers import list_models
-from utils import approx_token_count, coerce_int, ensure_gitignore, open_path
+from utils import approx_token_count, coerce_int, ensure_gitignore, open_path, read_json_file, write_json_file
 
 
 class App:
@@ -29,11 +29,16 @@ class App:
         self.stop_flag = False
         self.timeout_dialog = None
         self.timeout_dialog_event = None
+        self.settings_path = os.path.abspath(os.path.join(os.getcwd(), ".agent", "gui_settings.json"))
+        self._saved_prompt_text = ""
 
         self._build_vars()
+        self._load_gui_settings()
         self._build_ui()
+        self._apply_loaded_prompt()
         self._bind_events()
         self._refresh_prompt_metrics()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_vars(self):
         self.provider_var = tk.StringVar(value=config.PROVIDER)
@@ -107,10 +112,18 @@ class App:
         self.oa_model_combo.grid(row=4, column=1, sticky="we", **pad)
 
         ttk.Label(pipeline_box, text="OpenAI Key").grid(row=4, column=2, sticky="w", **pad)
-        ttk.Entry(pipeline_box, textvariable=self.oa_key_var, width=42, show="*").grid(row=4, column=3, sticky="we", **pad)
+        key_row = ttk.Frame(pipeline_box)
+        key_row.grid(row=4, column=3, sticky="we", **pad)
+        key_row.columnconfigure(0, weight=1)
+        ttk.Entry(key_row, textvariable=self.oa_key_var, width=34, show="*").grid(row=0, column=0, sticky="we")
+        ttk.Button(key_row, text="Save API Key", command=self.save_api_key).grid(row=0, column=1, padx=(6, 0))
 
         ttk.Label(pipeline_box, text="Project root").grid(row=4, column=4, sticky="w", **pad)
-        ttk.Entry(pipeline_box, textvariable=self.project_root_var, width=24).grid(row=4, column=5, sticky="we", **pad)
+        project_root_row = ttk.Frame(pipeline_box)
+        project_root_row.grid(row=4, column=5, sticky="we", **pad)
+        project_root_row.columnconfigure(0, weight=1)
+        ttk.Entry(project_root_row, textvariable=self.project_root_var, width=24).grid(row=0, column=0, sticky="we")
+        ttk.Button(project_root_row, text="Browse", command=self.browse_project_root).grid(row=0, column=1, padx=(6, 0))
 
         ttk.Label(pipeline_box, text="Patch files").grid(row=5, column=0, sticky="w", **pad)
         ttk.Entry(pipeline_box, textvariable=self.patch_files_var, width=40).grid(row=5, column=1, columnspan=2, sticky="we", **pad)
@@ -185,6 +198,12 @@ class App:
         self.prompt_chars_var.set(str(len(prompt)))
         self.estimated_tokens_var.set(str(approx_token_count(prompt)))
 
+    def _normalize_project_root(self, path):
+        path = str(path or "").strip()
+        if not path:
+            return ""
+        return os.path.abspath(os.path.normpath(path))
+
     def log(self, msg):
         self.root.after(0, lambda: self._append_log(msg))
 
@@ -198,7 +217,9 @@ class App:
         config.LMSTUDIO_MODEL = self.lm_model_var.get().strip()
         config.OPENAI_MODEL = self.oa_model_var.get().strip()
         config.OPENAI_API_KEY = self.oa_key_var.get().strip()
-        config.PROJECT_ROOT = self.project_root_var.get().strip() or "TEST"
+        normalized_project_root = self._normalize_project_root(self.project_root_var.get())
+        self.project_root_var.set(normalized_project_root)
+        config.PROJECT_ROOT = normalized_project_root
         config.MAX_ITERATIONS = coerce_int(self.max_iter_var.get(), 10, minimum=1, maximum=100)
         config.RUN_TIMEOUT = coerce_int(self.run_timeout_var.get(), 15, minimum=1, maximum=600)
         config.MODEL_TIMEOUT = coerce_int(self.model_timeout_var.get(), 120, minimum=5, maximum=3600)
@@ -207,6 +228,39 @@ class App:
         config.PATCH_FILES = self.patch_files_var.get().strip()
         config.PATCH_SNIPPET_LINES = coerce_int(self.patch_snippet_lines_var.get(), 80, minimum=10, maximum=400)
         config.MAX_OUTPUT_TOKENS = coerce_int(self.max_output_tokens_var.get(), 2000, minimum=128, maximum=16000)
+
+    def _load_gui_settings(self):
+        data = read_json_file(self.settings_path, default={})
+        if not isinstance(data, dict):
+            return
+        key = str(data.get("openai_api_key", "")).strip()
+        if key:
+            self.oa_key_var.set(key)
+            config.OPENAI_API_KEY = key
+        self._saved_prompt_text = str(data.get("last_prompt", "") or "")
+
+    def _save_gui_settings(self):
+        prompt_value = self._saved_prompt_text
+        if hasattr(self, "prompt_text"):
+            prompt_value = self.prompt_text.get("1.0", "end-1c")
+            self._saved_prompt_text = prompt_value
+        payload = {
+            "openai_api_key": self.oa_key_var.get().strip(),
+            "last_prompt": prompt_value,
+        }
+        write_json_file(self.settings_path, payload)
+
+    def _apply_loaded_prompt(self):
+        if not self._saved_prompt_text:
+            return
+        self.prompt_text.delete("1.0", "end")
+        self.prompt_text.insert("1.0", self._saved_prompt_text)
+        self.prompt_text.edit_modified(False)
+
+    def save_api_key(self):
+        self.apply_config()
+        self._save_gui_settings()
+        self.log("OpenAI API key saved to local GUI settings.")
 
     def _set_model_values(self, provider, models):
         combo = self.lm_model_combo if provider == "lmstudio" else self.oa_model_combo
@@ -219,17 +273,23 @@ class App:
     def fetch_models(self):
         self.apply_config()
         provider = self.provider_var.get().strip()
+        lm_url = self.lm_url_var.get().strip()
+        openai_key = self.oa_key_var.get().strip()
         self.status_label.config(text="Fetching models...")
 
         def job():
+            if provider == "openai" and not openai_key:
+                self.root.after(0, lambda: self._finish_fetch_models(provider, None, "OpenAI API key is missing. Enter a key and click 'Save API Key'."))
+                return
             try:
                 models = list_models(
                     provider_override=provider,
-                    lmstudio_url=self.lm_url_var.get().strip(),
-                    openai_api_key=self.oa_key_var.get().strip(),
+                    lmstudio_url=lm_url,
+                    openai_api_key=openai_key,
                 )
             except Exception as exc:
-                self.root.after(0, lambda: self._finish_fetch_models(provider, None, str(exc)))
+                error_message = str(exc)
+                self.root.after(0, lambda: self._finish_fetch_models(provider, None, error_message))
                 return
             self.root.after(0, lambda: self._finish_fetch_models(provider, models, ""))
 
@@ -326,6 +386,7 @@ class App:
             return
 
         self.apply_config()
+        self._save_gui_settings()
         self.stop_flag = False
         self.log_text.delete("1.0", "end")
         self.status_label.config(text="Running")
@@ -364,6 +425,12 @@ class App:
         path = filedialog.askdirectory(initialdir=self.repo_dir_var.get() or os.getcwd())
         if path:
             self.repo_dir_var.set(path)
+
+    def browse_project_root(self):
+        initial_dir = self._normalize_project_root(self.project_root_var.get()) or os.getcwd()
+        path = filedialog.askdirectory(initialdir=initial_dir)
+        if path:
+            self.project_root_var.set(self._normalize_project_root(path))
 
     def _git_log(self, title, ok, msg):
         prefix = "[OK]" if ok else "[ERR]"
@@ -419,6 +486,14 @@ class App:
         tag_name = self.tag_var.get().strip() or "v1.0-working"
         ok, msg = git_tag(repo_dir, tag_name)
         self._git_log("git tag+push", ok, msg)
+
+    def _on_close(self):
+        try:
+            self.apply_config()
+            self._save_gui_settings()
+        except Exception:
+            pass
+        self.root.destroy()
 
 
 def launch():

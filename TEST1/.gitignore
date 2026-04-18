@@ -1,0 +1,9 @@
+def griet():
+  return "hello"
+
+def calc():
+  return 2 + 2
+
+if __name__ == "__main__":
+  print(griet())
+  print(calc())

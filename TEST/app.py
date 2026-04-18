@@ -59,44 +59,65 @@ class SnakeGame:
             if event.type == pygame.QUIT:
                 pygame.quit()
                 sys.exit()
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    self.paused = not self.paused
-                elif event.key == pygame.K_r and self.game_over:
-                    self.reset()
-                elif not self.paused and not self.game_over:
-                    if event.key == pygame.K_UP and self.direction != DOWN:
-                        self.direction = UP
-                    elif event.key == pygame.K_DOWN and self.direction != UP:
-                        self.direction = DOWN
-                    elif event.key == pygame.K_LEFT and self.direction != RIGHT:
-                        self.direction = LEFT
-                    elif event.key == pygame.K_RIGHT and self.direction != LEFT:
-                        self.direction = RIGHT
 
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    # Toggle pause
+                    self.paused = not getattr(self, "paused", False)
+                    if self.paused:
+                        self.game_over = False
+                    continue
+
+                if getattr(self, "paused", False):
+                    # Ignore direction changes while paused
+                    continue
+
+                if event.key == pygame.K_UP and self.direction != DOWN:
+                    self.direction = UP
+                elif event.key == pygame.K_DOWN and self.direction != UP:
+                    self.direction = DOWN
+                elif event.key == pygame.K_LEFT and self.direction != RIGHT:
+                    self.direction = LEFT
+                elif event.key == pygame.K_RIGHT and self.direction != LEFT:
+                    self.direction = RIGHT
     def update(self):
-        if self.paused or self.game_over:
-            return
-        
+        # Move snake
         self.snake.insert(0, (self.snake[0][0] + self.direction[0], self.snake[0][1] + self.direction[1]))
-        
-        if self.snake[0] == self.food:
-            self.food = self.spawn_food()
-            self.score += 10
-            self.fruits_eaten += 1
-            if self.fruits_eaten % SPEED_INCREASE_INTERVAL == 0:
-                self.speed += 2
-        else:
-            self.snake.pop()
-        
-        if (self.snake[0][0] < 0 or self.snake[0][0] >= GRID_WIDTH or
-            self.snake[0][1] < 0 or self.snake[0][1] >= GRID_HEIGHT or
-            self.snake[0] in self.snake[1:]):
+
+        # Wrap around walls (instead of game over)
+        x, y = self.snake[0]
+        if x < 0:
+            x = GRID_WIDTH - 1
+        elif x >= GRID_WIDTH:
+            x = 0
+        if y < 0:
+            y = GRID_HEIGHT - 1
+        elif y >= GRID_HEIGHT:
+            y = 0
+        self.snake[0] = (x, y)
+
+        # Check self collision
+        if self.snake[0] in self.snake[1:]:
             self.game_over = True
+            self.paused = False
+            return
+
+        # Check food
+        if self.snake[0] == self.food:
+            self.score += 1
             if self.score > self.high_score:
                 self.high_score = self.score
                 self.save_high_score()
+            self.spawn_food()
 
+            # Increase speed gradually
+            self.speed = min(30, self.speed + 1)
+        else:
+            self.snake.pop()
+
+        # If paused, don't advance game state further
+        if getattr(self, "paused", False):
+            return
     def draw_grid(self):
         for x in range(0, WINDOW_WIDTH, CELL_SIZE):
             pygame.draw.line(self.screen, (40, 40, 40), (x, 0), (x, WINDOW_HEIGHT))
@@ -122,14 +143,22 @@ class SnakeGame:
         self.screen.blit(speed_text, (10, 90))
 
     def draw_game_over(self):
-        if self.game_over:
-            game_over_text = self.font.render("Game Over! Press R to restart", True, (255, 255, 255))
-            score_text = self.font.render(f"Final Score: {self.score}", True, (255, 255, 255))
-            high_score_text = self.font.render(f"High Score: {self.high_score}", True, (255, 255, 255))
-            self.screen.blit(game_over_text, (WINDOW_WIDTH // 2 - 150, WINDOW_HEIGHT // 2 - 60))
-            self.screen.blit(score_text, (WINDOW_WIDTH // 2 - 100, WINDOW_HEIGHT // 2))
-            self.screen.blit(high_score_text, (WINDOW_WIDTH // 2 - 100, WINDOW_HEIGHT // 2 + 60))
+        # Draw PAUSE overlay when paused
+        if getattr(self, "paused", False):
+            pause_text = self.font.render("PAUSE", True, (255, 255, 255))
+            pause_rect = pause_text.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2))
+            self.screen.blit(pause_text, pause_rect)
+            return
 
+        if self.game_over:
+            self.screen.fill((0, 0, 0))
+            game_over_text = self.font.render("Game Over", True, (255, 0, 0))
+            score_text = self.font.render(f"Score: {self.score}", True, (255, 255, 255))
+            high_score_text = self.font.render(f"High Score: {self.high_score}", True, (255, 255, 255))
+
+            self.screen.blit(game_over_text, game_over_text.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 - 40)))
+            self.screen.blit(score_text, score_text.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2)))
+            self.screen.blit(high_score_text, high_score_text.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 + 40)))
     def run(self):
         while True:
             self.handle_input()

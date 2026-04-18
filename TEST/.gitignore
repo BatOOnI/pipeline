@@ -1,9 +1,7 @@
-def greet():
-    return "hello"
-
-def calc():
-    return 2 + 2
-
-if __name__ == "__main__":
-    print(greet())
-    print(calc())
+__pycache__/
+*.pyc
+.agent/
+_tmp_validation/
+pipeline_log.txt
+.env
+.venv/

@@ -1,16 +1,9 @@
-def griet():
-  return "hello"
+def greet():
+    return "hello from b64"
 
 def calc():
-  return 2 + 2
+    return 10
 
 if __name__ == "__main__":
-  print(griet())
-  print(calc())
-__pycache__/
-*.pyc
-.agent/
-_tmp_validation/
-pipeline_log.txt
-.env
-.venv/
+    print(greet())
+    print(calc())

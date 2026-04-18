@@ -115,6 +115,7 @@ class PipelineState:
     mode: str
     active_project_root: str
     current_provider: str
+    mode_reason: str = ""
     target_files: list = field(default_factory=list)
     active_patch_target: str = ""
     expected_file_count: int = 1
@@ -218,6 +219,11 @@ def _normalize_prompt_text(user_prompt):
     return "".join(ch for ch in lower if not unicodedata.combining(ch))
 
 
+def _prompt_word_tokens(user_prompt):
+    lower = _normalize_prompt_text(user_prompt)
+    return re.findall(r"[a-z0-9_]+", lower)
+
+
 def _list_session_dirs(container):
     if not os.path.isdir(container):
         return []
@@ -308,17 +314,29 @@ def _prompt_mentions_existing_file(user_prompt):
     return False
 
 
+def _infer_mode_with_reason(user_prompt):
+    patch_files_value = str(config.PATCH_FILES or "")
+    if patch_files_value.strip():
+        return "patch", "PATCH_FILES non-empty"
+
+    words = set(_prompt_word_tokens(user_prompt))
+    matched_patch = next((keyword for keyword in PATCH_KEYWORDS if keyword in words), "")
+    if matched_patch:
+        return "patch", f'patch keyword matched: "{matched_patch}"'
+
+    if "dodaj" in words and _prompt_mentions_existing_file(user_prompt):
+        return "patch", 'prompt references existing file with "dodaj"'
+
+    matched_create = next((keyword for keyword in CREATE_KEYWORDS if keyword in words), "")
+    if matched_create:
+        return "create", f'create keyword matched: "{matched_create}"'
+
+    return "create", "default create"
+
+
 def _infer_mode(user_prompt):
-    if config.PATCH_FILES.strip():
-        return "patch"
-    lower = _normalize_prompt_text(user_prompt)
-    if any(keyword in lower for keyword in PATCH_KEYWORDS):
-        return "patch"
-    if "dodaj" in lower and _prompt_mentions_existing_file(user_prompt):
-        return "patch"
-    if any(keyword in lower for keyword in CREATE_KEYWORDS):
-        return "create"
-    return "create"
+    mode, _ = _infer_mode_with_reason(user_prompt)
+    return mode
 
 
 def _find_by_basename(project_root, basename):
@@ -474,6 +492,7 @@ def _save_session_state(state):
         "goal": state.goal,
         "prompt": state.goal,
         "mode": state.mode,
+        "mode_reason": state.mode_reason,
         "task_kind": state.mode,
         "project_root": state.active_project_root,
         "target_files": list(state.target_files),
@@ -495,7 +514,7 @@ def _save_session_state(state):
 
 def _build_state(user_prompt):
     session_data = _load_session_state()
-    mode = _infer_mode(user_prompt)
+    mode, mode_reason = _infer_mode_with_reason(user_prompt)
     previous_prompt = str(session_data.get("prompt") or session_data.get("goal") or "")
     prompt_changed = bool(previous_prompt and previous_prompt.strip() != (user_prompt or "").strip())
     session_root = str(session_data.get("project_root", "")).strip()
@@ -512,6 +531,7 @@ def _build_state(user_prompt):
         mode=mode,
         active_project_root=active_project_root,
         current_provider=config.PROVIDER,
+        mode_reason=mode_reason,
         prompt_changed=prompt_changed,
     )
     _hydrate_state_from_session(state, session_data)
@@ -1345,6 +1365,8 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None):
         empty_done_retry_used = False
 
         log(f"MODE: {state.mode}")
+        log(f"MODE REASON: {state.mode_reason or 'unknown'}")
+        log(f"PATCH_FILES REPR: {repr(config.PATCH_FILES)}")
         log(f"ACTIVE PROJECT ROOT: {state.active_project_root}")
         if state.mode == "patch":
             log(f"ACTIVE PATCH TARGET: {state.active_patch_target}")
@@ -1548,6 +1570,8 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None):
 
                     if not observation.ok and not iteration_error:
                         iteration_error = observation.details or observation.summary
+                    if observation.tool == "off_target_patch_action":
+                        break
 
                     _save_session_state(state)
 

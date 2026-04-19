@@ -16,10 +16,10 @@ PLAYER_SPEED = 5
 BULLET_SPEED = 10
 ENEMY_SPAWN_DISTANCE = 100
 ENEMY_STARTING_SPEED = 2.0
-ENEMY_SPEED_INCREASE_INTERVAL = 5000  # ms
-ENEMY_MAX_HP = 100
+ENEMY_HP = 100
 BULLET_DAMAGE = 50
-SCORE_PER_ENEMY = 10
+ENEMY_REWARD = 10
+ENEMY_SPEED_INCREASE_INTERVAL = 5000  # ms
 
 # Kolory
 WHITE = (255, 255, 255)
@@ -33,10 +33,6 @@ GRAY = (128, 128, 128)
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 pygame.display.set_caption("Top-Down Shooter")
 clock = pygame.time.Clock()
-
-# Czcionki
-text_font = pygame.font.SysFont(None, 36)
-small_font = pygame.font.SysFont(None, 24)
 
 # Klasa gracza
 class Player:
@@ -80,9 +76,9 @@ class Bullet:
     def __init__(self, x, y, angle):
         self.x = x
         self.y = y
-        self.radius = BULLET_RADIUS
-        self.speed = BULLET_SPEED
         self.angle = angle
+        self.speed = BULLET_SPEED
+        self.radius = BULLET_RADIUS
         
     def update(self):
         self.x += math.cos(self.angle) * self.speed
@@ -92,8 +88,8 @@ class Bullet:
         pygame.draw.circle(screen, GREEN, (int(self.x), int(self.y)), self.radius)
         
     def is_off_screen(self):
-        return (self.x < -self.radius or self.x > SCREEN_WIDTH + self.radius or
-                self.y < -self.radius or self.y > SCREEN_HEIGHT + self.radius)
+        return (self.x < 0 or self.x > SCREEN_WIDTH or 
+                self.y < 0 or self.y > SCREEN_HEIGHT)
 
 # Klasa wroga
 class Enemy:
@@ -101,11 +97,10 @@ class Enemy:
         self.x = x
         self.y = y
         self.radius = ENEMY_RADIUS
-        self.speed = ENEMY_STARTING_SPEED
-        self.max_hp = ENEMY_MAX_HP
-        self.hp = ENEMY_MAX_HP
+        self.hp = ENEMY_HP
+        self.max_hp = ENEMY_HP
         
-    def update(self, player_x, player_y):
+    def update(self, player_x, player_y, speed_multiplier):
         # Oblicz wektor do gracza
         dx = player_x - self.x
         dy = player_y - self.y
@@ -116,9 +111,9 @@ class Enemy:
             dx /= distance
             dy /= distance
             
-        # Ruch w stronę gracza
-        self.x += dx * self.speed
-        self.y += dy * self.speed
+        # Ruch w stronę gracza z mnożnikiem prędkości
+        self.x += dx * ENEMY_STARTING_SPEED * speed_multiplier
+        self.y += dy * ENEMY_STARTING_SPEED * speed_multiplier
         
     def draw(self, screen):
         # Rysowanie wroga jako okręgu
@@ -137,10 +132,9 @@ class Enemy:
         hp_ratio = self.hp / self.max_hp
         pygame.draw.rect(screen, RED, (bar_x, bar_y, bar_width * hp_ratio, bar_height))
 
-# Funkcja do generowania wrogów poza ekranem
+# Funkcja do generowania losowego punktu poza ekranem
 def spawn_enemy():
     side = random.choice(['top', 'bottom', 'left', 'right'])
-    
     if side == 'top':
         x = random.randint(0, SCREEN_WIDTH)
         y = -ENEMY_SPAWN_DISTANCE
@@ -153,7 +147,6 @@ def spawn_enemy():
     else:  # right
         x = SCREEN_WIDTH + ENEMY_SPAWN_DISTANCE
         y = random.randint(0, SCREEN_HEIGHT)
-    
     return Enemy(x, y)
 
 # Funkcja do sprawdzania kolizji
@@ -163,24 +156,40 @@ def check_collision(obj1_x, obj1_y, obj2_x, obj2_y, radius1, radius2):
 
 # Funkcja do rysowania ekranu game over
 def draw_game_over(screen, score):
-    screen.fill(BLACK)
+    font_large = pygame.font.SysFont(None, 72)
+    font_small = pygame.font.SysFont(None, 36)
     
-    game_over_text = text_font.render("GAME OVER", True, RED)
-    score_text = text_font.render(f"Score: {score}", True, WHITE)
-    restart_text = small_font.render("Press R to Restart", True, WHITE)
+    # Tekst Game Over
+    text = font_large.render("GAME OVER", True, RED)
+    screen.blit(text, (SCREEN_WIDTH//2 - text.get_width()//2, SCREEN_HEIGHT//2 - 50))
     
-    screen.blit(game_over_text, (SCREEN_WIDTH//2 - game_over_text.get_width()//2, SCREEN_HEIGHT//2 - 60))
-    screen.blit(score_text, (SCREEN_WIDTH//2 - score_text.get_width()//2, SCREEN_HEIGHT//2))
-    screen.blit(restart_text, (SCREEN_WIDTH//2 - restart_text.get_width()//2, SCREEN_HEIGHT//2 + 60))
+    # Wynik
+    score_text = font_small.render(f"Score: {score}", True, WHITE)
+    screen.blit(score_text, (SCREEN_WIDTH//2 - score_text.get_width()//2, SCREEN_HEIGHT//2 + 20))
+    
+    # Instrukcje
+    restart_text = font_small.render("Press R to Restart", True, WHITE)
+    screen.blit(restart_text, (SCREEN_WIDTH//2 - restart_text.get_width()//2, SCREEN_HEIGHT//2 + 70))
+    
+    esc_text = font_small.render("Press ESC to Resume", True, WHITE)
+    screen.blit(esc_text, (SCREEN_WIDTH//2 - esc_text.get_width()//2, SCREEN_HEIGHT//2 + 110))
 
 # Funkcja do rysowania pauzy
 def draw_pause_screen(screen):
-    overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-    overlay.fill((0, 0, 0, 180))
-    screen.blit(overlay, (0, 0))
+    font_large = pygame.font.SysFont(None, 72)
+    text = font_large.render("PAUSED", True, WHITE)
+    screen.blit(text, (SCREEN_WIDTH//2 - text.get_width()//2, SCREEN_HEIGHT//2))
+
+# Funkcja do rysowania ekranu startowego
+def draw_start_screen(screen):
+    font_large = pygame.font.SysFont(None, 72)
+    font_small = pygame.font.SysFont(None, 36)
     
-    pause_text = text_font.render("PAUSED", True, WHITE)
-    screen.blit(pause_text, (SCREEN_WIDTH//2 - pause_text.get_width()//2, SCREEN_HEIGHT//2))
+    text = font_large.render("TOP-DOWN SHOOTER", True, WHITE)
+    screen.blit(text, (SCREEN_WIDTH//2 - text.get_width()//2, SCREEN_HEIGHT//2 - 100))
+    
+    start_text = font_small.render("Press SPACE to Start", True, WHITE)
+    screen.blit(start_text, (SCREEN_WIDTH//2 - start_text.get_width()//2, SCREEN_HEIGHT//2))
 
 # Główna funkcja gry
 def main():
@@ -190,25 +199,22 @@ def main():
     score = 0
     game_over = False
     paused = False
-    last_enemy_spawn_time = pygame.time.get_ticks()
-    last_speed_increase_time = pygame.time.get_ticks()
-    enemy_speed = ENEMY_STARTING_SPEED
+    last_enemy_spawn = pygame.time.get_ticks()
+    last_speed_increase = pygame.time.get_ticks()
+    speed_multiplier = 1.0
     
     # Główna pętla gry
     running = True
     while running:
         mouse_x, mouse_y = pygame.mouse.get_pos()
         
-        # Obsługa zdarzeń
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            
-            if event.type == pygame.KEYDOWN:
+            elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     paused = not paused
-                
-                if game_over and event.key == pygame.K_r:
+                elif event.key == pygame.K_r and game_over:
                     # Restart gry
                     player = Player(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
                     bullets = []
@@ -216,17 +222,19 @@ def main():
                     score = 0
                     game_over = False
                     paused = False
-                    last_enemy_spawn_time = pygame.time.get_ticks()
-                    last_speed_increase_time = pygame.time.get_ticks()
-                    enemy_speed = ENEMY_STARTING_SPEED
-            
-            if event.type == pygame.MOUSEBUTTONDOWN and not game_over and not paused:
-                if event.button == 1:  # Lewy przycisk myszy
-                    # Strzał w kierunku kursora
-                    player.update_angle(mouse_x, mouse_y)
-                    bullets.append(Bullet(player.x, player.y, player.angle))
+                    last_enemy_spawn = pygame.time.get_ticks()
+                    last_speed_increase = pygame.time.get_ticks()
+                    speed_multiplier = 1.0
+                elif event.key == pygame.K_SPACE and not game_over:
+                    # Rozpocznij grę
+                    pass
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and not game_over and not paused:
+                # Strzał
+                bullet_x = player.x + math.cos(player.angle) * player.radius
+                bullet_y = player.y + math.sin(player.angle) * player.radius
+                bullets.append(Bullet(bullet_x, bullet_y, player.angle))
         
-        if not paused and not game_over:
+        if not game_over and not paused:
             # Ruch gracza
             keys = pygame.key.get_pressed()
             player.move(keys)
@@ -236,14 +244,14 @@ def main():
             
             # Spawnowanie wrogów
             current_time = pygame.time.get_ticks()
-            if current_time - last_enemy_spawn_time > 1000:  # Spawn co sekundę
+            if current_time - last_enemy_spawn > 1000:  # Spawn co sekundę
                 enemies.append(spawn_enemy())
-                last_enemy_spawn_time = current_time
+                last_enemy_spawn = current_time
             
             # Zwiększanie prędkości wrogów co 5 sekund
-            if current_time - last_speed_increase_time > ENEMY_SPEED_INCREASE_INTERVAL:
-                enemy_speed *= 1.10  # Zwiększ o 10%
-                last_speed_increase_time = current_time
+            if current_time - last_speed_increase > ENEMY_SPEED_INCREASE_INTERVAL:
+                speed_multiplier *= 1.10  # Zwiększ o 10%
+                last_speed_increase = current_time
             
             # Aktualizacja pocisków
             for bullet in bullets[:]:
@@ -253,28 +261,29 @@ def main():
                 
             # Aktualizacja wrogów
             for enemy in enemies:
-                enemy.update(player.x, player.y)
+                enemy.update(player.x, player.y, speed_multiplier)
                 
-            # Sprawdzanie kolizji pocisków z wrogami
+            # Kolizje pocisków z wrogami
             for bullet in bullets[:]:
                 for enemy in enemies[:]:
-                    if check_collision(bullet.x, bullet.y, enemy.x, enemy.y, bullet.radius, enemy.radius):
+                    if check_collision(bullet.x, bullet.y, enemy.x, enemy.y, BULLET_RADIUS, ENEMY_RADIUS):
                         enemy.hp -= BULLET_DAMAGE
-                        if bullet in bullets:
-                            bullets.remove(bullet)
-                        
                         if enemy.hp <= 0:
                             enemies.remove(enemy)
-                            score += SCORE_PER_ENEMY
+                            score += ENEMY_REWARD
+                        try:
+                            bullets.remove(bullet)
+                        except ValueError:
+                            pass
                         break
             
-            # Sprawdzanie kolizji wroga z graczem
+            # Kolizje wrogów z graczem
             for enemy in enemies[:]:
-                if check_collision(player.x, player.y, enemy.x, enemy.y, player.radius, enemy.radius):
+                if check_collision(player.x, player.y, enemy.x, enemy.y, PLAYER_RADIUS, ENEMY_RADIUS):
                     game_over = True
         
         # Rysowanie
-        screen.fill(WHITE)
+        screen.fill(BLACK)
         
         if not game_over:
             # Rysowanie gracza
@@ -289,25 +298,23 @@ def main():
                 enemy.draw(screen)
             
             # Rysowanie punktów
-            score_text = text_font.render(f"Score: {score}", True, BLACK)
+            font = pygame.font.SysFont(None, 36)
+            score_text = font.render(f"Score: {score}", True, WHITE)
             screen.blit(score_text, (10, 10))
             
             # Rysowanie prędkości wrogów
-            speed_text = small_font.render(f"Enemy Speed: {enemy_speed:.1f}", True, BLACK)
-            screen.blit(speed_text, (SCREEN_WIDTH - speed_text.get_width() - 10, 10))
-        
-        if game_over:
+            speed_text = font.render(f"Enemy Speed: {speed_multiplier:.2f}x", True, WHITE)
+            screen.blit(speed_text, (10, 50))
+        else:
             draw_game_over(screen, score)
         
         if paused and not game_over:
             draw_pause_screen(screen)
         
         pygame.display.flip()
-        clock.tick(60)
+        pygame.time.Clock().tick(60)
     
     pygame.quit()
-    sys.exit()
 
-# Uruchomienie gry
 if __name__ == "__main__":
     main()

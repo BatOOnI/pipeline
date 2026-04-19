@@ -23,6 +23,7 @@ BG_COLOR = (18, 18, 24)
 WHITE = (240, 240, 240)
 RED = (220, 60, 60)
 GREEN = (60, 220, 90)
+BLACK = (0, 0, 0)
 
 
 def clamp(x, a, b):

@@ -14,11 +14,12 @@ BULLET_RADIUS = 5
 ENEMY_RADIUS = 15
 PLAYER_SPEED = 5
 BULLET_SPEED = 10
-ENEMY_SPAWN_RATE = 2  # sekundy
-ENEMY_HEALTH = 100
+ENEMY_SPAWN_DISTANCE = 100
+ENEMY_STARTING_SPEED = 2.0
+ENEMY_SPEED_INCREASE_INTERVAL = 5000  # ms
+ENEMY_MAX_HP = 100
 BULLET_DAMAGE = 50
-ENEMY_SPEED_INCREASE_INTERVAL = 5  # sekundy
-ENEMY_SPEED_INCREASE_FACTOR = 0.1
+SCORE_PER_ENEMY = 10
 
 # Kolory
 WHITE = (255, 255, 255)
@@ -31,9 +32,11 @@ GRAY = (128, 128, 128)
 # Ustawienia ekranu
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 pygame.display.set_caption("Top-Down Shooter")
-font = pygame.font.Font(None, 36)
-small_font = pygame.font.Font(None, 24)
 clock = pygame.time.Clock()
+
+# Czcionki
+text_font = pygame.font.SysFont(None, 36)
+small_font = pygame.font.SysFont(None, 24)
 
 # Klasa gracza
 class Player:
@@ -42,7 +45,7 @@ class Player:
         self.y = y
         self.radius = PLAYER_RADIUS
         self.speed = PLAYER_SPEED
-        self.health = 100
+        self.angle = 0
         
     def move(self, keys):
         if keys[pygame.K_w]:
@@ -57,32 +60,33 @@ class Player:
         # Ograniczenie ruchu do ekranu
         self.x = max(self.radius, min(SCREEN_WIDTH - self.radius, self.x))
         self.y = max(self.radius, min(SCREEN_HEIGHT - self.radius, self.y))
-    
+        
+    def update_angle(self, mouse_x, mouse_y):
+        dx = mouse_x - self.x
+        dy = mouse_y - self.y
+        self.angle = math.atan2(dy, dx)
+        
     def draw(self, screen):
+        # Rysowanie gracza jako okręgu
         pygame.draw.circle(screen, BLUE, (int(self.x), int(self.y)), self.radius)
-        # Rysowanie lufy
-        mouse_x, mouse_y = pygame.mouse.get_pos()
-        angle = math.atan2(mouse_y - self.y, mouse_x - self.x)
-        end_x = self.x + math.cos(angle) * (self.radius + 10)
-        end_y = self.y + math.sin(angle) * (self.radius + 10)
-        pygame.draw.line(screen, BLACK, (self.x, self.y), (end_x, end_y), 3)
+        
+        # Rysowanie lufy (krótka linia na krawędzi koła)
+        end_x = self.x + math.cos(self.angle) * self.radius
+        end_y = self.y + math.sin(self.angle) * self.radius
+        pygame.draw.line(screen, BLACK, (self.x, self.y), (end_x, end_y), 4)
 
 # Klasa pocisku
 class Bullet:
-    def __init__(self, x, y, target_x, target_y):
+    def __init__(self, x, y, angle):
         self.x = x
         self.y = y
         self.radius = BULLET_RADIUS
-        # Oblicz wektor kierunkowy
-        dx = target_x - x
-        dy = target_y - y
-        distance = max(1, math.sqrt(dx*dx + dy*dy))
-        self.dx = (dx / distance) * BULLET_SPEED
-        self.dy = (dy / distance) * BULLET_SPEED
+        self.speed = BULLET_SPEED
+        self.angle = angle
         
     def update(self):
-        self.x += self.dx
-        self.y += self.dy
+        self.x += math.cos(self.angle) * self.speed
+        self.y += math.sin(self.angle) * self.speed
         
     def draw(self, screen):
         pygame.draw.circle(screen, GREEN, (int(self.x), int(self.y)), self.radius)
@@ -97,42 +101,59 @@ class Enemy:
         self.x = x
         self.y = y
         self.radius = ENEMY_RADIUS
-        self.health = ENEMY_HEALTH
+        self.speed = ENEMY_STARTING_SPEED
+        self.max_hp = ENEMY_MAX_HP
+        self.hp = ENEMY_MAX_HP
         
-    def update(self, player_x, player_y, speed_factor):
-        # Oblicz wektor kierunkowy do gracza
+    def update(self, player_x, player_y):
+        # Oblicz wektor do gracza
         dx = player_x - self.x
         dy = player_y - self.y
-        distance = max(1, math.sqrt(dx*dx + dy*dy))
+        distance = math.sqrt(dx*dx + dy*dy)
         
-        # Poruszanie się w stronę gracza z mnożnikiem prędkości
-        self.x += (dx / distance) * speed_factor
-        self.y += (dy / distance) * speed_factor
+        # Normalizacja wektora
+        if distance > 0:
+            dx /= distance
+            dy /= distance
+            
+        # Ruch w stronę gracza
+        self.x += dx * self.speed
+        self.y += dy * self.speed
         
     def draw(self, screen):
+        # Rysowanie wroga jako okręgu
         pygame.draw.circle(screen, RED, (int(self.x), int(self.y)), self.radius)
-        # Pasek życia
+        
+        # Rysowanie paska życia
         bar_width = self.radius * 2
         bar_height = 5
-        health_ratio = self.health / ENEMY_HEALTH
-        pygame.draw.rect(screen, RED, (self.x - bar_width/2, self.y - self.radius - 10, bar_width, bar_height))
-        pygame.draw.rect(screen, GREEN, (self.x - bar_width/2, self.y - self.radius - 10, bar_width * health_ratio, bar_height))
+        bar_x = self.x - bar_width / 2
+        bar_y = self.y - self.radius - 10
+        
+        # Tło paska życia
+        pygame.draw.rect(screen, BLACK, (bar_x, bar_y, bar_width, bar_height))
+        
+        # Żyje pasek
+        hp_ratio = self.hp / self.max_hp
+        pygame.draw.rect(screen, RED, (bar_x, bar_y, bar_width * hp_ratio, bar_height))
 
 # Funkcja do generowania wrogów poza ekranem
 def spawn_enemy():
     side = random.choice(['top', 'bottom', 'left', 'right'])
+    
     if side == 'top':
         x = random.randint(0, SCREEN_WIDTH)
-        y = -ENEMY_RADIUS
+        y = -ENEMY_SPAWN_DISTANCE
     elif side == 'bottom':
         x = random.randint(0, SCREEN_WIDTH)
-        y = SCREEN_HEIGHT + ENEMY_RADIUS
+        y = SCREEN_HEIGHT + ENEMY_SPAWN_DISTANCE
     elif side == 'left':
-        x = -ENEMY_RADIUS
+        x = -ENEMY_SPAWN_DISTANCE
         y = random.randint(0, SCREEN_HEIGHT)
     else:  # right
-        x = SCREEN_WIDTH + ENEMY_RADIUS
+        x = SCREEN_WIDTH + ENEMY_SPAWN_DISTANCE
         y = random.randint(0, SCREEN_HEIGHT)
+    
     return Enemy(x, y)
 
 # Funkcja do sprawdzania kolizji
@@ -140,130 +161,153 @@ def check_collision(obj1_x, obj1_y, obj2_x, obj2_y, radius1, radius2):
     distance = math.sqrt((obj1_x - obj2_x)**2 + (obj1_y - obj2_y)**2)
     return distance < (radius1 + radius2)
 
-class Game:
-    def __init__(self):
-        self.player = Player(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
-        self.bullets = []
-        self.enemies = []
-        self.score = 0
-        self.game_over = False
-        self.paused = False
-        self.enemy_spawn_timer = 0
-        self.last_speed_increase = 0
-        self.enemy_speed_factor = 1.0
+# Funkcja do rysowania ekranu game over
+def draw_game_over(screen, score):
+    screen.fill(BLACK)
+    
+    game_over_text = text_font.render("GAME OVER", True, RED)
+    score_text = text_font.render(f"Score: {score}", True, WHITE)
+    restart_text = small_font.render("Press R to Restart", True, WHITE)
+    
+    screen.blit(game_over_text, (SCREEN_WIDTH//2 - game_over_text.get_width()//2, SCREEN_HEIGHT//2 - 60))
+    screen.blit(score_text, (SCREEN_WIDTH//2 - score_text.get_width()//2, SCREEN_HEIGHT//2))
+    screen.blit(restart_text, (SCREEN_WIDTH//2 - restart_text.get_width()//2, SCREEN_HEIGHT//2 + 60))
+
+# Funkcja do rysowania pauzy
+def draw_pause_screen(screen):
+    overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, 180))
+    screen.blit(overlay, (0, 0))
+    
+    pause_text = text_font.render("PAUSED", True, WHITE)
+    screen.blit(pause_text, (SCREEN_WIDTH//2 - pause_text.get_width()//2, SCREEN_HEIGHT//2))
+
+# Główna funkcja gry
+def main():
+    player = Player(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
+    bullets = []
+    enemies = []
+    score = 0
+    game_over = False
+    paused = False
+    last_enemy_spawn_time = pygame.time.get_ticks()
+    last_speed_increase_time = pygame.time.get_ticks()
+    enemy_speed = ENEMY_STARTING_SPEED
+    
+    # Główna pętla gry
+    running = True
+    while running:
+        mouse_x, mouse_y = pygame.mouse.get_pos()
         
-    def handle_events(self):
+        # Obsługa zdarzeń
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                return False
-            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and not self.game_over and not self.paused:
-                # Strzelanie
-                mouse_x, mouse_y = pygame.mouse.get_pos()
-                self.bullets.append(Bullet(self.player.x, self.player.y, mouse_x, mouse_y))
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_r and self.game_over:
-                    # Restart gry
-                    self.__init__()
-                elif event.key == pygame.K_ESCAPE:
-                    # Pauza
-                    self.paused = not self.paused
-        return True
-    
-    def update(self, dt):
-        if self.game_over or self.paused:
-            return
-        
-        keys = pygame.key.get_pressed()
-        self.player.move(keys)
-        
-        # Aktualizacja pocisków
-        for bullet in self.bullets[:]:
-            bullet.update()
-            if bullet.is_off_screen():
-                self.bullets.remove(bullet)
+                running = False
             
-        # Spawnowanie wrogów
-        self.enemy_spawn_timer += dt
-        if self.enemy_spawn_timer >= ENEMY_SPAWN_RATE:
-            self.enemies.append(spawn_enemy())
-            self.enemy_spawn_timer = 0
-        
-        # Aktualizacja wrogów
-        for enemy in self.enemies:
-            enemy.update(self.player.x, self.player.y, self.enemy_speed_factor)
-            
-        # Kolizje pocisków z wrogami
-        for bullet in self.bullets[:]:
-            for enemy in self.enemies[:]:
-                if check_collision(bullet.x, bullet.y, enemy.x, enemy.y, bullet.radius, enemy.radius):
-                    enemy.health -= BULLET_DAMAGE
-                    if enemy.health <= 0:
-                        self.enemies.remove(enemy)
-                        self.score += 10
-                    try:
-                        self.bullets.remove(bullet)
-                    except ValueError:
-                        pass
-                    break
-        
-        # Kolizje wrogów z graczem
-        for enemy in self.enemies[:]:
-            if check_collision(self.player.x, self.player.y, enemy.x, enemy.y, self.player.radius, enemy.radius):
-                self.game_over = True
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    paused = not paused
                 
-        # Zwiększanie prędkości wrogów co 5 sekund
-        self.last_speed_increase += dt
-        if self.last_speed_increase >= ENEMY_SPEED_INCREASE_INTERVAL:
-            self.enemy_speed_factor *= (1 + ENEMY_SPEED_INCREASE_FACTOR)
-            self.last_speed_increase = 0
-    
-    def draw(self, screen):
+                if game_over and event.key == pygame.K_r:
+                    # Restart gry
+                    player = Player(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
+                    bullets = []
+                    enemies = []
+                    score = 0
+                    game_over = False
+                    paused = False
+                    last_enemy_spawn_time = pygame.time.get_ticks()
+                    last_speed_increase_time = pygame.time.get_ticks()
+                    enemy_speed = ENEMY_STARTING_SPEED
+            
+            if event.type == pygame.MOUSEBUTTONDOWN and not game_over and not paused:
+                if event.button == 1:  # Lewy przycisk myszy
+                    # Strzał w kierunku kursora
+                    player.update_angle(mouse_x, mouse_y)
+                    bullets.append(Bullet(player.x, player.y, player.angle))
+        
+        if not paused and not game_over:
+            # Ruch gracza
+            keys = pygame.key.get_pressed()
+            player.move(keys)
+            
+            # Obracanie gracza w stronę myszy
+            player.update_angle(mouse_x, mouse_y)
+            
+            # Spawnowanie wrogów
+            current_time = pygame.time.get_ticks()
+            if current_time - last_enemy_spawn_time > 1000:  # Spawn co sekundę
+                enemies.append(spawn_enemy())
+                last_enemy_spawn_time = current_time
+            
+            # Zwiększanie prędkości wrogów co 5 sekund
+            if current_time - last_speed_increase_time > ENEMY_SPEED_INCREASE_INTERVAL:
+                enemy_speed *= 1.10  # Zwiększ o 10%
+                last_speed_increase_time = current_time
+            
+            # Aktualizacja pocisków
+            for bullet in bullets[:]:
+                bullet.update()
+                if bullet.is_off_screen():
+                    bullets.remove(bullet)
+                
+            # Aktualizacja wrogów
+            for enemy in enemies:
+                enemy.update(player.x, player.y)
+                
+            # Sprawdzanie kolizji pocisków z wrogami
+            for bullet in bullets[:]:
+                for enemy in enemies[:]:
+                    if check_collision(bullet.x, bullet.y, enemy.x, enemy.y, bullet.radius, enemy.radius):
+                        enemy.hp -= BULLET_DAMAGE
+                        if bullet in bullets:
+                            bullets.remove(bullet)
+                        
+                        if enemy.hp <= 0:
+                            enemies.remove(enemy)
+                            score += SCORE_PER_ENEMY
+                        break
+            
+            # Sprawdzanie kolizji wroga z graczem
+            for enemy in enemies[:]:
+                if check_collision(player.x, player.y, enemy.x, enemy.y, player.radius, enemy.radius):
+                    game_over = True
+        
+        # Rysowanie
         screen.fill(WHITE)
         
-        if not self.game_over and not self.paused:
+        if not game_over:
             # Rysowanie gracza
-            self.player.draw(screen)
+            player.draw(screen)
             
             # Rysowanie pocisków
-            for bullet in self.bullets:
+            for bullet in bullets:
                 bullet.draw(screen)
             
             # Rysowanie wrogów
-            for enemy in self.enemies:
+            for enemy in enemies:
                 enemy.draw(screen)
+            
+            # Rysowanie punktów
+            score_text = text_font.render(f"Score: {score}", True, BLACK)
+            screen.blit(score_text, (10, 10))
+            
+            # Rysowanie prędkości wrogów
+            speed_text = small_font.render(f"Enemy Speed: {enemy_speed:.1f}", True, BLACK)
+            screen.blit(speed_text, (SCREEN_WIDTH - speed_text.get_width() - 10, 10))
         
-        # Rysowanie punktów
-        score_text = font.render(f"Score: {self.score}", True, BLACK)
-        screen.blit(score_text, (10, 10))
+        if game_over:
+            draw_game_over(screen, score)
         
-        # Rysowanie prędkości wrogów
-        speed_text = small_font.render(f"Enemy Speed: {self.enemy_speed_factor:.2f}x", True, BLACK)
-        screen.blit(speed_text, (10, 50))
-        
-        if self.game_over:
-            # Ekran game over
-            game_over_text = font.render("GAME OVER", True, RED)
-            restart_text = small_font.render("Press R to Restart", True, BLACK)
-            screen.blit(game_over_text, (SCREEN_WIDTH//2 - game_over_text.get_width()//2, SCREEN_HEIGHT//2 - 30))
-            screen.blit(restart_text, (SCREEN_WIDTH//2 - restart_text.get_width()//2, SCREEN_HEIGHT//2 + 10))
-        
-        if self.paused:
-            # Ekran pauzy
-            pause_text = font.render("PAUSED", True, BLACK)
-            screen.blit(pause_text, (SCREEN_WIDTH//2 - pause_text.get_width()//2, SCREEN_HEIGHT//2))
+        if paused and not game_over:
+            draw_pause_screen(screen)
         
         pygame.display.flip()
-
-# Główna pętla gry
-game = Game()
-running = True
-
-while running:
-    dt = clock.tick(60) / 1000.0  # Czas w sekundach
+        clock.tick(60)
     
-    running = game.handle_events()
-    game.update(dt)
-    game.draw(screen)
+    pygame.quit()
+    sys.exit()
 
-pygame.quit()
-sys.exit()
+# Uruchomienie gry
+if __name__ == "__main__":
+    main()

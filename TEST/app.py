@@ -84,25 +84,15 @@ def main():
     last_enemy_spawn = 0
 
     while True:
-        dt = clock.tick(60) / 1000.0
-        elapsed += dt
-
         # --- Obsługa zdarzeń ---
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return
-            elif event.type == pygame.KEYDOWN:
+            if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     paused = not paused
 
-        if paused:
-            # --- Rysowanie pauzy ---
-            screen.fill(BLACK)
-            draw_text_center(screen, big_font, "PAUZA", HEIGHT // 2 - 50, WHITE)
-            draw_text_center(screen, font, "Naciśnij ESC, aby kontynuować", HEIGHT // 2 + 50, WHITE)
-            pygame.display.flip()
-            continue
-
+        # --- Rysowanie ---
         # --- Rysowanie ---
         screen.fill(BLACK)
         # ... rest of drawing code would go here ...

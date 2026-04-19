@@ -72,6 +72,18 @@ def main():
     big_font = pygame.font.SysFont(None, 64)
 
     # --- Stan gry ---
+    elapsed = 0
+    player_x = WIDTH / 2
+    player_y = HEIGHT / 2
+    player_angle = 0
+    enemies = []
+    bullets = []
+    score = 0
+    paused = False
+    game_over = False
+    last_enemy_spawn = 0
+    enemy_speed_increase_timer = 0
+    # --- Stan gry ---
     player_x = WIDTH / 2
     player_y = HEIGHT / 2
     player_angle = 0

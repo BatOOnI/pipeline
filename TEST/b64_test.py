@@ -1,8 +1,8 @@
 def greet():
-    return "hello"
+    return "hello from b64"
 
 def calc():
-    return 2 + 2
+    return 10
 
 if __name__ == "__main__":
     print(greet())

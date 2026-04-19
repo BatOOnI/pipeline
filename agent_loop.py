@@ -181,6 +181,12 @@ class PipelineState:
     patch_strategy_reason: str = ""
     patch_exact_snippet: str = ""
     patch_hotspot_label: str = ""
+    patch_task_intent: str = ""
+    patch_hotspot_candidates: list = field(default_factory=list)
+    patch_hotspot_primary_index: int = 0
+    patch_hotspot_secondary_index: int = 1
+    patch_hotspot_fail_counts: dict = field(default_factory=dict)
+    patch_hotspot_last_fail_reason: str = ""
     patch_stale_error_detected: bool = False
     patch_stale_error_reason: str = ""
     patch_replace_miss_streak: int = 0
@@ -329,11 +335,41 @@ def _is_likely_large_create_prompt(user_prompt):
     return False
 
 
-def _choose_initial_create_strategy(user_prompt):
+def _is_effectively_empty_project_root(project_root):
+    root = str(project_root or "").strip()
+    if not root or not os.path.isdir(root):
+        return True
+    ignored_names = {".git", ".agent", "__pycache__"}
+    ignored_ext = {".log", ".tmp"}
+    try:
+        for entry in os.scandir(root):
+            name = entry.name.lower()
+            if name in ignored_names:
+                continue
+            if entry.is_file() and os.path.splitext(name)[1] in ignored_ext:
+                continue
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _choose_initial_create_strategy(user_prompt, project_root=""):
     provider = str(config.PROVIDER or "").strip().lower()
+    fresh_empty = _is_effectively_empty_project_root(project_root)
+    prompt_size = len(_normalize_prompt_text(user_prompt))
+    if fresh_empty:
+        # Fresh local create should stay simple first; chunking is escalation-only.
+        if provider == "lmstudio":
+            if prompt_size >= 1800:
+                return "chunked_rewrite", "very large prompt in fresh project"
+            return "write_file", "fresh empty project default"
+        if prompt_size >= 1400:
+            return "chunked_rewrite", "large prompt size"
+        return "write_file", "fresh empty project default"
     if _is_likely_large_create_prompt(user_prompt) and provider == "lmstudio":
         return "chunked_rewrite", "large-task heuristic"
-    if len(_normalize_prompt_text(user_prompt)) >= 1000:
+    if prompt_size >= 1000:
         return "chunked_rewrite", "large prompt size"
     return "write_file", "default simple create"
 
@@ -817,6 +853,12 @@ def _soft_reset_runtime_state(state):
     state.patch_failure_streak = 0
     state.patch_exact_snippet = ""
     state.patch_hotspot_label = ""
+    state.patch_task_intent = ""
+    state.patch_hotspot_candidates = []
+    state.patch_hotspot_primary_index = 0
+    state.patch_hotspot_secondary_index = 1
+    state.patch_hotspot_fail_counts = {}
+    state.patch_hotspot_last_fail_reason = ""
     state.patch_stale_error_detected = False
     state.patch_stale_error_reason = ""
     state.patch_replace_miss_streak = 0
@@ -854,6 +896,13 @@ def _hydrate_state_from_session(state, session_data):
     state.patch_failure_streak = int(session_data.get("patch_failure_streak") or 0)
     state.patch_exact_snippet = str(session_data.get("patch_exact_snippet") or "")
     state.patch_hotspot_label = str(session_data.get("patch_hotspot_label") or "")
+    state.patch_task_intent = str(session_data.get("patch_task_intent") or "")
+    state.patch_hotspot_candidates = list(session_data.get("patch_hotspot_candidates") or [])
+    state.patch_hotspot_primary_index = int(session_data.get("patch_hotspot_primary_index") or 0)
+    state.patch_hotspot_secondary_index = int(session_data.get("patch_hotspot_secondary_index") or 1)
+    cached_fail_counts = session_data.get("patch_hotspot_fail_counts") or {}
+    state.patch_hotspot_fail_counts = dict(cached_fail_counts) if isinstance(cached_fail_counts, dict) else {}
+    state.patch_hotspot_last_fail_reason = str(session_data.get("patch_hotspot_last_fail_reason") or "")
     state.patch_stale_error_detected = bool(session_data.get("patch_stale_error_detected") or False)
     state.patch_stale_error_reason = str(session_data.get("patch_stale_error_reason") or "")
     state.patch_replace_miss_streak = int(session_data.get("patch_replace_miss_streak") or 0)
@@ -916,6 +965,12 @@ def _save_session_state(state):
         "patch_failure_streak": state.patch_failure_streak,
         "patch_exact_snippet": state.patch_exact_snippet,
         "patch_hotspot_label": state.patch_hotspot_label,
+        "patch_task_intent": state.patch_task_intent,
+        "patch_hotspot_candidates": list(state.patch_hotspot_candidates),
+        "patch_hotspot_primary_index": state.patch_hotspot_primary_index,
+        "patch_hotspot_secondary_index": state.patch_hotspot_secondary_index,
+        "patch_hotspot_fail_counts": dict(state.patch_hotspot_fail_counts),
+        "patch_hotspot_last_fail_reason": state.patch_hotspot_last_fail_reason,
         "patch_stale_error_detected": state.patch_stale_error_detected,
         "patch_stale_error_reason": state.patch_stale_error_reason,
         "patch_replace_miss_streak": state.patch_replace_miss_streak,
@@ -963,7 +1018,7 @@ def _build_state(user_prompt):
         required_b64_fields=_required_b64_fields(user_prompt),
     )
     if mode == "create":
-        strategy, strategy_reason = _choose_initial_create_strategy(user_prompt)
+        strategy, strategy_reason = _choose_initial_create_strategy(user_prompt, active_project_root)
         state.create_strategy = strategy
         state.create_strategy_reason = strategy_reason
         state.create_phase = "chunk_begin" if strategy == "chunked_rewrite" else "initial_create"
@@ -1286,29 +1341,238 @@ def _patch_focus_tokens(user_prompt, state, history=None):
     return unique
 
 
+def _behavior_patch_signals(user_prompt):
+    lower = _normalize_prompt_text(user_prompt)
+    buckets = []
+    if any(token in lower for token in ("esc", "pause", "paused")):
+        buckets.append("pause/esc")
+    if any(token in lower for token in ("keyboard", "input", "keypress", "event")):
+        buckets.append("event loop / keyboard handling")
+    if any(token in lower for token in ("game loop", "restart", "game over", "score", "shoot", "enemy", "movement")):
+        buckets.append("gameplay loop")
+    return {
+        "active": bool(buckets),
+        "buckets": buckets,
+    }
+
+
+def _is_helper_like_hotspot(text):
+    lowered = _normalize_prompt_text(text)
+    helper_markers = ("clamp", "helper", "util", "normalize", "lerp", "math", "vector", "bounds")
+    return any(marker in lowered for marker in helper_markers)
+
+
+def _derive_patch_task_intent(user_prompt):
+    lower = _normalize_prompt_text(user_prompt)
+    intents = []
+    if any(token in lower for token in ("esc", "pause", "keyboard", "input", "event", "keydown", "keyup")):
+        intents.append("event loop / keyboard handling")
+    if any(token in lower for token in ("restart", "game over", "score", "shoot", "enemy", "movement", "update", "draw")):
+        intents.append("gameplay loop")
+    if any(token in lower for token in ("ui", "hud", "overlay", "menu")):
+        intents.append("ui/hud behavior")
+    if not intents:
+        intents.append("targeted behavior fix")
+    return ", ".join(dict.fromkeys(intents))
+
+
+def _candidate_snippet(path, project_root, line_no):
+    return read_file_snippet(
+        path,
+        project_root=project_root,
+        max_lines=max(18, config.PATCH_SNIPPET_LINES // 3),
+        around_line=line_no,
+    )
+
+
+def _hotspot_candidates_text(candidates):
+    lines = []
+    for idx, item in enumerate(candidates[:3], 1):
+        lines.append(f"- #{idx} {item.get('label', '(unknown)')} score={item.get('score', 0)} reason={item.get('reason', 'n/a')}")
+    return "\n".join(lines) if lines else "(none)"
+
+
+def _candidate_by_index(candidates, index):
+    if not isinstance(candidates, list) or not candidates:
+        return {}
+    if index < 0 or index >= len(candidates):
+        return {}
+    item = candidates[index]
+    return item if isinstance(item, dict) else {}
+
+
+def _action_mentions_hotspot_candidate(action, candidate):
+    if not isinstance(candidate, dict):
+        return False
+    action_type = str(action.get("type", ""))
+    if action_type not in {"replace_in_file", "insert_before", "insert_after", "replace_block", "patch_lines", "write_file"}:
+        return False
+    args = action.get("args") if isinstance(action.get("args"), dict) else {}
+    probe = " ".join(
+        str(args.get(key, ""))
+        for key in ("old", "new", "anchor", "start_anchor", "end_anchor", "content", "new_content")
+    )
+    probe_norm = _normalize_prompt_text(probe)
+    snippet_norm = _normalize_prompt_text(candidate.get("snippet", ""))
+    label_norm = _normalize_prompt_text(candidate.get("label", ""))
+    if not probe_norm:
+        return False
+    if label_norm and label_norm in probe_norm:
+        return True
+    shared_tokens = [token for token in _keyword_tokens(candidate.get("label", "")) if token in probe_norm]
+    if shared_tokens:
+        return True
+    snippet_tokens = [token for token in _keyword_tokens(candidate.get("snippet", "")) if len(token) >= 4]
+    overlap = sum(1 for token in snippet_tokens[:20] if token in probe_norm)
+    return overlap >= 2 and bool(snippet_norm)
+
+
+def _action_outside_grounded_hotspots(action, state):
+    if state.mode != "patch":
+        return False
+    action_type = str(action.get("type", ""))
+    if action_type not in {"insert_before", "insert_after", "replace_block", "replace_in_file"}:
+        return False
+    candidates = state.patch_hotspot_candidates if isinstance(state.patch_hotspot_candidates, list) else []
+    if not candidates:
+        return False
+    primary = _candidate_by_index(candidates, state.patch_hotspot_primary_index)
+    secondary = _candidate_by_index(candidates, state.patch_hotspot_secondary_index)
+    if _action_mentions_hotspot_candidate(action, primary):
+        return False
+    if _action_mentions_hotspot_candidate(action, secondary):
+        return False
+    return True
+
+
+def _negotiate_hotspot_from_actions(state, actions):
+    candidates = state.patch_hotspot_candidates if isinstance(state.patch_hotspot_candidates, list) else []
+    if len(candidates) < 2:
+        return False, ""
+    primary = _candidate_by_index(candidates, state.patch_hotspot_primary_index)
+    primary_idx = state.patch_hotspot_primary_index
+    for idx, candidate in enumerate(candidates[:3]):
+        if idx == primary_idx:
+            continue
+        for action in actions:
+            if _action_mentions_hotspot_candidate(action, candidate):
+                state.patch_hotspot_primary_index = idx
+                state.patch_hotspot_secondary_index = 0 if idx != 0 else (1 if len(candidates) > 1 else 0)
+                state.patch_hotspot_label = str(candidate.get("label", ""))
+                state.patch_exact_snippet = str(candidate.get("snippet", ""))
+                return True, f"agent selected candidate #{idx + 1}"
+    return False, ""
+
+
+def _promote_hotspot_candidate(state, reason):
+    candidates = state.patch_hotspot_candidates if isinstance(state.patch_hotspot_candidates, list) else []
+    if len(candidates) < 2:
+        return False, ""
+    current_idx = max(0, int(state.patch_hotspot_primary_index if state.patch_hotspot_primary_index is not None else 0))
+    current = _candidate_by_index(candidates, current_idx)
+    current_label = str(current.get("label", "")) if current else ""
+    if current_label:
+        state.patch_hotspot_fail_counts[current_label] = int(state.patch_hotspot_fail_counts.get(current_label, 0)) + 1
+    next_idx = max(0, int(state.patch_hotspot_secondary_index if state.patch_hotspot_secondary_index is not None else 1))
+    if next_idx == current_idx or next_idx >= len(candidates):
+        next_idx = (current_idx + 1) % len(candidates)
+    promoted = _candidate_by_index(candidates, next_idx)
+    if not promoted:
+        return False, ""
+    state.patch_hotspot_primary_index = next_idx
+    alt = [i for i in range(min(3, len(candidates))) if i != next_idx]
+    state.patch_hotspot_secondary_index = alt[0] if alt else next_idx
+    state.patch_hotspot_label = str(promoted.get("label", ""))
+    state.patch_exact_snippet = str(promoted.get("snippet", ""))
+    state.patch_hotspot_last_fail_reason = str(reason or "")
+    return True, f"primary -> secondary (#{current_idx + 1} -> #{next_idx + 1})"
+
+
 def _derive_patch_hotspots(path, project_root, user_prompt, state, history=None, max_items=6):
     outline_items = _discover_file_outline(path, project_root, max_items=18)
     if not outline_items:
-        return {"summary": "(hotspots unavailable)", "snippet": "(snippet unavailable)", "anchors": []}
+        return {
+            "summary": "(hotspots unavailable)",
+            "snippet": "(snippet unavailable)",
+            "anchors": [],
+            "selected_hotspot": "",
+            "selected_score": 0,
+            "focus_context": "",
+        }
 
     tokens = _patch_focus_tokens(user_prompt, state, history=history)
-    matched = []
+    behavior = _behavior_patch_signals(user_prompt)
+    lower_prompt = _normalize_prompt_text(user_prompt)
+    pause_input_intent = any(token in lower_prompt for token in ("esc", "pause", "keyboard", "input", "event", "keydown", "keyup"))
+    prior_hotspot = _normalize_prompt_text(getattr(state, "patch_hotspot_label", ""))
+    scored = []
+    task_intent = _derive_patch_task_intent(user_prompt)
     for line_no, text in outline_items:
         lowered = _normalize_prompt_text(text)
-        if any(token in lowered for token in tokens):
-            matched.append((line_no, text))
-        if len(matched) >= max_items:
-            break
+        token_hits = sum(1 for token in tokens if token in lowered)
+        score = token_hits * 4
 
-    hotspots = matched or outline_items[:max_items]
-    hotspot_lines = [f"- L{line_no}: {text}" for line_no, text in hotspots]
-    snippet_query = " ".join(tokens[:8]) or user_prompt
-    snippet = _focused_patch_snippets(path, project_root, snippet_query, max(24, config.PATCH_SNIPPET_LINES // 2))
+        if behavior["active"]:
+            if any(marker in lowered for marker in ("def main", " main(", "event", "input", "key", "pause", "update", "draw", "loop", "restart", "score", "enemy", "shoot")):
+                score += 8
+            if _is_helper_like_hotspot(text):
+                score -= 6
+        if pause_input_intent:
+            if any(marker in lowered for marker in ("def main", " main(", "event", "input", "key", "pause", "loop")):
+                score += 6
+            if any(marker in lowered for marker in ("draw", "hud", "score")) and "main" not in lowered:
+                score -= 3
+
+        if prior_hotspot and (prior_hotspot in lowered or lowered in prior_hotspot):
+            score += 2
+
+        fail_penalty = int(state.patch_hotspot_fail_counts.get(text, 0)) * 4
+        score -= fail_penalty
+        reason_parts = []
+        if token_hits:
+            reason_parts.append(f"token_hits={token_hits}")
+        if behavior["active"] and any(marker in lowered for marker in ("def main", " main(", "event", "input", "key", "pause", "update", "draw", "loop", "restart", "score", "enemy", "shoot")):
+            reason_parts.append("behavior-match")
+        if _is_helper_like_hotspot(text):
+            reason_parts.append("helper-downweight")
+        if fail_penalty:
+            reason_parts.append(f"fail_penalty={fail_penalty}")
+        scored.append((score, line_no, text, ", ".join(reason_parts) or "baseline"))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    hotspots = [(line_no, text) for score, line_no, text, _ in scored[:max_items]]
+    if not hotspots:
+        hotspots = outline_items[:max_items]
+
+    selected_score, selected_line, selected_text, _ = scored[0]
+    hotspot_lines = [f"- L{line_no}: {text} (score={score})" for score, line_no, text, _ in scored[:max_items]]
+    snippet = read_file_snippet(
+        path,
+        project_root=project_root,
+        max_lines=max(24, config.PATCH_SNIPPET_LINES // 2),
+        around_line=selected_line,
+    )
     anchors = [text for _, text in hotspots[:8]]
+    candidates = []
+    for score, line_no, text, reason in scored[:3]:
+        candidates.append(
+            {
+                "label": text,
+                "line": line_no,
+                "score": int(score),
+                "reason": reason,
+                "snippet": _candidate_snippet(path, project_root, line_no),
+            }
+        )
     return {
         "summary": "\n".join(hotspot_lines),
         "snippet": snippet,
         "anchors": anchors,
+        "selected_hotspot": selected_text,
+        "selected_score": selected_score,
+        "focus_context": ", ".join(behavior["buckets"]) if behavior["buckets"] else "",
+        "task_intent": task_intent,
+        "candidates": candidates,
     }
 
 
@@ -1337,6 +1601,10 @@ def build_instruction_bits(
     patch_phase="patch_target",
     patch_strategy="surgical_patch",
     patch_hotspots_summary="",
+    patch_task_intent="",
+    hotspot_candidates_text="",
+    hotspot_primary_label="",
+    hotspot_secondary_label="",
     stale_error_detected=False,
     stale_error_reason="",
     task_profile="",
@@ -1378,6 +1646,7 @@ def build_instruction_bits(
             "Mode: patch",
             f"PATCH PHASE: {patch_phase}",
             f"PATCH STRATEGY: {patch_strategy}",
+            f"PATCH TASK INTENT: {patch_task_intent or 'targeted behavior fix'}",
             f"TASK PROFILE: {task_profile or 'standard_patch'}",
             f"MODEL ROUTE: {model_route or 'local/default'}",
             f"User patch request: {user_prompt}",
@@ -1394,6 +1663,7 @@ def build_instruction_bits(
             "- Default to one existing file.",
             "- Keep target fixed: all file actions must stay on active_patch_target unless user explicitly expands scope.",
             "- Source-of-truth priority: current real file snapshot and anchors override older traceback/log text.",
+            "- AGENT SHOULD CHOOSE PRIMARY HOTSPOT FROM THESE CANDIDATES and stay within grounded candidate regions.",
             "- Use ONLY anchors that appear in the provided real outline, real anchors, or focused snippets.",
             "- Prefer exact anchor strings copied from the provided file data. Do not invent function or method names.",
             "- Patch/rewrite only mapped hotspot areas unless a clear error proves another area is required.",
@@ -1422,6 +1692,12 @@ def build_instruction_bits(
             "",
             "Patch hotspots:",
             patch_hotspots_summary or "(hotspots unavailable)",
+            "",
+            "Hotspot candidates:",
+            hotspot_candidates_text or "(none)",
+            f"CURRENT PRIMARY HOTSPOT: {hotspot_primary_label or '(unset)'}",
+            f"SECONDARY HOTSPOT: {hotspot_secondary_label or '(unset)'}",
+            "If current hotspot fails, use the next grounded candidate instead of inventing a new region.",
             "",
             "Patch context priority:",
             "current snapshot > stale logs",
@@ -1554,6 +1830,16 @@ def build_prompt(user_prompt, history, state):
     file_outline = ""
     real_anchors = ""
     patch_hotspots_summary = ""
+    patch_task_intent = str(getattr(state, "patch_task_intent", "") or "")
+    hotspot_candidates_text = _hotspot_candidates_text(getattr(state, "patch_hotspot_candidates", []) or [])
+    hotspot_primary_label = str(getattr(state, "patch_hotspot_label", "") or "")
+    hotspot_secondary_label = ""
+    secondary_item = _candidate_by_index(
+        getattr(state, "patch_hotspot_candidates", []) or [],
+        int(getattr(state, "patch_hotspot_secondary_index", 1) if getattr(state, "patch_hotspot_secondary_index", 1) is not None else 1),
+    )
+    if secondary_item:
+        hotspot_secondary_label = str(secondary_item.get("label", ""))
     if state.mode == "patch" and state.active_patch_target:
         hotspot_bundle = _derive_patch_hotspots(
             state.active_patch_target,
@@ -1567,6 +1853,12 @@ def build_prompt(user_prompt, history, state):
         file_outline = "\n".join(f"- L{line_no}: {text}" for line_no, text in outline_items[:18])
         real_anchors = "\n".join(f'- "{text}"' for text in (anchor_items[:12] if isinstance(anchor_items, list) else []))
         patch_hotspots_summary = hotspot_bundle.get("summary", "")
+        patch_task_intent = hotspot_bundle.get("task_intent", patch_task_intent)
+        derived_candidates = hotspot_bundle.get("candidates") or []
+        if not hotspot_candidates_text and derived_candidates:
+            hotspot_candidates_text = _hotspot_candidates_text(derived_candidates)
+        if not hotspot_primary_label:
+            hotspot_primary_label = str(hotspot_bundle.get("selected_hotspot") or "")
         file_snippet = hotspot_bundle.get("snippet") or _focused_patch_snippets(
             state.active_patch_target,
             state.active_project_root,
@@ -1599,6 +1891,10 @@ def build_prompt(user_prompt, history, state):
         patch_phase=state.patch_phase,
         patch_strategy=state.patch_strategy,
         patch_hotspots_summary=patch_hotspots_summary,
+        patch_task_intent=patch_task_intent,
+        hotspot_candidates_text=hotspot_candidates_text,
+        hotspot_primary_label=hotspot_primary_label,
+        hotspot_secondary_label=hotspot_secondary_label,
         stale_error_detected=bool(getattr(state, "patch_stale_error_detected", False)),
         stale_error_reason=str(getattr(state, "patch_stale_error_reason", "") or ""),
         task_profile=state.task_profile,
@@ -1626,6 +1922,12 @@ def build_prompt(user_prompt, history, state):
         file_outline = "\n".join(f"- L{line_no}: {text}" for line_no, text in outline_items[:12])
         real_anchors = "\n".join(f'- "{text}"' for text in (anchor_items[:8] if isinstance(anchor_items, list) else []))
         patch_hotspots_summary = hotspot_bundle.get("summary", "")
+        patch_task_intent = hotspot_bundle.get("task_intent", patch_task_intent)
+        derived_candidates = hotspot_bundle.get("candidates") or []
+        if not hotspot_candidates_text and derived_candidates:
+            hotspot_candidates_text = _hotspot_candidates_text(derived_candidates)
+        if not hotspot_primary_label:
+            hotspot_primary_label = str(hotspot_bundle.get("selected_hotspot") or "")
         file_snippet = hotspot_bundle.get("snippet") or _focused_patch_snippets(
             state.active_patch_target,
             state.active_project_root,
@@ -1657,6 +1959,10 @@ def build_prompt(user_prompt, history, state):
         patch_phase=state.patch_phase,
         patch_strategy=state.patch_strategy,
         patch_hotspots_summary=truncate_middle(patch_hotspots_summary, limit // 6),
+        patch_task_intent=truncate_middle(patch_task_intent, limit // 10),
+        hotspot_candidates_text=truncate_middle(hotspot_candidates_text, limit // 6),
+        hotspot_primary_label=hotspot_primary_label,
+        hotspot_secondary_label=hotspot_secondary_label,
         task_profile=state.task_profile,
         model_route=state.model_route,
     )
@@ -2377,6 +2683,18 @@ def _format_history_observation(summary, details):
     return summary
 
 
+def _compact_parse_error_for_history(message):
+    text = str(message or "").strip()
+    if not text:
+        return "PARSE_ERROR"
+    if "PARSE_ERROR" not in text:
+        return truncate_middle(text, 240)
+    if ": " in text:
+        head, tail = text.split(": ", 1)
+        return f"{head}: {truncate_middle(tail, 220)}"
+    return truncate_middle(text, 240)
+
+
 def _plan_indicates_completion(plan):
     lower = _normalize_prompt_text(plan)
     return any(keyword in lower for keyword in PATCH_DONE_KEYWORDS)
@@ -2526,14 +2844,35 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                     history=history,
                 )
                 hotspot_summary = hotspot_bundle.get("summary", "(hotspots unavailable)")
-                first_hotspot = ""
-                for line in str(hotspot_summary).splitlines():
-                    line = line.strip()
-                    if line:
-                        first_hotspot = line
-                        break
-                state.patch_hotspot_label = first_hotspot
+                selected_hotspot = str(hotspot_bundle.get("selected_hotspot") or "")
+                selected_score = hotspot_bundle.get("selected_score", 0)
+                focus_context = str(hotspot_bundle.get("focus_context") or "")
+                task_intent = str(hotspot_bundle.get("task_intent") or "")
+                candidates = hotspot_bundle.get("candidates") or []
+                if isinstance(candidates, list) and candidates:
+                    state.patch_hotspot_candidates = candidates[:3]
+                    preferred_idx = 0
+                    for idx, item in enumerate(state.patch_hotspot_candidates):
+                        if _normalize_prompt_text(str(item.get("label", ""))) == _normalize_prompt_text(selected_hotspot):
+                            preferred_idx = idx
+                            break
+                    state.patch_hotspot_primary_index = preferred_idx
+                    choices = [i for i in range(min(3, len(state.patch_hotspot_candidates))) if i != preferred_idx]
+                    state.patch_hotspot_secondary_index = choices[0] if choices else preferred_idx
+                state.patch_task_intent = task_intent
+                state.patch_hotspot_label = selected_hotspot
                 state.patch_exact_snippet = str(hotspot_bundle.get("snippet") or "")
+                if (
+                    state.last_runtime_error
+                    and not state.patch_stale_error_detected
+                    and _behavior_patch_signals(prompt).get("active")
+                ):
+                    runtime_symbols = _extract_error_symbols(state.last_runtime_error)
+                    selected_norm = _normalize_prompt_text(state.patch_exact_snippet)
+                    if runtime_symbols and not any(symbol in selected_norm for symbol in runtime_symbols[:6]):
+                        state.patch_stale_error_detected = True
+                        state.patch_stale_error_reason = "traceback symbols do not match selected hotspot snippet"
+                        log("STALE TRACEBACK DOWNWEIGHTED")
                 hotspots_unavailable = "(hotspots unavailable)" in _normalize_prompt_text(hotspot_summary)
                 if hotspots_unavailable:
                     state.patch_hotspot_unavailable_streak += 1
@@ -2543,8 +2882,25 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                 log(f"PATCH PHASE: {state.patch_phase}")
                 log(f"PATCH STRATEGY: {state.patch_strategy}")
                 if state.patch_hotspot_label:
+                    log(f"PATCH HOTSPOT SELECTED: {state.patch_hotspot_label}")
+                    log(f"PATCH HOTSPOT SCORE: {selected_score}")
                     log(f"PATCH GROUNDING: exact snippet for {state.patch_hotspot_label}")
                     log(f"PATCH GROUNDING SOURCE: current {state.patch_hotspot_label} snippet")
+                if state.patch_task_intent:
+                    log(f"PATCH TASK INTENT: {state.patch_task_intent}")
+                for idx, item in enumerate(state.patch_hotspot_candidates[:3], 1):
+                    log(
+                        f"HOTSPOT CANDIDATE #{idx}: {item.get('label', '(unknown)')} "
+                        f"score={item.get('score', 0)} reason={item.get('reason', 'n/a')}"
+                    )
+                primary_item = _candidate_by_index(state.patch_hotspot_candidates, state.patch_hotspot_primary_index)
+                secondary_item = _candidate_by_index(state.patch_hotspot_candidates, state.patch_hotspot_secondary_index)
+                if primary_item:
+                    log(f"HOTSPOT PRIMARY SELECTED: {primary_item.get('label', '(unknown)')}")
+                if secondary_item:
+                    log(f"HOTSPOT SECONDARY SELECTED: {secondary_item.get('label', '(unknown)')}")
+                if focus_context:
+                    log(f"PATCH CONTEXT FOCUS: {focus_context}")
                 if _is_small_focused_patch(state):
                     log("PATCH ACTION BIAS: prefer replace_block")
                 if strategy_escalation_reason:
@@ -2562,7 +2918,7 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                     _sync_chunk_session_from_rewrite_state(state, log=log, startup=False)
                 if (
                     state.create_strategy != "chunked_rewrite"
-                    and state.create_full_write_streak >= 1
+                    and state.create_full_write_streak >= (3 if "chunk protocol failure fallback" in str(state.create_strategy_reason or "") else 2)
                     and state.create_phase in {"verify_or_run", "fix_existing_file"}
                 ):
                     state.create_strategy = "chunked_rewrite"
@@ -2623,12 +2979,24 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                     active_target=state.active_patch_target if state.mode == "patch" else "",
                     expected_file_count=state.expected_file_count,
                     single_file_task=state.single_file_task,
+                    target_hint=(
+                        state.active_patch_target
+                        if state.mode == "patch"
+                        else (
+                            (state.target_files[0] if state.target_files else "")
+                            or state.last_created_main_file
+                            or state.chunk_target_path
+                        )
+                    ),
                 )
+                parse_path = str(data.get("parse_path") or "")
+                if parse_path:
+                    log(f"PARSE PATH: {parse_path}")
                 consecutive_parse_errors = 0
             except Exception as e:
                 message = str(e)
                 log(message)
-                history.append(message)
+                history.append(_compact_parse_error_for_history(message))
                 if state.mode == "patch" and state.single_file_task:
                     fallback_note = _single_file_patch_retry_note(state)
                     if fallback_note not in history[-4:]:
@@ -2647,6 +3015,11 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                 continue
 
             actions = [_normalize_action(action, state) for action in data.get("actions", [])]
+            if state.mode == "patch":
+                switched, reason = _negotiate_hotspot_from_actions(state, actions)
+                if switched:
+                    log(f"HOTSPOT NEGOTIATION: {reason}")
+                    log(f"HOTSPOT PRIMARY SELECTED: {state.patch_hotspot_label or '(unknown)'}")
             guarded_actions = []
             for action in actions:
                 risky, reason = _replace_in_file_looks_ungrounded(action, state)
@@ -2786,6 +3159,11 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                     ):
                         action = _format_violation_action(
                             "PATCH STRATEGY VIOLATION: chunked_rewrite_existing_file active; use begin_file_rewrite/append_file_chunk/finalize_file_rewrite on active_patch_target"
+                        )
+                    if state.mode == "patch" and _action_outside_grounded_hotspots(action, state):
+                        action = _format_violation_action(
+                            "GROUNDED HOTSPOT VIOLATION: patch action drifted outside primary/secondary grounded candidates. "
+                            "Retry using selected hotspot anchors/snippet."
                         )
 
                     action_key = json.dumps(action, ensure_ascii=False, sort_keys=True)
@@ -2941,6 +3319,10 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                                     state.patch_phase = "inspect_target"
                                     state.patch_exact_snippet = fresh
                                     log("PATCH MISS RECOVERY: switching to anchor-based edit")
+                                    promoted, transition = _promote_hotspot_candidate(state, "repeated replace_in_file miss")
+                                    if promoted:
+                                        log("HOTSPOT DOWNGRADED: repeated miss")
+                                        log(f"HOTSPOT FAILOVER: {transition}")
                                     history.append(
                                         "PATCH MISS RECOVERY: repeated replace_in_file miss. "
                                         "Use replace_block/insert_before/insert_after with real anchors from fresh snippet."
@@ -2955,6 +3337,10 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                                 patch_anchor_failure = True
                                 grounded = _grounded_patch_retry_context(target_path, state.active_project_root, prompt)
                                 state.patch_phase = "inspect_target"
+                                promoted, transition = _promote_hotspot_candidate(state, "missing anchor on current hotspot")
+                                if promoted:
+                                    log("HOTSPOT DOWNGRADED: repeated miss")
+                                    log(f"HOTSPOT FAILOVER: {transition}")
                                 log("PATCH GROUNDING REFRESH: missing anchor")
                                 log("GROUNDING RETRY WITH REAL OUTLINE/ANCHORS")
                                 history.append("Grounded retry context after missing anchor:\n" + truncate_middle(grounded, 2200))
@@ -3043,10 +3429,15 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                             if state.model_route in {"local/default", "standard"}:
                                 state.stuck_iterations = max(state.stuck_iterations, 2)
                                 log("CHUNK ROUTE ESCALATION REASON: repeated chunk protocol failure")
-                            log(f"CHUNK SESSION RESET REASON: {reason}")
+                            log(f"CHUNK FAILURE REASON: {reason}")
+                            log("CHUNK FALLBACK: reverting to write_file after protocol failure")
                             _reset_chunk_session(state, reason=reason, clear_rewrite_state=True)
-                            state.create_phase = "chunk_begin"
-                            log("CHUNK PHASE: chunk_begin")
+                            state.create_strategy = "write_file"
+                            state.create_strategy_reason = "chunk protocol failure fallback"
+                            state.create_full_write_streak = 0
+                            state.create_phase = "fix_existing_file" if (state.last_written_files or state.created_files) else "initial_create"
+                            log(f"CREATE STRATEGY: {state.create_strategy}")
+                            log(f"CREATE STRATEGY REASON: {state.create_strategy_reason}")
                 if state.mode == "patch":
                     state.patch_failure_streak += 1
                     if state.patch_stale_error_detected:

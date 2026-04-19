@@ -1,208 +1,282 @@
 import pygame
-import sys
 import random
 import math
 
-# Inicjalizacja Pygame
-pygame.init()
+# --- Konfiguracja ---
+WIDTH, HEIGHT = 900, 600
+FPS = 60
 
-# Stałe
-SCREEN_WIDTH = 800
-SCREEN_HEIGHT = 600
-PLAYER_SIZE = 20
-ENEMY_SIZE = 15
-BULLET_SIZE = 5
-PLAYER_SPEED = 5
-BULLET_SPEED = 10
-ENEMY_SPAWN_RATE = 60  # co ile klatek spawnuje sie wrog
+PLAYER_RADIUS = 22
+PLAYER_SPEED = 260
+BULLET_SPEED = 520
 
-# Kolory
-WHITE = (255, 255, 255)
-BLACK = (0, 0, 0)
-RED = (255, 0, 0)
-GREEN = (0, 255, 0)
-BLUE = (0, 0, 255)
+ENEMY_HP = 100
+BULLET_DAMAGE = 50
 
-# Ustawienia ekranu
-screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-pygame.display.set_caption("Top-Down Shooter")
-clock = pygame.time.Clock()
+SCORE_KILL = 10
 
-# Klasa gracza
-class Player:
-    def __init__(self, x, y):
-        self.x = x
-        self.y = y
-        self.size = PLAYER_SIZE
-        self.speed = PLAYER_SPEED
-        
-    def move(self, dx, dy):
-        self.x += dx * self.speed
-        self.y += dy * self.speed
-        
-        # Ograniczenia do ekranu
-        self.x = max(0, min(SCREEN_WIDTH - self.size, self.x))
-        self.y = max(0, min(SCREEN_HEIGHT - self.size, self.y))
-        
-    def draw(self, screen):
-        pygame.draw.rect(screen, GREEN, (self.x, self.y, self.size, self.size))
+ENEMY_BASE_SPEED = 70
+ENEMY_SPEED_INCREASE = 0.10  # +10%
+ENEMY_SPEED_INTERVAL = 5.0   # seconds
 
-# Klasa wroga
-class Enemy:
-    def __init__(self, x, y):
-        self.x = x
-        self.y = y
-        self.size = ENEMY_SIZE
-        self.speed = random.uniform(1.0, 3.0)
-        
-    def move_towards_player(self, player_x, player_y):
-        # Oblicz wektor kierunku do gracza
-        dx = player_x - self.x
-        dy = player_y - self.y
-        distance = max(1, math.sqrt(dx*dx + dy*dy))
-        
-        # Normalizuj wektor i przesuń wroga
-        dx /= distance
-        dy /= distance
-        
-        self.x += dx * self.speed
-        self.y += dy * self.speed
-        
-    def draw(self, screen):
-        pygame.draw.rect(screen, RED, (self.x, self.y, self.size, self.size))
+BG_COLOR = (18, 18, 24)
+WHITE = (240, 240, 240)
+RED = (220, 60, 60)
+GREEN = (60, 220, 90)
 
-# Klasa pocisku
-class Bullet:
-    def __init__(self, x, y, target_x, target_y):
-        self.x = x
-        self.y = y
-        self.size = BULLET_SIZE
-        
-        # Oblicz wektor kierunku do celu
-        dx = target_x - x
-        dy = target_y - y
-        distance = max(1, math.sqrt(dx*dx + dy*dy))
-        
-        # Normalizuj wektor i ustaw prędkość
-        self.dx = dx / distance * BULLET_SPEED
-        self.dy = dy / distance * BULLET_SPEED
-        
-    def update(self):
-        self.x += self.dx
-        self.y += self.dy
-        
-    def draw(self, screen):
-        pygame.draw.circle(screen, BLUE, (int(self.x), int(self.y)), self.size)
 
-# Inicjalizacja gracza
-player = Player(SCREEN_WIDTH // 2 - PLAYER_SIZE // 2, SCREEN_HEIGHT // 2 - PLAYER_SIZE // 2)
+def clamp(x, a, b):
+    return a if x < a else b if x > b else x
 
-# Listy obiektów
-enemies = []
-bullets = []
 
-# Zmienna do liczenia punktów
-score = 0
+def vec_from_angle(angle_rad):
+    return math.cos(angle_rad), math.sin(angle_rad)
 
-# Zegar spawnowania wrogów
-enemy_spawn_timer = 0
 
-# Główna pętla gry
-running = True
-while running:
-    # Obsługa zdarzeń
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            running = False
-        elif event.type == pygame.MOUSEBUTTONDOWN:
-            # Strzelanie po kliknięciu myszy
-            mouse_x, mouse_y = pygame.mouse.get_pos()
-            bullets.append(Bullet(player.x + PLAYER_SIZE//2, player.y + PLAYER_SIZE//2, mouse_x, mouse_y))
-    
-    # Obsługa klawiszy
-    keys = pygame.key.get_pressed()
-    dx, dy = 0, 0
-    if keys[pygame.K_w] or keys[pygame.K_UP]:
-        dy -= 1
-    if keys[pygame.K_s] or keys[pygame.K_DOWN]:
-        dy += 1
-    if keys[pygame.K_a] or keys[pygame.K_LEFT]:
-        dx -= 1
-    if keys[pygame.K_d] or keys[pygame.K_RIGHT]:
-        dx += 1
-    
-    player.move(dx, dy)
-    
-    # Spawnowanie wrogów
-    enemy_spawn_timer += 1
-    if enemy_spawn_timer >= ENEMY_SPAWN_RATE:
-        enemy_spawn_timer = 0
-        
-        # Wybierz losową stronę ekranu (z zewnątrz)
-        side = random.choice(['top', 'bottom', 'left', 'right'])
-        
-        if side == 'top':
-            x = random.randint(0, SCREEN_WIDTH)
-            y = -ENEMY_SIZE
-        elif side == 'bottom':
-            x = random.randint(0, SCREEN_WIDTH)
-            y = SCREEN_HEIGHT
-        elif side == 'left':
-            x = -ENEMY_SIZE
-            y = random.randint(0, SCREEN_HEIGHT)
-        else:  # right
-            x = SCREEN_WIDTH
-            y = random.randint(0, SCREEN_HEIGHT)
-            
-        enemies.append(Enemy(x, y))
-    
-    # Aktualizacja wrogów
-    for enemy in enemies[:]:
-        enemy.move_towards_player(player.x + PLAYER_SIZE//2, player.y + PLAYER_SIZE//2)
-        
-        # Usuń wroga jeśli wyjdzie poza ekran
-        if (enemy.x < -ENEMY_SIZE or enemy.x > SCREEN_WIDTH or 
-            enemy.y < -ENEMY_SIZE or enemy.y > SCREEN_HEIGHT):
-            enemies.remove(enemy)
-    
-    # Aktualizacja pocisków
-    for bullet in bullets[:]:
-        bullet.update()
-        
-        # Usuń pocisk jeśli wyjdzie poza ekran
-        if (bullet.x < 0 or bullet.x > SCREEN_WIDTH or 
-            bullet.y < 0 or bullet.y > SCREEN_HEIGHT):
-            bullets.remove(bullet)
-    
-    # Sprawdź kolizje pocisków z wrogami
-    for bullet in bullets[:]:
-        for enemy in enemies[:]:
-            # Prosta kolizja prostokąt-rectangle
-            if (bullet.x > enemy.x and bullet.x < enemy.x + enemy.size and 
-                bullet.y > enemy.y and bullet.y < enemy.y + enemy.size):
-                bullets.remove(bullet)
-                enemies.remove(enemy)
-                score += 1
-                break
-    
-    # Rysowanie
-    screen.fill(WHITE)
-    
-    player.draw(screen)
-    
-    for enemy in enemies:
-        enemy.draw(screen)
-        
-    for bullet in bullets:
-        bullet.draw(screen)
-    
-    # Wyświetlanie punktów
-    font = pygame.font.Font(None, 36)
-    score_text = font.render(f"Score: {score}", True, BLACK)
-    screen.blit(score_text, (10, 10))
-    
-    pygame.display.flip()
-    clock.tick(60)
+def angle_to_mouse(px, py, mx, my):
+    return math.atan2(my - py, mx - px)
 
-pygame.quit()
-sys.exit()
+
+def spawn_enemy_outside_screen():
+    # Spawn losowo poza widocznym obszarem: wybieramy stronę i losujemy pozycję poza ekranem.
+    side = random.choice(["left", "right", "top", "bottom"])
+    margin = 80
+    if side == "left":
+        x = -margin - random.randint(0, 200)
+        y = random.randint(0, HEIGHT)
+    elif side == "right":
+        x = WIDTH + margin + random.randint(0, 200)
+        y = random.randint(0, HEIGHT)
+    elif side == "top":
+        x = random.randint(0, WIDTH)
+        y = -margin - random.randint(0, 200)
+    else:  # bottom
+        x = random.randint(0, WIDTH)
+        y = HEIGHT + margin + random.randint(0, 200)
+    return [float(x), float(y), ENEMY_HP]
+
+
+def draw_text_center(surf, font, text, y, color=WHITE):
+    img = font.render(text, True, color)
+    rect = img.get_rect(center=(WIDTH // 2, y))
+    surf.blit(img, rect)
+
+
+def main():
+    pygame.init()
+    pygame.display.set_caption("Top-down Shooter")
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    clock = pygame.time.Clock()
+
+    font = pygame.font.SysFont(None, 28)
+    big_font = pygame.font.SysFont(None, 64)
+
+    # --- Stan gry ---
+    player_x = WIDTH / 2
+    player_y = HEIGHT / 2
+    player_angle = 0.0
+
+    bullets = []  # each: [x,y,vx,vy]
+    enemies = []  # each: [x,y,hp]
+
+    score = 0
+    game_over = False
+
+    enemy_speed = ENEMY_BASE_SPEED
+    next_speed_increase_time = ENEMY_SPEED_INTERVAL
+
+    # Spawn initial enemies
+    for _ in range(6):
+        enemies.append(spawn_enemy_outside_screen())
+
+    # Fire control: jeden klik = jeden strzał
+    shooting = False
+
+    # Timer for speed increase
+    elapsed = 0.0
+
+    running = True
+    while running:
+        dt = clock.tick(FPS) / 1000.0
+        elapsed += dt
+
+        # --- Input ---
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                if game_over and event.key == pygame.K_r:
+                    # Restart
+                    game_over = False
+                    bullets.clear()
+                    enemies.clear()
+                    score = 0
+                    enemy_speed = ENEMY_BASE_SPEED
+                    next_speed_increase_time = ENEMY_SPEED_INTERVAL
+                    elapsed = 0.0
+                    player_x = WIDTH / 2
+                    player_y = HEIGHT / 2
+                    for _ in range(6):
+                        enemies.append(spawn_enemy_outside_screen())
+
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1 and not game_over:
+                    shooting = True
+
+            if event.type == pygame.MOUSEBUTTONUP:
+                if event.button == 1:
+                    shooting = False
+
+        # --- Update ---
+        if not game_over:
+            mx, my = pygame.mouse.get_pos()
+            player_angle = angle_to_mouse(player_x, player_y, mx, my)
+
+            keys = pygame.key.get_pressed()
+            dx = 0.0
+            dy = 0.0
+            if keys[pygame.K_a]:
+                dx -= 1.0
+            if keys[pygame.K_d]:
+                dx += 1.0
+            if keys[pygame.K_w]:
+                dy -= 1.0
+            if keys[pygame.K_s]:
+                dy += 1.0
+
+            # Normalize movement
+            mag = math.hypot(dx, dy)
+            if mag > 0:
+                dx /= mag
+                dy /= mag
+
+            player_x += dx * PLAYER_SPEED * dt
+            player_y += dy * PLAYER_SPEED * dt
+
+            # Keep player within bounds (soft clamp)
+            player_x = clamp(player_x, PLAYER_RADIUS, WIDTH - PLAYER_RADIUS)
+            player_y = clamp(player_y, PLAYER_RADIUS, HEIGHT - PLAYER_RADIUS)
+
+            # One click = one shot
+            if shooting:
+                # Fire once per click: we set shooting True on down, but it stays True until up.
+                # To ensure exactly one shot per click, we immediately set shooting False after spawning.
+                shooting = False
+                vx, vy = vec_from_angle(player_angle)
+                # Spawn bullet at lufa end
+                lufa_len = 18
+                bx = player_x + vx * (PLAYER_RADIUS + 2)
+                by = player_y + vy * (PLAYER_RADIUS + 2)
+                bullets.append([bx, by, vx * BULLET_SPEED, vy * BULLET_SPEED])
+
+            # Enemy speed increases every 5 seconds by 10%
+            if elapsed >= next_speed_increase_time:
+                # Increase possibly multiple times if lag
+                while elapsed >= next_speed_increase_time:
+                    enemy_speed *= (1.0 + ENEMY_SPEED_INCREASE)
+                    next_speed_increase_time += ENEMY_SPEED_INTERVAL
+
+            # Update bullets
+            for b in bullets:
+                b[0] += b[2] * dt
+                b[1] += b[3] * dt
+
+            # Remove bullets off-screen
+            bullets = [b for b in bullets if -50 <= b[0] <= WIDTH + 50 and -50 <= b[1] <= HEIGHT + 50]
+
+            # Update enemies
+            for e in enemies:
+                ex, ey, hp = e
+                ang = angle_to_mouse(ex, ey, player_x, player_y)
+                vx, vy = vec_from_angle(ang)
+                ex += vx * enemy_speed * dt
+                ey += vy * enemy_speed * dt
+                e[0], e[1] = ex, ey
+
+            # Bullet-enemy collisions
+            # Enemy radius for collision and drawing
+            ENEMY_RADIUS = 20
+            for b in bullets[:]:
+                bx, by = b[0], b[1]
+                hit = False
+                for e in enemies[:]:
+                    ex, ey, hp = e
+                    if (bx - ex) ** 2 + (by - ey) ** 2 <= (ENEMY_RADIUS) ** 2:
+                        hp -= BULLET_DAMAGE
+                        e[2] = hp
+                        hit = True
+                        if hp <= 0:
+                            enemies.remove(e)
+                            score += SCORE_KILL
+                            # Respawn to keep pressure
+                            enemies.append(spawn_enemy_outside_screen())
+                        break
+                if hit:
+                    bullets.remove(b)
+
+            # Enemy-player collision => game over
+            for e in enemies:
+                ex, ey, hp = e
+                if (ex - player_x) ** 2 + (ey - player_y) ** 2 <= (PLAYER_RADIUS + ENEMY_RADIUS - 2) ** 2:
+                    game_over = True
+                    break
+
+        # --- Draw ---
+        screen.fill(BG_COLOR)
+
+        # Draw bullets
+        for b in bullets:
+            pygame.draw.circle(screen, (240, 240, 120), (int(b[0]), int(b[1])), 4)
+
+        # Draw enemies with HP bar
+        ENEMY_RADIUS = 20
+        for e in enemies:
+            ex, ey, hp = e
+            pygame.draw.circle(screen, (80, 80, 220), (int(ex), int(ey)), ENEMY_RADIUS)
+
+            # Red HP bar above enemy
+            bar_w = 44
+            bar_h = 7
+            x0 = int(ex) - bar_w // 2
+            y0 = int(ey) - ENEMY_RADIUS - 14
+            pygame.draw.rect(screen, (120, 0, 0), (x0, y0, bar_w, bar_h))
+            hp_ratio = max(0.0, min(1.0, hp / ENEMY_HP))
+            pygame.draw.rect(screen, RED, (x0, y0, int(bar_w * hp_ratio), bar_h))
+
+        # Draw player (circle) and short gun line on edge
+        pygame.draw.circle(screen, (70, 220, 220), (int(player_x), int(player_y)), PLAYER_RADIUS)
+        # Lufa: krótka linia na krawędzi koła
+        gun_len = 18
+        gx1 = player_x + math.cos(player_angle) * (PLAYER_RADIUS - 2)
+        gy1 = player_y + math.sin(player_angle) * (PLAYER_RADIUS - 2)
+        gx2 = player_x + math.cos(player_angle) * (PLAYER_RADIUS - 2 + gun_len)
+        gy2 = player_y + math.sin(player_angle) * (PLAYER_RADIUS - 2 + gun_len)
+        pygame.draw.line(screen, (240, 240, 240), (int(gx1), int(gy1)), (int(gx2), int(gy2)), 4)
+
+        # UI: SCORE left top
+        score_img = font.render(f"SCORE: {score}", True, WHITE)
+        screen.blit(score_img, (12, 10))
+
+        # UI: enemy speed on opposite side (right top)
+        speed_img = font.render(f"ENEMY SPEED: {enemy_speed:.1f}", True, WHITE)
+        screen.blit(speed_img, (WIDTH - speed_img.get_width() - 12, 10))
+
+        if game_over:
+            # Game over screen
+            overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 160))
+            screen.blit(overlay, (0, 0))
+            draw_text_center(screen, big_font, "GAME OVER", HEIGHT // 2 - 40, (255, 255, 255))
+            draw_text_center(screen, font, f"SCORE: {score}", HEIGHT // 2 + 10, (255, 255, 255))
+            draw_text_center(screen, font, "Naciśnij R aby zagrać ponownie", HEIGHT // 2 + 40, (220, 220, 220))
+
+        pygame.display.flip()
+
+    pygame.quit()
+
+
+if __name__ == "__main__":
+    main()

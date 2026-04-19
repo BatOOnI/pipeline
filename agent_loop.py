@@ -347,12 +347,16 @@ def _is_large_write_action(action):
     return len(content) >= 700 or len(content_b64) >= 500
 
 
+def _rescue_backend_available():
+    return bool(config.OPENAI_RESCUE_ENABLED and str(config.OPENAI_API_KEY or "").strip())
+
+
 def _can_use_rescue():
-    return bool(
-        _rescue_mode() == "ON"
-        and config.OPENAI_RESCUE_ENABLED
-        and str(config.OPENAI_API_KEY or "").strip()
-    )
+    return bool(_rescue_mode() == "ON" and _rescue_backend_available())
+
+
+def _rescue_confirmable():
+    return bool(_rescue_mode() in {"ON", "ASK_BEFORE_RESCUE"} and _rescue_backend_available())
 
 
 def _rescue_suppressed_reason():
@@ -408,12 +412,15 @@ def _route_for_task_profile(state, profile):
     if base not in {"lmstudio", "openai"}:
         base = str(config.PROVIDER or "lmstudio").strip().lower() or "lmstudio"
 
-    if state.current_provider.lower() == "openai" and state.rescue_handoff_count > 0 and _can_use_rescue():
+    if state.current_provider.lower() == "openai" and state.rescue_handoff_count > 0 and _rescue_confirmable():
         return "rescue", "openai", "rescue handoff active"
 
     if profile == "rescue":
         if _can_use_rescue():
             return "rescue", "openai", "repeated failures"
+        if _rescue_mode() == "ASK_BEFORE_RESCUE" and _rescue_backend_available():
+            fallback_route = "deep" if state.mode == "patch" else "standard"
+            return fallback_route, base, "rescue requires ASK_BEFORE_RESCUE confirmation"
         fallback_route = "deep" if state.mode == "patch" else "standard"
         return fallback_route, base, f"rescue unavailable: {_rescue_suppressed_reason()}"
 
@@ -646,6 +653,30 @@ def _infer_mode_with_reason(user_prompt):
 
     words = set(_prompt_word_tokens(user_prompt))
     matched_patch = next((keyword for keyword in PATCH_KEYWORDS if keyword in words), "")
+    if matched_patch in {"update", "modify", "change", "improve"}:
+        has_create_intent = any(keyword in words for keyword in CREATE_KEYWORDS)
+        has_existing_signal = _prompt_mentions_existing_file(user_prompt) or (
+            "dodaj" in words and _roots_have_existing_python_file() and _looks_like_existing_feature_edit(user_prompt, words)
+        )
+        strong_patch_signal = any(
+            keyword in words
+            for keyword in {
+                "patch",
+                "fix",
+                "replace",
+                "repair",
+                "refactor",
+                "debug",
+                "edytuj",
+                "napraw",
+                "przerob",
+                "zmien",
+                "popraw",
+                "usun",
+            }
+        )
+        if has_create_intent and not has_existing_signal and not strong_patch_signal:
+            matched_patch = ""
     if matched_patch:
         return "patch", f'patch keyword matched: "{matched_patch}"'
 
@@ -1811,11 +1842,12 @@ def _build_atomic_patch_stage(actions, state):
     if state.mode != "patch":
         return None
 
+    staged_mutating_actions = {"write_file", "replace_in_file", "insert_before", "insert_after", "replace_block", "patch_lines"}
     counts = {}
     ordered_paths = []
     for action in actions:
         action_type = str(action.get("type", "")).strip()
-        if action_type not in ATOMIC_PATCH_FILE_ACTIONS:
+        if action_type not in staged_mutating_actions:
             continue
         rel_path = str(action.get("args", {}).get("path", "")).strip()
         if not rel_path:
@@ -1824,7 +1856,7 @@ def _build_atomic_patch_stage(actions, state):
         if rel_path not in ordered_paths:
             ordered_paths.append(rel_path)
 
-    staged_paths = [path for path in ordered_paths if counts.get(path, 0) > 1]
+    staged_paths = list(ordered_paths)
     if not staged_paths:
         return None
 
@@ -1861,6 +1893,8 @@ def _stage_action_project_root(action, state, stage_context):
         return state.active_project_root
     action_type = str(action.get("type", "")).strip()
     rel_path = str(action.get("args", {}).get("path", "")).strip()
+    if action_type == "run_cmd":
+        return stage_context["root"]
     if action_type in ATOMIC_PATCH_FILE_ACTIONS and rel_path in stage_context.get("path_set", set()):
         return stage_context["root"]
     return state.active_project_root
@@ -2348,7 +2382,7 @@ def _plan_indicates_completion(plan):
     return any(keyword in lower for keyword in PATCH_DONE_KEYWORDS)
 
 
-def _completion_decision(state, plan, had_run_cmd, touched_paths, verify_observation):
+def _completion_decision(state, plan, had_run_cmd, touched_paths, verify_observation, meaningful_materialization=False):
     verified_ok = not touched_paths or bool(verify_observation.ok)
     plan_done = _plan_indicates_completion(plan)
     patch_target_touched = False
@@ -2358,7 +2392,8 @@ def _completion_decision(state, plan, had_run_cmd, touched_paths, verify_observa
     if state.mode == "create":
         if had_run_cmd and verified_ok:
             return True, "EXECUTION/CHECK PASSED -> STOP"
-        if plan_done and verified_ok:
+        grounded_create_done = bool(touched_paths) or bool(meaningful_materialization) or had_run_cmd
+        if plan_done and verified_ok and grounded_create_done:
             return True, "MODEL INDICATED COMPLETION -> STOP"
         return False, "WRITE/VERIFY OK BUT CONTINUE"
 
@@ -2926,7 +2961,17 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
 
                     if not observation.ok and not iteration_error:
                         iteration_error = observation.details or observation.summary
-                    if observation.tool in {"write_file", "begin_file_rewrite", "append_file_chunk", "finalize_file_rewrite"} and not observation.ok:
+                    if observation.tool in {
+                        "write_file",
+                        "begin_file_rewrite",
+                        "append_file_chunk",
+                        "finalize_file_rewrite",
+                        "replace_in_file",
+                        "insert_before",
+                        "insert_after",
+                        "replace_block",
+                        "patch_lines",
+                    } and not observation.ok:
                         critical_generation_failed = True
                     if observation.tool in {"off_target_patch_action", "action_format_violation"}:
                         break
@@ -3091,6 +3136,7 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                 had_run_cmd=had_run_cmd,
                 touched_paths=touched_paths,
                 verify_observation=verify_observation,
+                meaningful_materialization=meaningful_materialization,
             )
             if should_stop:
                 if state.mode == "patch":

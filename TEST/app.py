@@ -1,8 +1,9 @@
 import pygame
+import sys
 import random
 import math
 
-# Inicjalizacja pygame
+# Inicjalizacja Pygame
 pygame.init()
 
 # Stałe
@@ -35,16 +36,16 @@ class Player:
         self.size = PLAYER_SIZE
         self.speed = PLAYER_SPEED
         
-    def draw(self, screen):
-        pygame.draw.circle(screen, GREEN, (int(self.x), int(self.y)), self.size)
-        
     def move(self, dx, dy):
         self.x += dx * self.speed
         self.y += dy * self.speed
         
-        # Ograniczenia ekranu
-        self.x = max(self.size, min(SCREEN_WIDTH - self.size, self.x))
-        self.y = max(self.size, min(SCREEN_HEIGHT - self.size, self.y))
+        # Ograniczenia do ekranu
+        self.x = max(0, min(SCREEN_WIDTH - self.size, self.x))
+        self.y = max(0, min(SCREEN_HEIGHT - self.size, self.y))
+        
+    def draw(self, screen):
+        pygame.draw.rect(screen, GREEN, (self.x, self.y, self.size, self.size))
 
 # Klasa wroga
 class Enemy:
@@ -54,21 +55,21 @@ class Enemy:
         self.size = ENEMY_SIZE
         self.speed = random.uniform(1.0, 3.0)
         
-    def draw(self, screen):
-        pygame.draw.circle(screen, RED, (int(self.x), int(self.y)), self.size)
-        
     def move_towards_player(self, player_x, player_y):
         # Oblicz wektor kierunku do gracza
         dx = player_x - self.x
         dy = player_y - self.y
-        distance = math.sqrt(dx*dx + dy*dy)
+        distance = max(1, math.sqrt(dx*dx + dy*dy))
         
-        if distance > 0:
-            dx /= distance
-            dy /= distance
-            
+        # Normalizuj wektor i przesuń wroga
+        dx /= distance
+        dy /= distance
+        
         self.x += dx * self.speed
         self.y += dy * self.speed
+        
+    def draw(self, screen):
+        pygame.draw.rect(screen, RED, (self.x, self.y, self.size, self.size))
 
 # Klasa pocisku
 class Bullet:
@@ -80,46 +81,45 @@ class Bullet:
         # Oblicz wektor kierunku do celu
         dx = target_x - x
         dy = target_y - y
-        distance = math.sqrt(dx*dx + dy*dy)
+        distance = max(1, math.sqrt(dx*dx + dy*dy))
         
-        if distance > 0:
-            self.dx = (dx / distance) * BULLET_SPEED
-            self.dy = (dy / distance) * BULLET_SPEED
-        else:
-            self.dx = 0
-            self.dy = 0
-        
-    def draw(self, screen):
-        pygame.draw.circle(screen, BLUE, (int(self.x), int(self.y)), self.size)
+        # Normalizuj wektor i ustaw prędkość
+        self.dx = dx / distance * BULLET_SPEED
+        self.dy = dy / distance * BULLET_SPEED
         
     def update(self):
         self.x += self.dx
         self.y += self.dy
         
-    def is_off_screen(self):
-        return (self.x < -self.size or self.x > SCREEN_WIDTH + self.size or
-                self.y < -self.size or self.y > SCREEN_HEIGHT + self.size)
+    def draw(self, screen):
+        pygame.draw.circle(screen, BLUE, (int(self.x), int(self.y)), self.size)
 
-# Inicjalizacja obiektów
-game_running = True
-player = Player(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
+# Inicjalizacja gracza
+player = Player(SCREEN_WIDTH // 2 - PLAYER_SIZE // 2, SCREEN_HEIGHT // 2 - PLAYER_SIZE // 2)
+
+# Listy obiektów
 enemies = []
 bullets = []
-spawn_timer = 0
+
+# Zmienna do liczenia punktów
 score = 0
 
+# Zegar spawnowania wrogów
+enemy_spawn_timer = 0
+
 # Główna pętla gry
-while game_running:
+running = True
+while running:
     # Obsługa zdarzeń
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
-            game_running = False
+            running = False
         elif event.type == pygame.MOUSEBUTTONDOWN:
-            if event.button == 1:  # Lewy przycisk myszy
-                mouse_x, mouse_y = pygame.mouse.get_pos()
-                bullets.append(Bullet(player.x, player.y, mouse_x, mouse_y))
+            # Strzelanie po kliknięciu myszy
+            mouse_x, mouse_y = pygame.mouse.get_pos()
+            bullets.append(Bullet(player.x + PLAYER_SIZE//2, player.y + PLAYER_SIZE//2, mouse_x, mouse_y))
     
-    # Pobranie stanu klawiszy
+    # Obsługa klawiszy
     keys = pygame.key.get_pressed()
     dx, dy = 0, 0
     if keys[pygame.K_w] or keys[pygame.K_UP]:
@@ -131,70 +131,68 @@ while game_running:
     if keys[pygame.K_d] or keys[pygame.K_RIGHT]:
         dx += 1
     
-    # Ruch gracza
     player.move(dx, dy)
     
     # Spawnowanie wrogów
-    spawn_timer += 1
-    if spawn_timer >= ENEMY_SPAWN_RATE:
-        spawn_timer = 0
-        # Spawnuj z losowej strony ekranu
+    enemy_spawn_timer += 1
+    if enemy_spawn_timer >= ENEMY_SPAWN_RATE:
+        enemy_spawn_timer = 0
+        
+        # Wybierz losową stronę ekranu (z zewnątrz)
         side = random.choice(['top', 'bottom', 'left', 'right'])
+        
         if side == 'top':
             x = random.randint(0, SCREEN_WIDTH)
             y = -ENEMY_SIZE
         elif side == 'bottom':
             x = random.randint(0, SCREEN_WIDTH)
-            y = SCREEN_HEIGHT + ENEMY_SIZE
+            y = SCREEN_HEIGHT
         elif side == 'left':
             x = -ENEMY_SIZE
             y = random.randint(0, SCREEN_HEIGHT)
         else:  # right
-            x = SCREEN_WIDTH + ENEMY_SIZE
+            x = SCREEN_WIDTH
             y = random.randint(0, SCREEN_HEIGHT)
-        
+            
         enemies.append(Enemy(x, y))
     
     # Aktualizacja wrogów
-    for enemy in enemies:
-        enemy.move_towards_player(player.x, player.y)
+    for enemy in enemies[:]:
+        enemy.move_towards_player(player.x + PLAYER_SIZE//2, player.y + PLAYER_SIZE//2)
+        
+        # Usuń wroga jeśli wyjdzie poza ekran
+        if (enemy.x < -ENEMY_SIZE or enemy.x > SCREEN_WIDTH or 
+            enemy.y < -ENEMY_SIZE or enemy.y > SCREEN_HEIGHT):
+            enemies.remove(enemy)
     
     # Aktualizacja pocisków
     for bullet in bullets[:]:
         bullet.update()
-        if bullet.is_off_screen():
+        
+        # Usuń pocisk jeśli wyjdzie poza ekran
+        if (bullet.x < 0 or bullet.x > SCREEN_WIDTH or 
+            bullet.y < 0 or bullet.y > SCREEN_HEIGHT):
             bullets.remove(bullet)
     
-    # Kolizje
-    # Pociski z wrogami
+    # Sprawdź kolizje pocisków z wrogami
     for bullet in bullets[:]:
         for enemy in enemies[:]:
-            distance = math.sqrt((bullet.x - enemy.x)**2 + (bullet.y - enemy.y)**2)
-            if distance < bullet.size + enemy.size:
-                if bullet in bullets:
-                    bullets.remove(bullet)
-                if enemy in enemies:
-                    enemies.remove(enemy)
+            # Prosta kolizja prostokąt-rectangle
+            if (bullet.x > enemy.x and bullet.x < enemy.x + enemy.size and 
+                bullet.y > enemy.y and bullet.y < enemy.y + enemy.size):
+                bullets.remove(bullet)
+                enemies.remove(enemy)
                 score += 1
                 break
     
-    # Wrogowie z graczem
-    for enemy in enemies[:]:
-        distance = math.sqrt((player.x - enemy.x)**2 + (player.y - enemy.y)**2)
-        if distance < player.size + enemy.size:
-            game_running = False  # Koniec gry
-            
     # Rysowanie
     screen.fill(WHITE)
     
-    # Rysowanie gracza
     player.draw(screen)
     
-    # Rysowanie wrogów
     for enemy in enemies:
         enemy.draw(screen)
         
-    # Rysowanie pocisków
     for bullet in bullets:
         bullet.draw(screen)
     
@@ -207,3 +205,4 @@ while game_running:
     clock.tick(60)
 
 pygame.quit()
+sys.exit()

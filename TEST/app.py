@@ -81,6 +81,7 @@ def main():
 
     score = 0
     game_over = False
+    paused = False
 
     enemy_speed = ENEMY_BASE_SPEED
     next_speed_increase_time = ENEMY_SPEED_INTERVAL

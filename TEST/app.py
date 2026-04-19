@@ -74,28 +74,13 @@ def main():
     # --- Stan gry ---
     player_x = WIDTH / 2
     player_y = HEIGHT / 2
-    player_angle = 0.0
-
-    bullets = []  # each: [x,y,vx,vy]
-    enemies = []  # each: [x,y,hp]
-
+    player_angle = 0
+    enemies = []
+    bullets = []
     score = 0
-    game_over = False
     paused = False
-
-    enemy_speed = ENEMY_BASE_SPEED
-    next_speed_increase_time = ENEMY_SPEED_INTERVAL
-
-    # Spawn initial enemies
-    for _ in range(6):
-        enemies.append(spawn_enemy_outside_screen())
-
-    # Fire control: jeden klik = jeden strzał
-    shooting = False
-
-    # Timer for speed increase
-    elapsed = 0.0
-
+    
+    running = True
     running = True
     while running:
         dt = clock.tick(FPS) / 1000.0

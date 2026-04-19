@@ -181,6 +181,8 @@ class PipelineState:
     patch_strategy_reason: str = ""
     patch_exact_snippet: str = ""
     patch_hotspot_label: str = ""
+    patch_stale_error_detected: bool = False
+    patch_stale_error_reason: str = ""
     patch_replace_miss_streak: int = 0
     patch_failure_streak: int = 0
     patch_verify_failure_streak: int = 0
@@ -784,6 +786,8 @@ def _soft_reset_runtime_state(state):
     state.patch_failure_streak = 0
     state.patch_exact_snippet = ""
     state.patch_hotspot_label = ""
+    state.patch_stale_error_detected = False
+    state.patch_stale_error_reason = ""
     state.patch_replace_miss_streak = 0
     state.patch_verify_failure_streak = 0
     state.patch_syntax_failure_streak = 0
@@ -819,6 +823,8 @@ def _hydrate_state_from_session(state, session_data):
     state.patch_failure_streak = int(session_data.get("patch_failure_streak") or 0)
     state.patch_exact_snippet = str(session_data.get("patch_exact_snippet") or "")
     state.patch_hotspot_label = str(session_data.get("patch_hotspot_label") or "")
+    state.patch_stale_error_detected = bool(session_data.get("patch_stale_error_detected") or False)
+    state.patch_stale_error_reason = str(session_data.get("patch_stale_error_reason") or "")
     state.patch_replace_miss_streak = int(session_data.get("patch_replace_miss_streak") or 0)
     state.patch_verify_failure_streak = int(session_data.get("patch_verify_failure_streak") or 0)
     state.patch_syntax_failure_streak = int(session_data.get("patch_syntax_failure_streak") or 0)
@@ -879,6 +885,8 @@ def _save_session_state(state):
         "patch_failure_streak": state.patch_failure_streak,
         "patch_exact_snippet": state.patch_exact_snippet,
         "patch_hotspot_label": state.patch_hotspot_label,
+        "patch_stale_error_detected": state.patch_stale_error_detected,
+        "patch_stale_error_reason": state.patch_stale_error_reason,
         "patch_replace_miss_streak": state.patch_replace_miss_streak,
         "patch_verify_failure_streak": state.patch_verify_failure_streak,
         "patch_syntax_failure_streak": state.patch_syntax_failure_streak,
@@ -1113,14 +1121,126 @@ def _grounded_patch_retry_context(path, project_root, user_prompt):
     return "\n".join(parts)
 
 
+def _extract_error_like_text(user_prompt, state, history=None):
+    bits = []
+    prompt_text = str(user_prompt or "")
+    if any(marker in _normalize_prompt_text(prompt_text) for marker in ("traceback", "error", "exception", "syntaxerror", "indentationerror")):
+        bits.append(prompt_text)
+    runtime_text = str(state.last_runtime_error or "")
+    if runtime_text:
+        bits.append(runtime_text)
+    for item in (history or [])[-4:]:
+        text = str(item or "")
+        lowered = _normalize_prompt_text(text)
+        if any(marker in lowered for marker in ("traceback", "error", "exception", "syntaxerror", "indentationerror")):
+            bits.append(text)
+    return "\n".join(bits).strip()
+
+
+def _extract_error_symbols(error_text):
+    if not error_text:
+        return []
+    stop_words = {
+        "traceback",
+        "line",
+        "file",
+        "error",
+        "exception",
+        "runtime",
+        "recent",
+        "call",
+        "last",
+        "most",
+        "none",
+        "true",
+        "false",
+        "nameerror",
+        "typeerror",
+        "valueerror",
+        "syntaxerror",
+        "indentationerror",
+        "unboundlocalerror",
+        "attributeerror",
+        "keyerror",
+        "indexerror",
+    }
+    raw = []
+    raw.extend(re.findall(r"'([A-Za-z_][A-Za-z0-9_]*)'", error_text))
+    raw.extend(re.findall(r'"([A-Za-z_][A-Za-z0-9_]*)"', error_text))
+    raw.extend(re.findall(r"\bin\s+([A-Za-z_][A-Za-z0-9_]*)\b", error_text))
+    if not raw:
+        fallback_tokens = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", _normalize_prompt_text(error_text))
+        raw.extend(token for token in fallback_tokens if "_" in token)
+    symbols = []
+    seen = set()
+    for token in raw:
+        norm = _normalize_prompt_text(token).strip()
+        if len(norm) < 3 or norm in stop_words or norm in seen:
+            continue
+        seen.add(norm)
+        symbols.append(norm)
+        if len(symbols) >= 24:
+            break
+    return symbols
+
+
+def _detect_stale_error_context(path, project_root, user_prompt, state, history=None):
+    error_text = _extract_error_like_text(user_prompt, state, history=history)
+    if not error_text:
+        return False, ""
+
+    snapshot = _normalize_prompt_text(_read_target_text(path, project_root))
+    if not snapshot:
+        return False, ""
+
+    symbols = _extract_error_symbols(error_text)
+    if not symbols:
+        return False, ""
+
+    outlined = " ".join(
+        _normalize_prompt_text(item_text) for _, item_text in _discover_file_outline(path, project_root, max_items=24)
+    )
+    anchor_pool = " ".join(_normalize_prompt_text(anchor) for anchor in _discover_real_anchors(path, project_root, max_items=16))
+    search_space = " ".join([snapshot, outlined, anchor_pool]).strip()
+    if not search_space:
+        return False, ""
+
+    present = [symbol for symbol in symbols if symbol in search_space]
+    absent = [symbol for symbol in symbols if symbol not in search_space]
+    has_error_markers = any(
+        marker in _normalize_prompt_text(error_text)
+        for marker in ("traceback", "error", "exception", "syntaxerror", "indentationerror", "unboundlocalerror")
+    )
+    if has_error_markers and absent and not present:
+        preview = ", ".join(absent[:5])
+        return True, f"symbol/block not present in current snapshot ({preview})"
+    if has_error_markers and len(absent) >= 4 and len(present) <= 1:
+        preview = ", ".join(absent[:5])
+        return True, f"traceback context poorly aligned with current snapshot ({preview})"
+    return False, ""
+
+
+def _prune_traceback_lines(text):
+    rows = []
+    for row in str(text or "").splitlines():
+        lowered = _normalize_prompt_text(row)
+        if any(marker in lowered for marker in ("traceback", "error", "exception", "file \"", "line ")):
+            continue
+        rows.append(row)
+    return "\n".join(rows)
+
+
 def _patch_focus_tokens(user_prompt, state, history=None):
     history = history or []
-    text_bits = [user_prompt or ""]
-    if state.last_runtime_error:
+    prompt_source = user_prompt or ""
+    if getattr(state, "patch_stale_error_detected", False):
+        prompt_source = _prune_traceback_lines(prompt_source)
+    text_bits = [prompt_source]
+    if state.last_runtime_error and not getattr(state, "patch_stale_error_detected", False):
         text_bits.append(state.last_runtime_error)
     if state.last_useful_observation_summary:
         text_bits.append(state.last_useful_observation_summary)
-    if history:
+    if history and not getattr(state, "patch_stale_error_detected", False):
         text_bits.append("\n".join(history[-3:]))
     tokens = _keyword_tokens(" ".join(text_bits))
     unique = []
@@ -1186,6 +1306,8 @@ def build_instruction_bits(
     patch_phase="patch_target",
     patch_strategy="surgical_patch",
     patch_hotspots_summary="",
+    stale_error_detected=False,
+    stale_error_reason="",
     task_profile="",
     model_route="",
 ):
@@ -1240,6 +1362,7 @@ def build_instruction_bits(
             "Rules:",
             "- Default to one existing file.",
             "- Keep target fixed: all file actions must stay on active_patch_target unless user explicitly expands scope.",
+            "- Source-of-truth priority: current real file snapshot and anchors override older traceback/log text.",
             "- Use ONLY anchors that appear in the provided real outline, real anchors, or focused snippets.",
             "- Prefer exact anchor strings copied from the provided file data. Do not invent function or method names.",
             "- Patch/rewrite only mapped hotspot areas unless a clear error proves another area is required.",
@@ -1268,6 +1391,10 @@ def build_instruction_bits(
             "",
             "Patch hotspots:",
             patch_hotspots_summary or "(hotspots unavailable)",
+            "",
+            "Patch context priority:",
+            "current snapshot > stale logs",
+            f"stale context signal: {stale_error_reason}" if stale_error_detected and stale_error_reason else "stale context signal: none",
             "",
             "Exact grounded snippet for current hotspot:",
             exact_patch_snippet or "(exact snippet unavailable)",
@@ -1441,6 +1568,8 @@ def build_prompt(user_prompt, history, state):
         patch_phase=state.patch_phase,
         patch_strategy=state.patch_strategy,
         patch_hotspots_summary=patch_hotspots_summary,
+        stale_error_detected=bool(getattr(state, "patch_stale_error_detected", False)),
+        stale_error_reason=str(getattr(state, "patch_stale_error_reason", "") or ""),
         task_profile=state.task_profile,
         model_route=state.model_route,
     )
@@ -2243,12 +2372,16 @@ def _completion_decision(state, plan, had_run_cmd, touched_paths, verify_observa
 
 
 def _single_file_patch_retry_note(state):
+    stale_hint = ""
+    if getattr(state, "patch_stale_error_detected", False):
+        stale_hint = " current snapshot overrides stale traceback/log hints."
     return (
         f"SINGLE-FILE PATCH FALLBACK for {state.active_patch_target or 'app.py'}: "
         f"current strategy={_normalize_patch_strategy(getattr(state, 'patch_strategy', 'surgical_patch'))}. "
         "prefer anchored edits (replace_in_file, insert_before/after, replace_block). "
         "If patching keeps failing or file scope is large, escalate to rewrite_existing_file or chunked_rewrite_existing_file. "
         "For chunked rewrite use begin_file_rewrite + append_file_chunk + finalize_file_rewrite."
+        f"{stale_hint}"
     )
 
 
@@ -2336,6 +2469,20 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
 
             if state.mode == "patch":
                 _refresh_patch_context(state)
+                stale_detected, stale_reason = _detect_stale_error_context(
+                    state.active_patch_target,
+                    state.active_project_root,
+                    prompt,
+                    state,
+                    history=history,
+                )
+                state.patch_stale_error_detected = bool(stale_detected)
+                state.patch_stale_error_reason = str(stale_reason or "")
+                if state.patch_stale_error_detected:
+                    log("PATCH CONTEXT PRIORITY: current snapshot > stale logs")
+                    log("STALE ERROR CONTEXT DETECTED")
+                    if state.patch_stale_error_reason:
+                        log(f"STALE ERROR REASON: {state.patch_stale_error_reason}")
                 hotspot_bundle = _derive_patch_hotspots(
                     state.active_patch_target,
                     state.active_project_root,
@@ -2362,6 +2509,7 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                 log(f"PATCH STRATEGY: {state.patch_strategy}")
                 if state.patch_hotspot_label:
                     log(f"PATCH GROUNDING: exact snippet for {state.patch_hotspot_label}")
+                    log(f"PATCH GROUNDING SOURCE: current {state.patch_hotspot_label} snippet")
                 if _is_small_focused_patch(state):
                     log("PATCH ACTION BIAS: prefer replace_block")
                 if strategy_escalation_reason:
@@ -2762,6 +2910,12 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                                         "PATCH MISS RECOVERY: repeated replace_in_file miss. "
                                         "Use replace_block/insert_before/insert_after with real anchors from fresh snippet."
                                     )
+                                    if state.patch_stale_error_detected:
+                                        log("PATCH GROUNDING REFRESH: stale-context miss")
+                                        history.append(
+                                            "PATCH CONTEXT PRIORITY: current snapshot > stale logs. "
+                                            "Older traceback hints appear stale; ground next patch only on current snippet/anchors."
+                                        )
                             if "anchor not found" in details_lower or "missing anchor" in details_lower:
                                 patch_anchor_failure = True
                                 grounded = _grounded_patch_retry_context(target_path, state.active_project_root, prompt)
@@ -2850,6 +3004,12 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                             log("CHUNK PHASE: chunk_begin")
                 if state.mode == "patch":
                     state.patch_failure_streak += 1
+                    if state.patch_stale_error_detected:
+                        state.patch_phase = "inspect_target"
+                        history.append(
+                            "PATCH GROUNDING REFRESH: prioritize current file snapshot. "
+                            "Stale traceback/log context downgraded for next retry."
+                        )
                     if patch_anchor_failure:
                         state.patch_anchor_failure_streak += 1
                     if patch_broad_attempt:

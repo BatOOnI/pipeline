@@ -17,6 +17,7 @@ from utils import is_subpath
 
 
 PATH_LIKE_RE = re.compile(r"[\\/]|^\.\.?$|\.[A-Za-z0-9_+-]{1,8}$")
+WINDOWS_SIMPLE_LAUNCH_RE = re.compile(r'^\s*cd\s+/d\s+(".*?"|\S+)\s*&&\s*(.+?)\s*$', re.IGNORECASE)
 SHELL_TEXT_EXTENSIONS = {".bat", ".cmd", ".ps1", ".sh"}
 WINDOWS_SCRIPT_EXTENSIONS = {".bat", ".cmd", ".ps1"}
 REWRITE_STATE_DIR = os.path.join(".agent", "rewrite_state")
@@ -982,9 +983,41 @@ def _prepare_cmd(cmd, project_root=None):
     return cmd, ""
 
 
+def _normalize_simple_windows_launch(cmd, cwd=None, project_root=None):
+    if not isinstance(cmd, str):
+        return cmd, cwd, ""
+    raw = str(cmd).strip()
+    if "&&" not in raw:
+        return cmd, cwd, ""
+    if any(token in raw for token in ("||", ";", "|", ">", "<")):
+        return cmd, cwd, ""
+    match = WINDOWS_SIMPLE_LAUNCH_RE.match(raw)
+    if not match:
+        return cmd, cwd, ""
+
+    target_text = (match.group(1) or "").strip().strip('"').strip("'")
+    remainder = (match.group(2) or "").strip()
+    if not remainder:
+        return cmd, cwd, ""
+
+    normalized_cwd = cwd
+    base_root = project_root or cwd or os.getcwd()
+    if target_text.lower() == "%~dp0":
+        normalized_cwd = base_root
+    else:
+        try:
+            normalized_cwd = _resolve_path(target_text, project_root=base_root)
+        except Exception:
+            return cmd, cwd, ""
+    return remainder, normalized_cwd, "Normalized simple Windows launch command."
+
+
 def run_cmd(cmd, cwd=None, project_root=None):
     project_root = project_root or cwd
-    prepared, error = _prepare_cmd(cmd, project_root=project_root)
+    normalized_cmd, normalized_cwd, normalization_note = _normalize_simple_windows_launch(
+        cmd, cwd=cwd, project_root=project_root
+    )
+    prepared, error = _prepare_cmd(normalized_cmd, project_root=project_root)
     if error:
         return Observation(False, f"CMD BLOCKED: {cmd}", changed=False, details=error, tool="run_cmd")
 
@@ -994,11 +1027,16 @@ def run_cmd(cmd, cwd=None, project_root=None):
             shell=False,
             capture_output=True,
             text=True,
-            cwd=cwd,
+            cwd=normalized_cwd,
             input="",
             timeout=config.RUN_TIMEOUT,
         )
         details = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()[:4000]
+        if normalization_note:
+            prefix = normalization_note
+            if normalized_cwd:
+                prefix += f" cwd={normalized_cwd}"
+            details = (prefix + "\n" + details).strip()
         return Observation(
             result.returncode == 0,
             f"CMD exit={result.returncode}: {prepared}",

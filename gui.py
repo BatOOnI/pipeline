@@ -42,6 +42,8 @@ class App:
 
     def _build_vars(self):
         self.provider_var = tk.StringVar(value=config.PROVIDER)
+        self.mode_control_var = tk.StringVar(value=str(getattr(config, "MODE_CONTROL", "AUTO") or "AUTO").upper())
+        self.rescue_mode_var = tk.StringVar(value=str(getattr(config, "RESCUE_MODE", "OFF") or "OFF").upper())
         self.lm_url_var = tk.StringVar(value=config.LMSTUDIO_URL)
         self.lm_model_var = tk.StringVar(value=config.LMSTUDIO_MODEL)
         self.oa_model_var = tk.StringVar(value=config.OPENAI_MODEL)
@@ -100,12 +102,17 @@ class App:
             state="readonly",
         ).grid(row=3, column=1, sticky="w", **pad)
 
-        ttk.Label(pipeline_box, text="LM URL").grid(row=3, column=2, sticky="w", **pad)
-        ttk.Entry(pipeline_box, textvariable=self.lm_url_var, width=42).grid(row=3, column=3, sticky="we", **pad)
+        ttk.Label(pipeline_box, text="Mode control").grid(row=3, column=2, sticky="w", **pad)
+        ttk.Combobox(
+            pipeline_box,
+            textvariable=self.mode_control_var,
+            values=["AUTO", "FORCE_CREATE", "FORCE_PATCH"],
+            width=16,
+            state="readonly",
+        ).grid(row=3, column=3, sticky="w", **pad)
 
-        ttk.Label(pipeline_box, text="LM Model").grid(row=3, column=4, sticky="w", **pad)
-        self.lm_model_combo = ttk.Combobox(pipeline_box, textvariable=self.lm_model_var, width=24)
-        self.lm_model_combo.grid(row=3, column=5, sticky="we", **pad)
+        ttk.Label(pipeline_box, text="LM URL").grid(row=3, column=4, sticky="w", **pad)
+        ttk.Entry(pipeline_box, textvariable=self.lm_url_var, width=42).grid(row=3, column=5, sticky="we", **pad)
 
         ttk.Label(pipeline_box, text="OpenAI Model").grid(row=4, column=0, sticky="w", **pad)
         self.oa_model_combo = ttk.Combobox(pipeline_box, textvariable=self.oa_model_var, width=18)
@@ -125,11 +132,15 @@ class App:
         ttk.Entry(project_root_row, textvariable=self.project_root_var, width=24).grid(row=0, column=0, sticky="we")
         ttk.Button(project_root_row, text="Browse", command=self.browse_project_root).grid(row=0, column=1, padx=(6, 0))
 
-        ttk.Label(pipeline_box, text="Patch files").grid(row=5, column=0, sticky="w", **pad)
-        ttk.Entry(pipeline_box, textvariable=self.patch_files_var, width=40).grid(row=5, column=1, columnspan=2, sticky="we", **pad)
+        ttk.Label(pipeline_box, text="LM Model").grid(row=5, column=0, sticky="w", **pad)
+        self.lm_model_combo = ttk.Combobox(pipeline_box, textvariable=self.lm_model_var, width=24)
+        self.lm_model_combo.grid(row=5, column=1, sticky="we", **pad)
 
-        ttk.Label(pipeline_box, text="Patch snippet lines").grid(row=5, column=3, sticky="w", **pad)
-        ttk.Entry(pipeline_box, textvariable=self.patch_snippet_lines_var, width=10).grid(row=5, column=4, sticky="w", **pad)
+        ttk.Label(pipeline_box, text="Patch files").grid(row=5, column=2, sticky="w", **pad)
+        ttk.Entry(pipeline_box, textvariable=self.patch_files_var, width=40).grid(row=5, column=3, sticky="we", **pad)
+
+        ttk.Label(pipeline_box, text="Patch snippet lines").grid(row=5, column=4, sticky="w", **pad)
+        ttk.Entry(pipeline_box, textvariable=self.patch_snippet_lines_var, width=10).grid(row=5, column=5, sticky="w", **pad)
 
         ttk.Label(pipeline_box, text="Max iterations").grid(row=6, column=0, sticky="w", **pad)
         ttk.Entry(pipeline_box, textvariable=self.max_iter_var, width=8).grid(row=6, column=1, sticky="w", **pad)
@@ -141,6 +152,14 @@ class App:
         ttk.Entry(pipeline_box, textvariable=self.model_timeout_var, width=8).grid(row=6, column=5, sticky="w", **pad)
 
         ttk.Checkbutton(pipeline_box, text="Auto run commands", variable=self.auto_run_var).grid(row=7, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Label(pipeline_box, text="Rescue mode").grid(row=7, column=2, sticky="w", **pad)
+        ttk.Combobox(
+            pipeline_box,
+            textvariable=self.rescue_mode_var,
+            values=["OFF", "ON", "ASK_BEFORE_RESCUE"],
+            width=20,
+            state="readonly",
+        ).grid(row=7, column=3, sticky="w", **pad)
 
         btn_row = ttk.Frame(pipeline_box)
         btn_row.grid(row=8, column=0, columnspan=6, sticky="we", **pad)
@@ -213,6 +232,16 @@ class App:
 
     def apply_config(self):
         config.PROVIDER = self.provider_var.get().strip()
+        mode_control = str(self.mode_control_var.get() or "AUTO").strip().upper()
+        if mode_control not in {"AUTO", "FORCE_CREATE", "FORCE_PATCH"}:
+            mode_control = "AUTO"
+        self.mode_control_var.set(mode_control)
+        config.MODE_CONTROL = mode_control
+        rescue_mode = str(self.rescue_mode_var.get() or "OFF").strip().upper()
+        if rescue_mode not in {"OFF", "ON", "ASK_BEFORE_RESCUE"}:
+            rescue_mode = "OFF"
+        self.rescue_mode_var.set(rescue_mode)
+        config.RESCUE_MODE = rescue_mode
         config.LMSTUDIO_URL = self.lm_url_var.get().strip()
         config.LMSTUDIO_MODEL = self.lm_model_var.get().strip()
         config.OPENAI_MODEL = self.oa_model_var.get().strip()
@@ -237,6 +266,44 @@ class App:
         if key:
             self.oa_key_var.set(key)
             config.OPENAI_API_KEY = key
+        provider = str(data.get("provider", "")).strip().lower()
+        if provider in {"lmstudio", "openai"}:
+            self.provider_var.set(provider)
+        mode_control = str(data.get("mode_control", "")).strip().upper()
+        if mode_control in {"AUTO", "FORCE_CREATE", "FORCE_PATCH"}:
+            self.mode_control_var.set(mode_control)
+        rescue_mode = str(data.get("rescue_mode", "")).strip().upper()
+        if rescue_mode in {"OFF", "ON", "ASK_BEFORE_RESCUE"}:
+            self.rescue_mode_var.set(rescue_mode)
+        lm_model = str(data.get("lm_model", "")).strip()
+        if lm_model:
+            self.lm_model_var.set(lm_model)
+        oa_model = str(data.get("openai_model", "")).strip()
+        if oa_model:
+            self.oa_model_var.set(oa_model)
+        lm_url = str(data.get("lm_url", "")).strip()
+        if lm_url:
+            self.lm_url_var.set(lm_url)
+        project_root = self._normalize_project_root(data.get("project_root", ""))
+        if project_root:
+            self.project_root_var.set(project_root)
+        patch_files = str(data.get("patch_files", "")).strip()
+        if patch_files or "patch_files" in data:
+            self.patch_files_var.set(patch_files)
+        if "max_iterations" in data:
+            self.max_iter_var.set(str(data.get("max_iterations")))
+        if "run_timeout" in data:
+            self.run_timeout_var.set(str(data.get("run_timeout")))
+        if "model_timeout" in data:
+            self.model_timeout_var.set(str(data.get("model_timeout")))
+        if "prompt_char_limit" in data:
+            self.prompt_char_limit_var.set(str(data.get("prompt_char_limit")))
+        if "patch_snippet_lines" in data:
+            self.patch_snippet_lines_var.set(str(data.get("patch_snippet_lines")))
+        if "max_output_tokens" in data:
+            self.max_output_tokens_var.set(str(data.get("max_output_tokens")))
+        if "auto_run_commands" in data:
+            self.auto_run_var.set(bool(data.get("auto_run_commands")))
         self._saved_prompt_text = str(data.get("last_prompt", "") or "")
 
     def _save_gui_settings(self):
@@ -247,6 +314,21 @@ class App:
         payload = {
             "openai_api_key": self.oa_key_var.get().strip(),
             "last_prompt": prompt_value,
+            "provider": self.provider_var.get().strip(),
+            "mode_control": self.mode_control_var.get().strip().upper(),
+            "rescue_mode": self.rescue_mode_var.get().strip().upper(),
+            "lm_url": self.lm_url_var.get().strip(),
+            "lm_model": self.lm_model_var.get().strip(),
+            "openai_model": self.oa_model_var.get().strip(),
+            "project_root": self._normalize_project_root(self.project_root_var.get()),
+            "patch_files": self.patch_files_var.get().strip(),
+            "max_iterations": self.max_iter_var.get().strip(),
+            "run_timeout": self.run_timeout_var.get().strip(),
+            "model_timeout": self.model_timeout_var.get().strip(),
+            "prompt_char_limit": self.prompt_char_limit_var.get().strip(),
+            "patch_snippet_lines": self.patch_snippet_lines_var.get().strip(),
+            "max_output_tokens": self.max_output_tokens_var.get().strip(),
+            "auto_run_commands": bool(self.auto_run_var.get()),
         }
         write_json_file(self.settings_path, payload)
 
@@ -375,6 +457,24 @@ class App:
         request_handle.cancel()
         close_dialog("kill")
 
+    def handle_rescue_request(self, reason, from_provider, to_provider):
+        decision = {"value": False}
+        finished = threading.Event()
+
+        def ask():
+            title = "Rescue Confirmation"
+            message = (
+                f"Switch provider from {from_provider} to {to_provider} rescue?\n\n"
+                f"Reason:\n{str(reason)[:500]}"
+            )
+            decision["value"] = bool(messagebox.askyesno(title, message))
+            finished.set()
+
+        self.root.after(0, ask)
+        while not finished.wait(0.2):
+            pass
+        return decision["value"]
+
     def start_pipeline(self):
         if self.worker and self.worker.is_alive():
             messagebox.showinfo("Busy", "Pipeline is already running.")
@@ -398,6 +498,7 @@ class App:
                     logger=self.log,
                     stop_checker=lambda: self.stop_flag,
                     model_timeout_handler=self.handle_model_timeout,
+                    rescue_decider=self.handle_rescue_request,
                 )
                 self.log("PIPELINE FINISHED")
                 if config.ACTIVE_PROJECT_ROOT:

@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import os
@@ -60,9 +61,21 @@ CREATE_KEYWORDS = (
     "build",
     "make",
 )
+EXISTING_EDIT_HINTS = (
+    "moja gra",
+    "mojej gry",
+    "my game",
+    "this game",
+    "this app",
+    "moja aplikacja",
+    "existing file",
+    "existing project",
+    "w mojej grze",
+)
 PATCH_DONE_KEYWORDS = ("done", "complete", "completed", "finished", "ready", "gotowe", "zakonczone")
 SESSION_DIR_RE = re.compile(r"^TEST-(\d+)$", re.IGNORECASE)
 FILE_TOKEN_RE = re.compile(r"([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_+-]+)")
+CHUNK_STATUS_RE = re.compile(r"part=(\d+)/(\d+).*received=(\d+)", re.IGNORECASE)
 BLOCKED_TARGET_TOKENS = {
     "path",
     "paths",
@@ -85,6 +98,19 @@ PROGRESS_TOOLS = {
     "patch_lines",
     "finalize_file_rewrite",
 }
+REWRITE_STATE_DIR = os.path.join(".agent", "rewrite_state")
+PATCH_FILE_ACTIONS = {
+    "write_file",
+    "replace_in_file",
+    "insert_before",
+    "insert_after",
+    "replace_block",
+    "patch_lines",
+    "begin_file_rewrite",
+    "append_file_chunk",
+    "finalize_file_rewrite",
+    "find_in_file",
+}
 ATOMIC_PATCH_FILE_ACTIONS = {
     "write_file",
     "replace_in_file",
@@ -92,6 +118,9 @@ ATOMIC_PATCH_FILE_ACTIONS = {
     "insert_after",
     "replace_block",
     "patch_lines",
+    "begin_file_rewrite",
+    "append_file_chunk",
+    "finalize_file_rewrite",
 }
 
 
@@ -115,6 +144,7 @@ class PipelineState:
     mode: str
     active_project_root: str
     current_provider: str
+    base_provider: str = ""
     mode_reason: str = ""
     target_files: list = field(default_factory=list)
     active_patch_target: str = ""
@@ -133,6 +163,34 @@ class PipelineState:
     iteration_count: int = 0
     last_useful_observation_summary: str = ""
     prompt_changed: bool = False
+    required_b64_fields: list = field(default_factory=list)
+    create_strategy: str = "write_file"
+    create_phase: str = "initial_create"
+    create_strategy_reason: str = ""
+    create_full_write_streak: int = 0
+    last_created_main_file: str = ""
+    chunk_session_open: bool = False
+    chunk_target_path: str = ""
+    chunk_expected_parts: int = 0
+    chunk_received_parts: int = 0
+    chunk_missing_parts: list = field(default_factory=list)
+    chunk_finalize_pending: bool = False
+    chunk_protocol_violation_streak: int = 0
+    patch_phase: str = "inspect_target"
+    patch_strategy: str = "surgical_patch"
+    patch_strategy_reason: str = ""
+    patch_exact_snippet: str = ""
+    patch_hotspot_label: str = ""
+    patch_replace_miss_streak: int = 0
+    patch_failure_streak: int = 0
+    patch_verify_failure_streak: int = 0
+    patch_syntax_failure_streak: int = 0
+    patch_anchor_failure_streak: int = 0
+    patch_broad_patch_streak: int = 0
+    patch_hotspot_unavailable_streak: int = 0
+    task_profile: str = ""
+    model_route: str = ""
+    route_reason: str = ""
 
 
 def normalize_rel_path(rel_path: str) -> str:
@@ -222,6 +280,228 @@ def _normalize_prompt_text(user_prompt):
 def _prompt_word_tokens(user_prompt):
     lower = _normalize_prompt_text(user_prompt)
     return re.findall(r"[a-z0-9_]+", lower)
+
+
+def _rescue_mode():
+    mode = str(getattr(config, "RESCUE_MODE", "OFF") or "OFF").strip().upper()
+    if mode not in {"OFF", "ON", "ASK_BEFORE_RESCUE"}:
+        return "OFF"
+    return mode
+
+
+def _required_b64_fields(user_prompt):
+    lower = _normalize_prompt_text(user_prompt)
+    required = []
+    for key in ("content_b64", "old_b64", "new_b64"):
+        if key in lower:
+            required.append(key)
+    return required
+
+
+def _looks_like_base64_text(value):
+    text = str(value or "").strip()
+    if len(text) < 12:
+        return False
+    if len(text) % 4 != 0:
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9+/=]+", text):
+        return False
+    try:
+        raw = base64.b64decode(text, validate=True)
+        decoded = raw.decode("utf-8")
+    except Exception:
+        return False
+    markers = ("\n", "def ", "class ", "import ", "print(", "{", "}", ";", "<", ">")
+    return any(marker in decoded for marker in markers)
+
+
+def _is_likely_large_create_prompt(user_prompt):
+    text = _normalize_prompt_text(user_prompt)
+    if len(text) >= 700:
+        return True
+    if len(text) >= 420 and any(
+        marker in text
+        for marker in ("game", "website", "web app", "pygame", "tkinter", "flask", "fastapi", "full app", "full file")
+    ):
+        return True
+    return False
+
+
+def _choose_initial_create_strategy(user_prompt):
+    provider = str(config.PROVIDER or "").strip().lower()
+    if _is_likely_large_create_prompt(user_prompt) and provider == "lmstudio":
+        return "chunked_rewrite", "large-task heuristic"
+    if len(_normalize_prompt_text(user_prompt)) >= 1000:
+        return "chunked_rewrite", "large prompt size"
+    return "write_file", "default simple create"
+
+
+def _is_large_write_action(action):
+    if str(action.get("type", "")) != "write_file":
+        return False
+    args = action.get("args") if isinstance(action.get("args"), dict) else {}
+    content = str(args.get("content", ""))
+    content_b64 = str(args.get("content_b64", ""))
+    return len(content) >= 700 or len(content_b64) >= 500
+
+
+def _can_use_rescue():
+    return bool(
+        _rescue_mode() == "ON"
+        and config.OPENAI_RESCUE_ENABLED
+        and str(config.OPENAI_API_KEY or "").strip()
+    )
+
+
+def _rescue_suppressed_reason():
+    mode = _rescue_mode()
+    if mode == "OFF":
+        return "automatic OpenAI fallback disabled"
+    if mode == "ASK_BEFORE_RESCUE":
+        return "ASK_BEFORE_RESCUE requires explicit confirmation"
+    if not config.OPENAI_RESCUE_ENABLED:
+        return "OPENAI_RESCUE_ENABLED is false"
+    if not str(config.OPENAI_API_KEY or "").strip():
+        return "OpenAI API key missing"
+    return "rescue unavailable"
+
+
+def _choose_task_profile(state, user_prompt, consecutive_parse_errors=0):
+    text = _normalize_prompt_text(user_prompt)
+    token_count = len(_prompt_word_tokens(user_prompt))
+    runtime_lower = _normalize_prompt_text(state.last_runtime_error)
+    repeated_failures = consecutive_parse_errors >= 2 or state.stuck_iterations >= 2
+    no_progress_signal = state.stuck_iterations >= 1
+    grounding_signal = any(marker in runtime_lower for marker in ("anchor", "traceback", "syntaxerror", "indentationerror"))
+
+    if repeated_failures:
+        if _can_use_rescue():
+            return "rescue", "repeated parse failures or no progress"
+        if state.mode == "patch":
+            return "deep_patch", "repeated parse failures or no progress"
+        return "standard_create", "repeated parse failures or no progress"
+
+    if state.mode == "create":
+        if state.create_strategy == "chunked_rewrite" or _is_likely_large_create_prompt(user_prompt):
+            return "standard_create", "large/code-heavy create task"
+        if token_count <= 32 and len(text) <= 260:
+            return "simple_create", "small create task"
+        return "standard_create", "default create profile"
+
+    if _normalize_patch_strategy(getattr(state, "patch_strategy", "")) in {"rewrite_existing_file", "chunked_rewrite_existing_file"}:
+        return "deep_patch", f"patch strategy: {state.patch_strategy}"
+    if grounding_signal:
+        return "deep_patch", "patch grounding or runtime failure signal"
+    if state.patch_phase in {"inspect_target", "verify_patch"}:
+        return "standard_patch", f"patch phase: {state.patch_phase}"
+    if token_count <= 30 and len(text) <= 300:
+        return "simple_patch", "small focused patch"
+    if no_progress_signal:
+        return "deep_patch", "repeated no progress"
+    return "standard_patch", "default patch profile"
+
+
+def _route_for_task_profile(state, profile):
+    base = str(state.base_provider or state.current_provider or config.PROVIDER).strip().lower()
+    if base not in {"lmstudio", "openai"}:
+        base = str(config.PROVIDER or "lmstudio").strip().lower() or "lmstudio"
+
+    if state.current_provider.lower() == "openai" and state.rescue_handoff_count > 0 and _can_use_rescue():
+        return "rescue", "openai", "rescue handoff active"
+
+    if profile == "rescue":
+        if _can_use_rescue():
+            return "rescue", "openai", "repeated failures"
+        fallback_route = "deep" if state.mode == "patch" else "standard"
+        return fallback_route, base, f"rescue unavailable: {_rescue_suppressed_reason()}"
+
+    if profile in {"simple_create", "simple_patch"}:
+        route = "local/default" if base == "lmstudio" else "standard"
+        return route, base, "simple task"
+
+    if profile in {"standard_create", "standard_patch"}:
+        return "standard", base, "standard complexity"
+
+    if profile == "deep_patch":
+        return "deep", base, "complex patch"
+
+    return "local/default", base, "default route"
+
+
+def _is_syntax_like_failure(message):
+    lower = _normalize_prompt_text(message)
+    markers = (
+        "syntaxerror",
+        "indentationerror",
+        "taberror",
+        "invalid syntax",
+        "expected an indented block",
+        "unindent does not match",
+    )
+    return any(marker in lower for marker in markers)
+
+
+def _patch_target_metrics(state):
+    if state.mode != "patch" or not state.active_patch_target:
+        return 0, 0
+    content = _read_target_text(state.active_patch_target, state.active_project_root)
+    if not content:
+        return 0, 0
+    return len(content), len(content.splitlines())
+
+
+def _prefer_chunked_patch_rewrite(state):
+    chars, lines = _patch_target_metrics(state)
+    provider = str(state.current_provider or state.base_provider or config.PROVIDER or "").strip().lower()
+    if chars >= 5000 or lines >= 220:
+        return True
+    if provider == "lmstudio" and (chars >= 2200 or lines >= 120):
+        return True
+    if state.task_profile in {"deep_patch", "rescue"} and (chars >= 1800 or lines >= 90):
+        return True
+    return False
+
+
+def _normalize_patch_strategy(value):
+    allowed = {"surgical_patch", "rewrite_existing_file", "chunked_rewrite_existing_file"}
+    clean = str(value or "").strip().lower()
+    if clean in allowed:
+        return clean
+    return "surgical_patch"
+
+
+def _maybe_escalate_patch_strategy(state):
+    if state.mode != "patch":
+        return ""
+
+    state.patch_strategy = _normalize_patch_strategy(state.patch_strategy)
+    reason = ""
+    if state.patch_strategy == "surgical_patch":
+        if state.patch_verify_failure_streak >= 2 and state.patch_broad_patch_streak >= 1:
+            reason = "repeated staged verify failures"
+        elif state.patch_syntax_failure_streak >= 2 and state.patch_broad_patch_streak >= 1:
+            reason = "syntax failure after broad patch"
+        elif state.patch_anchor_failure_streak >= 2 and state.patch_failure_streak >= 2:
+            reason = "repeated missing-anchor retries with no effective progress"
+        elif state.patch_broad_patch_streak >= 2 and state.patch_failure_streak >= 2:
+            reason = "repeated broad replace_block attempts"
+        elif state.patch_hotspot_unavailable_streak >= 2 and state.patch_failure_streak >= 1:
+            reason = "hotspots unavailable after failed patch attempts"
+        if reason:
+            state.patch_strategy = "chunked_rewrite_existing_file" if _prefer_chunked_patch_rewrite(state) else "rewrite_existing_file"
+            state.patch_strategy_reason = reason
+            state.patch_phase = "inspect_target"
+            return reason
+
+    if state.patch_strategy == "rewrite_existing_file":
+        if (state.patch_failure_streak >= 2 or state.patch_verify_failure_streak >= 1) and _prefer_chunked_patch_rewrite(state):
+            reason = "rewrite_existing_file remained unstable"
+            state.patch_strategy = "chunked_rewrite_existing_file"
+            state.patch_strategy_reason = reason
+            state.patch_phase = "inspect_target"
+            return reason
+
+    return ""
 
 
 def _list_session_dirs(container):
@@ -314,7 +594,50 @@ def _prompt_mentions_existing_file(user_prompt):
     return False
 
 
+def _roots_have_existing_python_file():
+    for root in _candidate_existing_roots():
+        try:
+            for _, _, filenames in os.walk(root):
+                if any(name.lower().endswith(".py") for name in filenames):
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def _looks_like_existing_feature_edit(user_prompt, words):
+    text = _normalize_prompt_text(user_prompt)
+    if any(hint in text for hint in EXISTING_EDIT_HINTS):
+        return True
+    feature_tokens = {
+        "dodaj",
+        "add",
+        "pause",
+        "esc",
+        "menu",
+        "opcje",
+        "opcje",
+        "feature",
+        "counter",
+        "score",
+        "spawn",
+        "enemy",
+        "gracza",
+        "gracz",
+        "ruch",
+        "ui",
+    }
+    context_tokens = {"gra", "gry", "grze", "game", "app", "mojej", "moja", "my", "existing", "current", "this"}
+    return bool(words.intersection(feature_tokens) and words.intersection(context_tokens))
+
+
 def _infer_mode_with_reason(user_prompt):
+    mode_control = str(getattr(config, "MODE_CONTROL", "AUTO") or "AUTO").strip().upper()
+    if mode_control == "FORCE_CREATE":
+        return "create", "forced by MODE_CONTROL=FORCE_CREATE"
+    if mode_control == "FORCE_PATCH":
+        return "patch", "forced by MODE_CONTROL=FORCE_PATCH"
+
     patch_files_value = str(config.PATCH_FILES or "")
     if patch_files_value.strip():
         return "patch", "PATCH_FILES non-empty"
@@ -326,6 +649,8 @@ def _infer_mode_with_reason(user_prompt):
 
     if "dodaj" in words and _prompt_mentions_existing_file(user_prompt):
         return "patch", 'prompt references existing file with "dodaj"'
+    if "dodaj" in words and _roots_have_existing_python_file() and _looks_like_existing_feature_edit(user_prompt, words):
+        return "patch", 'feature request targets existing project context with "dodaj"'
 
     matched_create = next((keyword for keyword in CREATE_KEYWORDS if keyword in words), "")
     if matched_create:
@@ -454,6 +779,24 @@ def _soft_reset_runtime_state(state):
     state.rescue_handoff_count = 0
     state.progress_happened = False
     state.last_useful_observation_summary = ""
+    state.patch_strategy = "surgical_patch"
+    state.patch_strategy_reason = ""
+    state.patch_failure_streak = 0
+    state.patch_exact_snippet = ""
+    state.patch_hotspot_label = ""
+    state.patch_replace_miss_streak = 0
+    state.patch_verify_failure_streak = 0
+    state.patch_syntax_failure_streak = 0
+    state.patch_anchor_failure_streak = 0
+    state.patch_broad_patch_streak = 0
+    state.patch_hotspot_unavailable_streak = 0
+    state.chunk_session_open = False
+    state.chunk_target_path = ""
+    state.chunk_expected_parts = 0
+    state.chunk_received_parts = 0
+    state.chunk_missing_parts = []
+    state.chunk_finalize_pending = False
+    state.chunk_protocol_violation_streak = 0
 
 
 def _hydrate_state_from_session(state, session_data):
@@ -471,6 +814,24 @@ def _hydrate_state_from_session(state, session_data):
     state.last_written_files = list(session_data.get("last_written_files") or [])
     state.iteration_count = int(session_data.get("iteration_count") or 0)
     state.last_useful_observation_summary = str(session_data.get("last_useful_observation_summary") or "")
+    state.patch_strategy = _normalize_patch_strategy(session_data.get("patch_strategy", state.patch_strategy))
+    state.patch_strategy_reason = str(session_data.get("patch_strategy_reason") or "")
+    state.patch_failure_streak = int(session_data.get("patch_failure_streak") or 0)
+    state.patch_exact_snippet = str(session_data.get("patch_exact_snippet") or "")
+    state.patch_hotspot_label = str(session_data.get("patch_hotspot_label") or "")
+    state.patch_replace_miss_streak = int(session_data.get("patch_replace_miss_streak") or 0)
+    state.patch_verify_failure_streak = int(session_data.get("patch_verify_failure_streak") or 0)
+    state.patch_syntax_failure_streak = int(session_data.get("patch_syntax_failure_streak") or 0)
+    state.patch_anchor_failure_streak = int(session_data.get("patch_anchor_failure_streak") or 0)
+    state.patch_broad_patch_streak = int(session_data.get("patch_broad_patch_streak") or 0)
+    state.patch_hotspot_unavailable_streak = int(session_data.get("patch_hotspot_unavailable_streak") or 0)
+    state.chunk_session_open = bool(session_data.get("chunk_session_open") or False)
+    state.chunk_target_path = normalize_rel_path(session_data.get("chunk_target_path") or "")
+    state.chunk_expected_parts = int(session_data.get("chunk_expected_parts") or 0)
+    state.chunk_received_parts = int(session_data.get("chunk_received_parts") or 0)
+    state.chunk_missing_parts = list(session_data.get("chunk_missing_parts") or [])
+    state.chunk_finalize_pending = bool(session_data.get("chunk_finalize_pending") or False)
+    state.chunk_protocol_violation_streak = int(session_data.get("chunk_protocol_violation_streak") or 0)
 
     if not state.prompt_changed:
         state.last_runtime_error = str(session_data.get("last_runtime_error") or "")
@@ -508,6 +869,32 @@ def _save_session_state(state):
         "last_runtime_error": state.last_runtime_error,
         "last_useful_observation_summary": state.last_useful_observation_summary,
         "current_test_folder": test_folder,
+        "create_strategy": state.create_strategy,
+        "create_phase": state.create_phase,
+        "create_strategy_reason": state.create_strategy_reason,
+        "create_full_write_streak": state.create_full_write_streak,
+        "last_created_main_file": state.last_created_main_file,
+        "patch_strategy": state.patch_strategy,
+        "patch_strategy_reason": state.patch_strategy_reason,
+        "patch_failure_streak": state.patch_failure_streak,
+        "patch_exact_snippet": state.patch_exact_snippet,
+        "patch_hotspot_label": state.patch_hotspot_label,
+        "patch_replace_miss_streak": state.patch_replace_miss_streak,
+        "patch_verify_failure_streak": state.patch_verify_failure_streak,
+        "patch_syntax_failure_streak": state.patch_syntax_failure_streak,
+        "patch_anchor_failure_streak": state.patch_anchor_failure_streak,
+        "patch_broad_patch_streak": state.patch_broad_patch_streak,
+        "patch_hotspot_unavailable_streak": state.patch_hotspot_unavailable_streak,
+        "chunk_session_open": state.chunk_session_open,
+        "chunk_target_path": state.chunk_target_path,
+        "chunk_expected_parts": state.chunk_expected_parts,
+        "chunk_received_parts": state.chunk_received_parts,
+        "chunk_missing_parts": list(state.chunk_missing_parts),
+        "chunk_finalize_pending": state.chunk_finalize_pending,
+        "chunk_protocol_violation_streak": state.chunk_protocol_violation_streak,
+        "task_profile": state.task_profile,
+        "model_route": state.model_route,
+        "route_reason": state.route_reason,
     }
     write_json_file(_session_path(), payload)
 
@@ -531,9 +918,16 @@ def _build_state(user_prompt):
         mode=mode,
         active_project_root=active_project_root,
         current_provider=config.PROVIDER,
+        base_provider=config.PROVIDER,
         mode_reason=mode_reason,
         prompt_changed=prompt_changed,
+        required_b64_fields=_required_b64_fields(user_prompt),
     )
+    if mode == "create":
+        strategy, strategy_reason = _choose_initial_create_strategy(user_prompt)
+        state.create_strategy = strategy
+        state.create_strategy_reason = strategy_reason
+        state.create_phase = "chunk_begin" if strategy == "chunked_rewrite" else "initial_create"
     _hydrate_state_from_session(state, session_data)
     config.ACTIVE_PROJECT_ROOT = state.active_project_root
 
@@ -555,6 +949,10 @@ def _build_state(user_prompt):
         state.target_files = [active_target]
         state.expected_file_count = 1
         state.single_file_task = True
+        state.patch_phase = "inspect_target"
+        state.patch_strategy = _normalize_patch_strategy(state.patch_strategy)
+        if not state.patch_strategy:
+            state.patch_strategy = "surgical_patch"
     else:
         state.target_files = target_files
         state.expected_file_count = max(1, len(target_files) or 1)
@@ -715,6 +1113,54 @@ def _grounded_patch_retry_context(path, project_root, user_prompt):
     return "\n".join(parts)
 
 
+def _patch_focus_tokens(user_prompt, state, history=None):
+    history = history or []
+    text_bits = [user_prompt or ""]
+    if state.last_runtime_error:
+        text_bits.append(state.last_runtime_error)
+    if state.last_useful_observation_summary:
+        text_bits.append(state.last_useful_observation_summary)
+    if history:
+        text_bits.append("\n".join(history[-3:]))
+    tokens = _keyword_tokens(" ".join(text_bits))
+    unique = []
+    seen = set()
+    for token in tokens:
+        if token in seen:
+            continue
+        seen.add(token)
+        unique.append(token)
+        if len(unique) >= 14:
+            break
+    return unique
+
+
+def _derive_patch_hotspots(path, project_root, user_prompt, state, history=None, max_items=6):
+    outline_items = _discover_file_outline(path, project_root, max_items=18)
+    if not outline_items:
+        return {"summary": "(hotspots unavailable)", "snippet": "(snippet unavailable)", "anchors": []}
+
+    tokens = _patch_focus_tokens(user_prompt, state, history=history)
+    matched = []
+    for line_no, text in outline_items:
+        lowered = _normalize_prompt_text(text)
+        if any(token in lowered for token in tokens):
+            matched.append((line_no, text))
+        if len(matched) >= max_items:
+            break
+
+    hotspots = matched or outline_items[:max_items]
+    hotspot_lines = [f"- L{line_no}: {text}" for line_no, text in hotspots]
+    snippet_query = " ".join(tokens[:8]) or user_prompt
+    snippet = _focused_patch_snippets(path, project_root, snippet_query, max(24, config.PATCH_SNIPPET_LINES // 2))
+    anchors = [text for _, text in hotspots[:8]]
+    return {
+        "summary": "\n".join(hotspot_lines),
+        "snippet": snippet,
+        "anchors": anchors,
+    }
+
+
 def build_instruction_bits(
     user_prompt,
     *,
@@ -725,19 +1171,62 @@ def build_instruction_bits(
     file_outline="",
     real_anchors="",
     file_snippet="",
+    exact_patch_snippet="",
     last_error="",
     history=None,
     compact_level=0,
+    create_strategy="write_file",
+    create_phase="initial_create",
+    chunk_session_open=False,
+    chunk_target_path="",
+    chunk_expected_parts=0,
+    chunk_received_parts=0,
+    chunk_missing_parts=None,
+    chunk_protocol_violation_streak=0,
+    patch_phase="patch_target",
+    patch_strategy="surgical_patch",
+    patch_hotspots_summary="",
+    task_profile="",
+    model_route="",
 ):
     target_files = target_files or []
     history = history or []
+    chunk_missing_parts = list(chunk_missing_parts or [])
     compact_history = _compact_history(history, compact_level)
+    required_b64 = _required_b64_fields(user_prompt)
 
     if mode == "patch":
+        patch_strategy = _normalize_patch_strategy(patch_strategy)
+        if patch_strategy == "chunked_rewrite_existing_file":
+            strategy_rules = [
+                "- Strategy contract: this task has escalated to chunked full rewrite of the existing active patch target.",
+                "- Return begin_file_rewrite, then append_file_chunk parts in order, then finalize_file_rewrite for the SAME active patch target.",
+                "- Do not use one-shot write_file for this strategy.",
+                "- Do not mix chunked rewrite with anchored patch actions in the same reply.",
+            ]
+        elif patch_strategy == "rewrite_existing_file":
+            strategy_rules = [
+                "- Strategy contract: this task has escalated to controlled full rewrite of the existing active patch target.",
+                "- Prefer one coherent corrected file for the active target, not many tiny scattered edits.",
+                "- Keep the rewrite grounded in provided outline/snippets and preserve required behavior.",
+                "- Use chunked rewrite if the output becomes large or escaping becomes fragile.",
+            ]
+        else:
+            strategy_rules = [
+                "- Strategy contract: surgical patching is active.",
+                "- For single-file patch tasks, use this order: replace_in_file, insert_before, insert_after, replace_block, write_file fallback only if necessary.",
+                "- Prefer 1-3 small anchored edits for weaker local models.",
+                "- Use only one strategy family per iteration. Do not mix anchored edits with rewrite strategy unless absolutely necessary.",
+            ]
+
         return [
             "You are a coding agent working inside an existing local project.",
             f"Project root: {project_root}",
             "Mode: patch",
+            f"PATCH PHASE: {patch_phase}",
+            f"PATCH STRATEGY: {patch_strategy}",
+            f"TASK PROFILE: {task_profile or 'standard_patch'}",
+            f"MODEL ROUTE: {model_route or 'local/default'}",
             f"User patch request: {user_prompt}",
             f"canonical active_patch_target: {active_patch_target or 'app.py'}",
             f"target_files: {json.dumps(target_files or [active_patch_target or 'app.py'])}",
@@ -750,23 +1239,25 @@ def build_instruction_bits(
             "Allowed actions: replace_in_file, insert_before, insert_after, replace_block, begin_file_rewrite, append_file_chunk, finalize_file_rewrite, write_file, patch_lines, find_in_file, run_cmd",
             "Rules:",
             "- Default to one existing file.",
-            "- For single-file patch tasks, use patch-first strategy in this order: replace_in_file, insert_before, insert_after, replace_block, write_file fallback only if necessary.",
-            "- Prefer 1-3 small anchored edits for weaker local models.",
-            "- Use only one strategy family per iteration. Do not mix anchored edits with rewrite strategy in the same reply unless absolutely necessary.",
+            "- Keep target fixed: all file actions must stay on active_patch_target unless user explicitly expands scope.",
             "- Use ONLY anchors that appear in the provided real outline, real anchors, or focused snippets.",
             "- Prefer exact anchor strings copied from the provided file data. Do not invent function or method names.",
+            "- Patch/rewrite only mapped hotspot areas unless a clear error proves another area is required.",
             "- Do not use line_number, start_line, or end_line unless absolutely necessary.",
             "- Use patch_lines only as a legacy fallback.",
             "- Use write_file only for small full-file rewrites.",
-            "- If full rewrite is needed for a large file, use chunked rewrite protocol: begin_file_rewrite, then append_file_chunk parts in order, then finalize_file_rewrite.",
+            "- If full rewrite is needed for a large file, use chunked rewrite protocol.",
             "- For medium/large code payloads with quotes/newlines, prefer safe transport fields: content_b64 / old_b64 / new_b64.",
             "- Keep small/simple edits as plain text when safe; use b64 for bigger blocks to avoid JSON escaping failures.",
+            "- For small focused patches, prefer replace_block/insert_before/insert_after using real anchors over large replace_in_file blocks.",
+            "- If using replace_in_file, keep old/new compact and exactly grounded in the provided exact snippet.",
             "- For Python replace_block on methods/classes, return a complete valid block body with correct indentation.",
             "- Do not return truncated or partial method fragments.",
             "- Prefer fewer, self-contained method/class replacements over many tiny risky edits.",
             "- If replacing a Python method, include the full method implementation for that method in one coherent block.",
             "- Do not create folders or new files unless the user clearly asked for that.",
             "- Do not overwrite the whole file with a tiny fragment.",
+            *strategy_rules,
             "Examples:",
             '{"type":"insert_after","args":{"path":"app.py","anchor":"def main():\\n","content":"    print(\\"ready\\")\\n"}}',
             '{"type":"insert_before","args":{"path":"app.py","anchor":"if __name__ == \\"__main__\\":\\n","content":"\\n# launcher\\n"}}',
@@ -774,6 +1265,12 @@ def build_instruction_bits(
             "",
             "Real file outline:",
             file_outline or "(outline unavailable)",
+            "",
+            "Patch hotspots:",
+            patch_hotspots_summary or "(hotspots unavailable)",
+            "",
+            "Exact grounded snippet for current hotspot:",
+            exact_patch_snippet or "(exact snippet unavailable)",
             "",
             "Real anchors from file:",
             real_anchors or "(anchors unavailable)",
@@ -788,10 +1285,21 @@ def build_instruction_bits(
             compact_history or "None",
         ]
 
-    return [
+    next_required = ""
+    if create_strategy == "chunked_rewrite":
+        if create_phase == "chunk_begin":
+            next_required = "begin_file_rewrite"
+        elif create_phase == "chunk_finalize":
+            next_required = "finalize_file_rewrite"
+        elif create_phase == "chunk_append":
+            next_required = "finalize_file_rewrite" if int(chunk_received_parts or 0) >= int(chunk_expected_parts or 0) and int(chunk_expected_parts or 0) > 0 else "append_file_chunk"
+
+    base = [
         "You are a coding agent.",
         f"Project root: {project_root}",
         "Mode: create",
+        f"TASK PROFILE: {task_profile or 'standard_create'}",
+        f"MODEL ROUTE: {model_route or 'local/default'}",
         f"User task: {user_prompt}",
         "",
         "Return ONLY JSON with this exact shape:",
@@ -805,28 +1313,109 @@ def build_instruction_bits(
             '- For Windows launcher files (.bat/.cmd), use real newlines and prefer: "@echo off", `cd /d "%~dp0"`, `py -3 app.py` with fallback to `python app.py`, and `pause`.',
             "- If a previous attempt failed, fix it instead of repeating the same broken action.",
             "- If task is complete, return plan=done with empty actions.",
+            '- If user explicitly requires content_b64/old_b64/new_b64, use those fields exactly.',
+            "- Do not place raw base64 payload in plain content/old/new fields.",
+            f"- CREATE STRATEGY: {create_strategy}",
+            f"- CREATE PHASE: {create_phase}",
+            f"- CHUNK SESSION OPEN: {'true' if chunk_session_open else 'false'}",
+            f"- CHUNK TARGET: {chunk_target_path or 'app.py'}",
+            f"- CHUNK SESSION STATUS: received {int(chunk_received_parts or 0)}/{int(chunk_expected_parts or 0)} parts",
+            f"- CHUNK NEXT REQUIRED ACTION: {next_required or 'none'}",
+            "- In verify_or_run phase, prefer run_cmd, verify, and targeted edits over full-file rewrite.",
+            "- In fix_existing_file phase, prefer replace_in_file/insert_before/insert_after/replace_block on existing files.",
             "",
             "Recent observations:",
             compact_history or "None",
     ]
+    if create_strategy == "chunked_rewrite" and chunk_missing_parts:
+        preview = ",".join(str(x) for x in chunk_missing_parts[:24])
+        if len(chunk_missing_parts) > 24:
+            preview += ",..."
+        base.extend([
+            "",
+            f"CHUNK MISSING PARTS: {preview}",
+        ])
+    if create_strategy == "chunked_rewrite" and int(chunk_protocol_violation_streak or 0) > 0:
+        base.extend([
+            "",
+            "CHUNK PROTOCOL GUIDANCE STRENGTHENED:",
+            "- Previous response repeated protocol incorrectly.",
+            "- Continue from current phase and required action; do not restart chunk protocol.",
+        ])
+    return base + (([
+            "",
+            f"STRICT FORMAT CONTRACT: required fields -> {', '.join(required_b64)}",
+            "If required field is missing, return a format-correct action instead of plain content fallback.",
+        ] if required_b64 else []) + ([
+            "",
+            "CHUNKED CREATE CONTRACT:",
+            "- Use begin_file_rewrite(path, expected_parts), then append_file_chunk(path, part, content/content_b64), then finalize_file_rewrite(path).",
+            "- Do not use one-shot write_file for large main file generation in this strategy.",
+            "- Optional run_cmd is allowed only after finalize_file_rewrite.",
+            "- If CHUNK SESSION OPEN is true, DO NOT call begin_file_rewrite again.",
+            "- Continue append_file_chunk for missing parts, then call finalize_file_rewrite.",
+            "- In chunk_append phase, begin_file_rewrite is NOT allowed.",
+            '- chunk_append example: {"type":"append_file_chunk","args":{"path":"app.py","part":1,"content":"..."}}',
+            "- finalize_file_rewrite is allowed only when all required parts are present.",
+        ] if create_strategy == "chunked_rewrite" else []))
+
+
+def _format_violation_action(message):
+    return {"type": "action_format_violation", "args": {"message": message}}
+
+
+def _is_small_focused_patch(state):
+    if state.mode != "patch":
+        return False
+    if _normalize_patch_strategy(state.patch_strategy) != "surgical_patch":
+        return False
+    return state.task_profile in {"simple_patch", "standard_patch"}
+
+
+def _replace_in_file_looks_ungrounded(action, state):
+    if not _is_small_focused_patch(state):
+        return False, ""
+    if action.get("type") != "replace_in_file":
+        return False, ""
+    args = action.get("args") if isinstance(action.get("args"), dict) else {}
+    old_text = str(args.get("old", ""))
+    if len(old_text) < 220:
+        return False, ""
+    snippet = str(state.patch_exact_snippet or "")
+    if not snippet:
+        return False, ""
+    if old_text in snippet:
+        return False, ""
+    return True, "PATCH ACTION REJECTED: oversized ungrounded replace_in_file old block"
 
 
 def build_prompt(user_prompt, history, state):
     snippet_lines, _, _ = _prompt_budget(state.prompt_compaction_level)
     file_snippet = ""
+    exact_patch_snippet = ""
     file_outline = ""
     real_anchors = ""
+    patch_hotspots_summary = ""
     if state.mode == "patch" and state.active_patch_target:
+        hotspot_bundle = _derive_patch_hotspots(
+            state.active_patch_target,
+            state.active_project_root,
+            user_prompt,
+            state,
+            history=history,
+        )
         outline_items = _discover_file_outline(state.active_patch_target, state.active_project_root)
-        anchor_items = _discover_real_anchors(state.active_patch_target, state.active_project_root)
+        anchor_items = hotspot_bundle.get("anchors") or _discover_real_anchors(state.active_patch_target, state.active_project_root)
         file_outline = "\n".join(f"- L{line_no}: {text}" for line_no, text in outline_items[:18])
-        real_anchors = "\n".join(f'- "{text}"' for text in anchor_items[:12])
-        file_snippet = _focused_patch_snippets(
+        real_anchors = "\n".join(f'- "{text}"' for text in (anchor_items[:12] if isinstance(anchor_items, list) else []))
+        patch_hotspots_summary = hotspot_bundle.get("summary", "")
+        file_snippet = hotspot_bundle.get("snippet") or _focused_patch_snippets(
             state.active_patch_target,
             state.active_project_root,
             user_prompt,
             snippet_lines,
         )
+        exact_patch_snippet = hotspot_bundle.get("snippet") or ""
 
     bits = build_instruction_bits(
         user_prompt,
@@ -837,9 +1426,23 @@ def build_prompt(user_prompt, history, state):
         file_outline=file_outline,
         real_anchors=real_anchors,
         file_snippet=file_snippet,
+        exact_patch_snippet=exact_patch_snippet,
         last_error=truncate_middle(state.last_runtime_error, 1800),
         history=history,
         compact_level=state.prompt_compaction_level,
+        create_strategy=state.create_strategy,
+        create_phase=state.create_phase,
+        chunk_session_open=state.chunk_session_open,
+        chunk_target_path=state.chunk_target_path,
+        chunk_expected_parts=state.chunk_expected_parts,
+        chunk_received_parts=state.chunk_received_parts,
+        chunk_missing_parts=state.chunk_missing_parts,
+        chunk_protocol_violation_streak=state.chunk_protocol_violation_streak,
+        patch_phase=state.patch_phase,
+        patch_strategy=state.patch_strategy,
+        patch_hotspots_summary=patch_hotspots_summary,
+        task_profile=state.task_profile,
+        model_route=state.model_route,
     )
     prompt = "\n".join(bit for bit in bits if bit is not None)
 
@@ -850,16 +1453,26 @@ def build_prompt(user_prompt, history, state):
     state.prompt_compaction_level += 1
     snippet_lines, _, _ = _prompt_budget(state.prompt_compaction_level)
     if state.mode == "patch" and state.active_patch_target:
+        hotspot_bundle = _derive_patch_hotspots(
+            state.active_patch_target,
+            state.active_project_root,
+            user_prompt,
+            state,
+            history=history,
+            max_items=4,
+        )
         outline_items = _discover_file_outline(state.active_patch_target, state.active_project_root, max_items=12)
-        anchor_items = _discover_real_anchors(state.active_patch_target, state.active_project_root, max_items=8)
+        anchor_items = hotspot_bundle.get("anchors") or _discover_real_anchors(state.active_patch_target, state.active_project_root, max_items=8)
         file_outline = "\n".join(f"- L{line_no}: {text}" for line_no, text in outline_items[:12])
-        real_anchors = "\n".join(f'- "{text}"' for text in anchor_items[:8])
-        file_snippet = _focused_patch_snippets(
+        real_anchors = "\n".join(f'- "{text}"' for text in (anchor_items[:8] if isinstance(anchor_items, list) else []))
+        patch_hotspots_summary = hotspot_bundle.get("summary", "")
+        file_snippet = hotspot_bundle.get("snippet") or _focused_patch_snippets(
             state.active_patch_target,
             state.active_project_root,
             user_prompt,
             snippet_lines,
         )
+        exact_patch_snippet = hotspot_bundle.get("snippet") or exact_patch_snippet
     bits = build_instruction_bits(
         user_prompt,
         mode=state.mode,
@@ -869,9 +1482,23 @@ def build_prompt(user_prompt, history, state):
         file_outline=truncate_middle(file_outline, limit // 5),
         real_anchors=truncate_middle(real_anchors, limit // 6),
         file_snippet=truncate_middle(file_snippet, limit // 2),
+        exact_patch_snippet=truncate_middle(exact_patch_snippet, limit // 3),
         last_error=truncate_middle(state.last_runtime_error, limit // 5),
         history=history[-2:],
         compact_level=state.prompt_compaction_level,
+        create_strategy=state.create_strategy,
+        create_phase=state.create_phase,
+        chunk_session_open=state.chunk_session_open,
+        chunk_target_path=state.chunk_target_path,
+        chunk_expected_parts=state.chunk_expected_parts,
+        chunk_received_parts=state.chunk_received_parts,
+        chunk_missing_parts=state.chunk_missing_parts,
+        chunk_protocol_violation_streak=state.chunk_protocol_violation_streak,
+        patch_phase=state.patch_phase,
+        patch_strategy=state.patch_strategy,
+        patch_hotspots_summary=truncate_middle(patch_hotspots_summary, limit // 6),
+        task_profile=state.task_profile,
+        model_route=state.model_route,
     )
     prompt = "\n".join(bit for bit in bits if bit is not None)
     return truncate_middle(prompt, limit)
@@ -896,6 +1523,159 @@ def _reset_stuck_state(state):
     state.duplicate_action_cache.clear()
     state.last_plan_fingerprint = ""
     state.stuck_iterations = 0
+
+
+def _rewrite_state_path_for(rel_path, project_root):
+    rel = normalize_rel_path(rel_path or "")
+    if not rel:
+        return ""
+    abs_path = os.path.abspath(os.path.join(project_root, rel))
+    key = hashlib.sha256(os.path.normcase(abs_path).encode("utf-8")).hexdigest()
+    return os.path.join(project_root, REWRITE_STATE_DIR, f"{key}.json")
+
+
+def _load_rewrite_state_for(rel_path, project_root):
+    state_path = _rewrite_state_path_for(rel_path, project_root)
+    if not state_path or not os.path.exists(state_path):
+        return None
+    try:
+        data = read_json_file(state_path)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _clear_rewrite_state_for(rel_path, project_root):
+    state_path = _rewrite_state_path_for(rel_path, project_root)
+    if not state_path:
+        return
+    try:
+        os.remove(state_path)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+def _compute_missing_parts(expected_parts, parts):
+    try:
+        expected = int(expected_parts or 0)
+    except Exception:
+        expected = 0
+    if expected <= 0:
+        return []
+    present = set()
+    if isinstance(parts, dict):
+        for key in parts.keys():
+            try:
+                idx = int(key)
+            except Exception:
+                continue
+            if 1 <= idx <= expected:
+                present.add(idx)
+    return [idx for idx in range(1, expected + 1) if idx not in present]
+
+
+def _chunk_next_required_action(state):
+    if state.create_strategy != "chunked_rewrite":
+        return ""
+    if state.create_phase == "chunk_begin":
+        return "begin_file_rewrite"
+    if state.create_phase == "chunk_finalize":
+        return "finalize_file_rewrite"
+    if state.create_phase == "chunk_append":
+        if state.chunk_finalize_pending:
+            return "finalize_file_rewrite"
+        return "append_file_chunk"
+    return ""
+
+
+def _reset_chunk_session(state, reason="", clear_rewrite_state=False):
+    if clear_rewrite_state and state.chunk_target_path:
+        _clear_rewrite_state_for(state.chunk_target_path, state.active_project_root)
+    state.chunk_session_open = False
+    state.chunk_target_path = ""
+    state.chunk_expected_parts = 0
+    state.chunk_received_parts = 0
+    state.chunk_missing_parts = []
+    state.chunk_finalize_pending = False
+    state.chunk_protocol_violation_streak = 0
+    if reason:
+        state.create_strategy_reason = reason
+
+
+def _sync_chunk_session_from_rewrite_state(state, log=None, startup=False):
+    if state.mode != "create" or state.create_strategy != "chunked_rewrite":
+        return
+
+    if not state.chunk_target_path and not state.chunk_session_open and not state.last_created_main_file:
+        state.chunk_missing_parts = []
+        state.create_phase = "chunk_begin"
+        return
+
+    target = normalize_rel_path(state.chunk_target_path or state.last_created_main_file or "app.py")
+    state.chunk_target_path = target
+    rewrite_data = _load_rewrite_state_for(target, state.active_project_root)
+
+    if not rewrite_data:
+        if state.chunk_session_open:
+            msg = "CHUNK SESSION RESET: stale state after restart"
+            reason = "recorded open session but rewrite_state missing"
+            if log:
+                log(msg)
+                log(f"CHUNK SESSION RESET REASON: {reason}")
+            _reset_chunk_session(state, reason=reason, clear_rewrite_state=False)
+        state.create_phase = "chunk_begin"
+        state.chunk_missing_parts = []
+        return
+
+    expected_parts = rewrite_data.get("expected_parts")
+    parts = rewrite_data.get("parts")
+    if not isinstance(expected_parts, int) or expected_parts < 1 or expected_parts > 200 or not isinstance(parts, dict):
+        msg = "CHUNK SESSION RESET: stale state after restart"
+        reason = "rewrite state is corrupt or incomplete metadata"
+        if log:
+            log(msg)
+            log(f"CHUNK SESSION RESET REASON: {reason}")
+        _reset_chunk_session(state, reason=reason, clear_rewrite_state=True)
+        state.create_phase = "chunk_begin"
+        return
+
+    missing_parts = _compute_missing_parts(expected_parts, parts)
+    received = max(0, expected_parts - len(missing_parts))
+
+    state.chunk_session_open = True
+    state.chunk_expected_parts = expected_parts
+    state.chunk_received_parts = min(received, expected_parts)
+    state.chunk_missing_parts = missing_parts
+    state.chunk_finalize_pending = state.chunk_received_parts >= state.chunk_expected_parts
+
+    if startup and state.chunk_expected_parts > 0 and state.chunk_received_parts == 0:
+        reason = f"startup open session with 0/{state.chunk_expected_parts} parts"
+        if log:
+            log("CHUNK SESSION RESET: stale empty session")
+            log(f"CHUNK SESSION RESET REASON: {reason}")
+        _reset_chunk_session(state, reason=reason, clear_rewrite_state=True)
+        state.create_phase = "chunk_begin"
+        if log:
+            log("CHUNK PHASE: chunk_begin")
+        return
+
+    state.create_phase = "chunk_finalize" if state.chunk_finalize_pending else "chunk_append"
+    if log:
+        phase_label = state.create_phase
+        prefix = "CHUNK SESSION: "
+        if startup:
+            prefix = "CHUNK SESSION (startup): "
+        log(
+            f"{prefix}open target={state.chunk_target_path} expected_parts={state.chunk_expected_parts}"
+        )
+        log(f"CHUNK PHASE: {phase_label}")
+        log(f"CHUNK SESSION STATUS: received {state.chunk_received_parts}/{state.chunk_expected_parts} parts")
+        if state.chunk_missing_parts:
+            preview = ",".join(str(i) for i in state.chunk_missing_parts[:12])
+            suffix = "..." if len(state.chunk_missing_parts) > 12 else ""
+            log(f"CHUNK MISSING PARTS: {preview}{suffix}")
 
 
 def _build_atomic_patch_stage(actions, state):
@@ -1007,13 +1787,43 @@ def _commit_atomic_patch_stage(stage_context, state, log):
     return touched_paths, created_files, error_message
 
 
-def _hard_rescue_handoff(state, history, log, reason):
+def _hard_rescue_handoff(state, history, log, reason, rescue_decider=None):
+    if _rescue_mode() != "ON":
+        if _rescue_mode() == "ASK_BEFORE_RESCUE":
+            if callable(rescue_decider):
+                try:
+                    allowed = bool(rescue_decider(reason, state.current_provider, "openai"))
+                except Exception:
+                    allowed = False
+                if not allowed:
+                    suppressed = "ASK_BEFORE_RESCUE declined"
+                    log(f"RESCUE SUPPRESSED: {suppressed}")
+                    history.append(f"RESCUE SUPPRESSED: {suppressed}")
+                    return False
+            else:
+                suppressed = "ASK_BEFORE_RESCUE has no dialog handler"
+                log(f"RESCUE SUPPRESSED: {suppressed}")
+                history.append(f"RESCUE SUPPRESSED: {suppressed}")
+                return False
+        else:
+            suppressed = _rescue_suppressed_reason()
+            log(f"RESCUE SUPPRESSED: {suppressed}")
+            history.append(f"RESCUE SUPPRESSED: {suppressed}")
+            return False
+    if _rescue_mode() != "ON" and _rescue_mode() != "ASK_BEFORE_RESCUE":
+        suppressed = _rescue_suppressed_reason()
+        log(f"RESCUE SUPPRESSED: {suppressed}")
+        history.append(f"RESCUE SUPPRESSED: {suppressed}")
+        return False
     if (
         state.current_provider.lower() != "openai"
         and config.OPENAI_RESCUE_ENABLED
         and config.OPENAI_API_KEY.strip()
     ):
         state.current_provider = "openai"
+        state.task_profile = "rescue"
+        state.model_route = "rescue"
+        state.route_reason = str(reason or "")
         state.rescue_handoff_count += 1
         _reset_stuck_state(state)
         state.prompt_compaction_level = max(state.prompt_compaction_level, 1)
@@ -1052,25 +1862,84 @@ def _sanitize_action_path(raw_path, state):
     return fallback
 
 
+def _off_target_action(raw_path, state):
+    raw_text = str(raw_path or "").strip()
+    if not raw_text:
+        raw_text = "<empty>"
+    return {
+        "type": "off_target_patch_action",
+        "args": {
+            "message": (
+                "OFF-TARGET PATCH ACTION REJECTED: "
+                f"{raw_text} does not match active patch target {state.active_patch_target or 'app.py'}"
+            )
+        },
+    }
+
+
+def _normalize_action_path_or_reject(raw_path, state):
+    if state.mode != "patch" or not state.single_file_task:
+        return _sanitize_action_path(raw_path, state), None
+    if not state.active_patch_target:
+        return _sanitize_action_path(raw_path, state), None
+
+    explicit = str(raw_path or "").strip()
+    if not explicit:
+        return state.active_patch_target, None
+
+    resolved = _sanitize_target_token(explicit, state.active_project_root, patch_mode=True)
+    if not resolved:
+        return "", _off_target_action(explicit, state)
+
+    if os.path.normcase(os.path.normpath(resolved)) != os.path.normcase(os.path.normpath(state.active_patch_target)):
+        return "", _off_target_action(explicit, state)
+
+    return state.active_patch_target, None
+
+
 def _normalize_action(action, state):
     action_type = str(action.get("type", "")).strip()
     args = action.get("args") if isinstance(action.get("args"), dict) else {}
 
+    if action_type in PATCH_FILE_ACTIONS:
+        normalized_path, rejection = _normalize_action_path_or_reject(args.get("path"), state)
+        if rejection:
+            return rejection
+    else:
+        normalized_path = ""
+
     if action_type == "write_file":
+        if "content_b64" in state.required_b64_fields:
+            if not args.get("content_b64"):
+                content_text = str(args.get("content", ""))
+                if _looks_like_base64_text(content_text):
+                    return _format_violation_action("ACTION FORMAT VIOLATION: base64 payload was placed in plain content instead of content_b64")
+                if content_text:
+                    return _format_violation_action("ACTION FORMAT VIOLATION: content_b64 required but plain content was returned")
+                return _format_violation_action("ACTION FORMAT VIOLATION: content_b64 required but missing")
         return {
             "type": action_type,
             "args": {
-                "path": _sanitize_action_path(args.get("path"), state),
+                "path": normalized_path,
                 "content": str(args.get("content", "")),
                 "content_b64": args.get("content_b64"),
             },
         }
 
     if action_type == "replace_in_file":
+        if "old_b64" in state.required_b64_fields and not args.get("old_b64") and str(args.get("old", "")):
+            return _format_violation_action("ACTION FORMAT VIOLATION: old_b64 required but plain old was returned")
+        if "new_b64" in state.required_b64_fields and not args.get("new_b64"):
+            new_text = str(args.get("new", ""))
+            if _looks_like_base64_text(new_text):
+                return _format_violation_action("ACTION FORMAT VIOLATION: base64 payload was placed in plain new instead of new_b64")
+            if new_text:
+                return _format_violation_action("ACTION FORMAT VIOLATION: new_b64 required but plain new was returned")
+            return _format_violation_action("ACTION FORMAT VIOLATION: new_b64 required but missing")
         return {
             "type": action_type,
             "args": {
-                "path": _sanitize_action_path(args.get("path"), state),
+                "path": normalized_path,
                 "old": str(args.get("old", "")),
                 "new": str(args.get("new", "")),
                 "old_b64": args.get("old_b64"),
@@ -1082,7 +1951,7 @@ def _normalize_action(action, state):
         return {
             "type": action_type,
             "args": {
-                "path": _sanitize_action_path(args.get("path"), state),
+                "path": normalized_path,
                 "start_line": args.get("start_line"),
                 "end_line": args.get("end_line"),
                 "new_content": str(args.get("new_content", args.get("content", ""))),
@@ -1090,13 +1959,19 @@ def _normalize_action(action, state):
         }
 
     if action_type in {"insert_before", "insert_after"}:
+        if "content_b64" in state.required_b64_fields and not args.get("content_b64") and not args.get("new_content_b64"):
+            content_text = str(args.get("content", args.get("new_content", "")))
+            if _looks_like_base64_text(content_text):
+                return _format_violation_action("ACTION FORMAT VIOLATION: base64 payload was placed in plain content instead of content_b64")
+            if content_text:
+                return _format_violation_action("ACTION FORMAT VIOLATION: content_b64 required but plain content was returned")
         fallback_anchor = args.get("target", "")
         if isinstance(fallback_anchor, int):
             fallback_anchor = ""
         return {
             "type": action_type,
             "args": {
-                "path": _sanitize_action_path(args.get("path"), state),
+                "path": normalized_path,
                 "anchor": str(args.get("anchor", fallback_anchor)),
                 "content": str(args.get("content", args.get("new_content", ""))),
                 "content_b64": args.get("content_b64", args.get("new_content_b64")),
@@ -1105,6 +1980,12 @@ def _normalize_action(action, state):
         }
 
     if action_type == "replace_block":
+        if "content_b64" in state.required_b64_fields and not args.get("content_b64") and not args.get("new_content_b64"):
+            content_text = str(args.get("content", args.get("new_content", "")))
+            if _looks_like_base64_text(content_text):
+                return _format_violation_action("ACTION FORMAT VIOLATION: base64 payload was placed in plain content instead of content_b64")
+            if content_text:
+                return _format_violation_action("ACTION FORMAT VIOLATION: content_b64 required but plain content was returned")
         start_fallback = args.get("start", "")
         end_fallback = args.get("end", "")
         if isinstance(start_fallback, int):
@@ -1114,7 +1995,7 @@ def _normalize_action(action, state):
         return {
             "type": action_type,
             "args": {
-                "path": _sanitize_action_path(args.get("path"), state),
+                "path": normalized_path,
                 "start_anchor": str(args.get("start_anchor", start_fallback)),
                 "end_anchor": str(args.get("end_anchor", end_fallback)),
                 "content": str(args.get("content", args.get("new_content", ""))),
@@ -1128,16 +2009,22 @@ def _normalize_action(action, state):
         return {
             "type": action_type,
             "args": {
-                "path": _sanitize_action_path(args.get("path"), state),
+                "path": normalized_path,
                 "expected_parts": args.get("expected_parts", args.get("parts")),
             },
         }
 
     if action_type == "append_file_chunk":
+        if "content_b64" in state.required_b64_fields and not args.get("content_b64"):
+            content_text = str(args.get("content", args.get("chunk", "")))
+            if _looks_like_base64_text(content_text):
+                return _format_violation_action("ACTION FORMAT VIOLATION: base64 payload was placed in plain content instead of content_b64")
+            if content_text:
+                return _format_violation_action("ACTION FORMAT VIOLATION: content_b64 required but plain content was returned")
         return {
             "type": action_type,
             "args": {
-                "path": _sanitize_action_path(args.get("path"), state),
+                "path": normalized_path,
                 "part": args.get("part", args.get("index")),
                 "content": str(args.get("content", args.get("chunk", ""))),
                 "content_b64": args.get("content_b64"),
@@ -1148,7 +2035,7 @@ def _normalize_action(action, state):
         return {
             "type": action_type,
             "args": {
-                "path": _sanitize_action_path(args.get("path"), state),
+                "path": normalized_path,
             },
         }
 
@@ -1156,7 +2043,7 @@ def _normalize_action(action, state):
         return {
             "type": action_type,
             "args": {
-                "path": _sanitize_action_path(args.get("path"), state),
+                "path": normalized_path,
                 "query": str(args.get("query", "")),
             },
         }
@@ -1184,6 +2071,28 @@ def _execute_action(action, state, project_root_override=None):
     action_type = action.get("type")
     args = action.get("args", {})
     project_root = project_root_override or state.active_project_root
+
+    if action_type == "action_format_violation":
+        from contracts import Observation
+
+        return Observation(
+            False,
+            "ACTION FORMAT VIOLATION",
+            changed=False,
+            details=str(args.get("message", "Action format contract failed.")),
+            tool=action_type,
+        )
+
+    if action_type == "off_target_patch_action":
+        from contracts import Observation
+
+        return Observation(
+            False,
+            "OFF-TARGET PATCH ACTION REJECTED",
+            changed=False,
+            details=str(args.get("message", "Action path does not match active patch target.")),
+            tool=action_type,
+        )
 
     if action_type == "write_file":
         return write_file(
@@ -1336,13 +2245,14 @@ def _completion_decision(state, plan, had_run_cmd, touched_paths, verify_observa
 def _single_file_patch_retry_note(state):
     return (
         f"SINGLE-FILE PATCH FALLBACK for {state.active_patch_target or 'app.py'}: "
+        f"current strategy={_normalize_patch_strategy(getattr(state, 'patch_strategy', 'surgical_patch'))}. "
         "prefer anchored edits (replace_in_file, insert_before/after, replace_block). "
-        "If full rewrite is needed for a large file, use begin_file_rewrite + append_file_chunk + finalize_file_rewrite. "
-        "Use one write_file only for a small full-file rewrite."
+        "If patching keeps failing or file scope is large, escalate to rewrite_existing_file or chunked_rewrite_existing_file. "
+        "For chunked rewrite use begin_file_rewrite + append_file_chunk + finalize_file_rewrite."
     )
 
 
-def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None):
+def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, rescue_decider=None):
     state = _build_state(prompt)
     os.makedirs(state.active_project_root, exist_ok=True)
     ensure_gitignore(state.active_project_root)
@@ -1365,11 +2275,42 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None):
         empty_done_retry_used = False
 
         log(f"MODE: {state.mode}")
+        log(f"MODE CONTROL: {str(getattr(config, 'MODE_CONTROL', 'AUTO') or 'AUTO').strip().upper()}")
+        log(f"RESCUE MODE: {_rescue_mode()}")
         log(f"MODE REASON: {state.mode_reason or 'unknown'}")
         log(f"PATCH_FILES REPR: {repr(config.PATCH_FILES)}")
         log(f"ACTIVE PROJECT ROOT: {state.active_project_root}")
+        if _rescue_mode() == "OFF":
+            log(f"RESCUE SUPPRESSED: {_rescue_suppressed_reason()}")
+        initial_profile, initial_profile_reason = _choose_task_profile(state, prompt, consecutive_parse_errors=0)
+        initial_route, initial_provider, initial_route_reason = _route_for_task_profile(state, initial_profile)
+        state.task_profile = initial_profile
+        state.model_route = initial_route
+        state.route_reason = initial_profile_reason or initial_route_reason
+        state.current_provider = initial_provider
+        log(f"TASK PROFILE: {state.task_profile}")
+        log(f"MODEL ROUTE: {state.model_route} ({state.current_provider})")
         if state.mode == "patch":
             log(f"ACTIVE PATCH TARGET: {state.active_patch_target}")
+            log(f"PATCH PHASE: {state.patch_phase}")
+            log(f"PATCH STRATEGY: {state.patch_strategy}")
+            if state.patch_strategy_reason:
+                log(f"PATCH STRATEGY REASON: {state.patch_strategy_reason}")
+        if state.mode == "create":
+            if state.create_strategy == "chunked_rewrite":
+                _sync_chunk_session_from_rewrite_state(state, log=log, startup=True)
+            log(f"CREATE STRATEGY: {state.create_strategy}")
+            log(f"CREATE STRATEGY REASON: {state.create_strategy_reason or 'n/a'}")
+            log(f"CREATE PHASE: {state.create_phase}")
+            if state.create_strategy == "chunked_rewrite":
+                log(
+                    f"CHUNK SESSION: {'open' if state.chunk_session_open else 'closed'} "
+                    f"target={state.chunk_target_path or 'app.py'} expected_parts={state.chunk_expected_parts or 0}"
+                )
+                log(f"CHUNK SESSION STATUS: received {state.chunk_received_parts or 0}/{state.chunk_expected_parts or 0} parts")
+                next_required = _chunk_next_required_action(state)
+                if next_required:
+                    log(f"CHUNK NEXT REQUIRED ACTION: {next_required}")
 
         for iteration in range(config.MAX_ITERATIONS):
             state.iteration_count = iteration + 1
@@ -1378,8 +2319,89 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None):
                 log("STOP REQUESTED")
                 break
 
+            previous_profile = state.task_profile
+            previous_route = state.model_route
+            profile, profile_reason = _choose_task_profile(state, prompt, consecutive_parse_errors=consecutive_parse_errors)
+            route, provider_for_iter, route_reason = _route_for_task_profile(state, profile)
+            state.task_profile = profile
+            state.model_route = route
+            state.route_reason = profile_reason or route_reason
+            state.current_provider = provider_for_iter
+            log(f"TASK PROFILE: {state.task_profile}")
+            log(f"MODEL ROUTE: {state.model_route} ({state.current_provider})")
+            if state.task_profile == "rescue" and state.model_route != "rescue":
+                log(f"RESCUE SUPPRESSED: {_rescue_suppressed_reason()}")
+            if (previous_profile and previous_profile != state.task_profile) or (previous_route and previous_route != state.model_route):
+                log(f"ROUTE ESCALATION REASON: {state.route_reason or 'profile/route change'}")
+
             if state.mode == "patch":
                 _refresh_patch_context(state)
+                hotspot_bundle = _derive_patch_hotspots(
+                    state.active_patch_target,
+                    state.active_project_root,
+                    prompt,
+                    state,
+                    history=history,
+                )
+                hotspot_summary = hotspot_bundle.get("summary", "(hotspots unavailable)")
+                first_hotspot = ""
+                for line in str(hotspot_summary).splitlines():
+                    line = line.strip()
+                    if line:
+                        first_hotspot = line
+                        break
+                state.patch_hotspot_label = first_hotspot
+                state.patch_exact_snippet = str(hotspot_bundle.get("snippet") or "")
+                hotspots_unavailable = "(hotspots unavailable)" in _normalize_prompt_text(hotspot_summary)
+                if hotspots_unavailable:
+                    state.patch_hotspot_unavailable_streak += 1
+                else:
+                    state.patch_hotspot_unavailable_streak = 0
+                strategy_escalation_reason = _maybe_escalate_patch_strategy(state)
+                log(f"PATCH PHASE: {state.patch_phase}")
+                log(f"PATCH STRATEGY: {state.patch_strategy}")
+                if state.patch_hotspot_label:
+                    log(f"PATCH GROUNDING: exact snippet for {state.patch_hotspot_label}")
+                if _is_small_focused_patch(state):
+                    log("PATCH ACTION BIAS: prefer replace_block")
+                if strategy_escalation_reason:
+                    log(f"PATCH REWRITE ESCALATION REASON: {strategy_escalation_reason}")
+                    history.append(f"PATCH REWRITE ESCALATION REASON: {strategy_escalation_reason}")
+                log("PATCH HOTSPOTS: " + truncate_middle(hotspot_summary, 500))
+                if state.patch_phase == "inspect_target":
+                    history.append("Patch inspection summary:\n" + truncate_middle(hotspot_summary, 1500))
+                    history.append("Patch inspection snippet:\n" + truncate_middle(hotspot_bundle.get("snippet", ""), 1600))
+                    state.patch_phase = "patch_target"
+                    _save_session_state(state)
+                    continue
+            if state.mode == "create":
+                if state.create_strategy == "chunked_rewrite":
+                    _sync_chunk_session_from_rewrite_state(state, log=log, startup=False)
+                if (
+                    state.create_strategy != "chunked_rewrite"
+                    and state.create_full_write_streak >= 1
+                    and state.create_phase in {"verify_or_run", "fix_existing_file"}
+                ):
+                    state.create_strategy = "chunked_rewrite"
+                    state.create_strategy_reason = "repeated full write_file"
+                    state.create_phase = "chunk_begin"
+                    _reset_chunk_session(state)
+                    log("CHUNK ESCALATION REASON: repeated full write_file")
+                log(f"CREATE STRATEGY: {state.create_strategy}")
+                log(f"CREATE PHASE: {state.create_phase}")
+                if state.create_strategy == "chunked_rewrite":
+                    log(
+                        f"CHUNK SESSION: {'open' if state.chunk_session_open else 'closed'} "
+                        f"target={state.chunk_target_path or 'app.py'} expected_parts={state.chunk_expected_parts or 0}"
+                    )
+                    log(f"CHUNK SESSION STATUS: received {state.chunk_received_parts or 0}/{state.chunk_expected_parts or 0} parts")
+                    if state.chunk_missing_parts:
+                        preview = ",".join(str(i) for i in state.chunk_missing_parts[:12])
+                        suffix = "..." if len(state.chunk_missing_parts) > 12 else ""
+                        log(f"CHUNK MISSING PARTS: {preview}{suffix}")
+                    next_required = _chunk_next_required_action(state)
+                    if next_required:
+                        log(f"CHUNK NEXT REQUIRED ACTION: {next_required}")
 
             log(f"\nITER {iteration}")
             prompt_payload = build_prompt(prompt, history, state)
@@ -1405,7 +2427,7 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None):
                     log("CONTEXT PRESSURE DETECTED -> COMPACTING PROMPT")
                     _save_session_state(state)
                     continue
-                if _hard_rescue_handoff(state, history, log, reason=message):
+                if _hard_rescue_handoff(state, history, log, reason=message, rescue_decider=rescue_decider):
                     _save_session_state(state)
                     continue
                 break
@@ -1430,7 +2452,9 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None):
                         log("PATCH PARSE FALLBACK -> REQUEST ANCHORED OR CHUNKED RETRY")
                         history.append(fallback_note)
                 consecutive_parse_errors += 1
-                if consecutive_parse_errors >= config.MAX_PARSE_ERRORS and _hard_rescue_handoff(state, history, log, reason=message):
+                if consecutive_parse_errors >= config.MAX_PARSE_ERRORS and _hard_rescue_handoff(
+                    state, history, log, reason=message, rescue_decider=rescue_decider
+                ):
                     consecutive_parse_errors = 0
                     _save_session_state(state)
                     continue
@@ -1440,8 +2464,35 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None):
                 continue
 
             actions = [_normalize_action(action, state) for action in data.get("actions", [])]
+            guarded_actions = []
+            for action in actions:
+                risky, reason = _replace_in_file_looks_ungrounded(action, state)
+                if risky:
+                    log(reason)
+                    history.append(reason)
+                    guarded_actions.append(
+                        _format_violation_action(
+                            reason + ". PATCH MISS RECOVERY: switching to anchor-based edit."
+                        )
+                    )
+                else:
+                    guarded_actions.append(action)
+            actions = guarded_actions
             plan = str(data.get("plan", ""))
             plan_fingerprint = _fingerprint_plan(plan, actions)
+            requested_large_writes = sum(1 for action in actions if _is_large_write_action(action))
+            chunk_ops_requested = sum(
+                1 for action in actions if action.get("type") in {"begin_file_rewrite", "append_file_chunk", "finalize_file_rewrite"}
+            )
+            replace_block_requested = sum(1 for action in actions if action.get("type") == "replace_block")
+            patch_broad_attempt = (
+                state.mode == "patch"
+                and (
+                    replace_block_requested > 0
+                    or any(action.get("type") == "patch_lines" for action in actions)
+                    or requested_large_writes > 0
+                )
+            )
 
             if plan_fingerprint == state.last_plan_fingerprint:
                 state.stuck_iterations += 1
@@ -1451,7 +2502,7 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None):
 
             if state.stuck_iterations >= config.STALL_TRIGGER:
                 history.append("Repeated same plan without progress. Refresh from current files only.")
-                if _hard_rescue_handoff(state, history, log, reason="repeated same plan"):
+                if _hard_rescue_handoff(state, history, log, reason="repeated same plan", rescue_decider=rescue_decider):
                     continue
                 _reset_stuck_state(state)
                 if state.mode == "patch":
@@ -1480,6 +2531,10 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None):
             touched_paths = []
             iteration_progress = False
             iteration_error = ""
+            critical_generation_failed = False
+            patch_anchor_failure = False
+            meaningful_materialization = False
+            chunk_protocol_violation_seen = False
             stage_context = _build_atomic_patch_stage(actions, state)
 
             try:
@@ -1487,6 +2542,68 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None):
                     if stop_checker and stop_checker():
                         log("STOP REQUESTED")
                         return log_path
+
+                    if (
+                        state.mode == "create"
+                        and state.create_strategy == "chunked_rewrite"
+                        and action.get("type") == "write_file"
+                        and _is_large_write_action(action)
+                    ):
+                        action = _format_violation_action(
+                            "CREATE STRATEGY VIOLATION: chunked_rewrite active; use begin_file_rewrite/append_file_chunk/finalize_file_rewrite"
+                        )
+
+                    if state.mode == "create" and state.create_strategy == "chunked_rewrite":
+                        action_type = action.get("type")
+                        action_path = normalize_rel_path(action.get("args", {}).get("path", "") or state.chunk_target_path or "app.py")
+                        if not state.chunk_target_path:
+                            state.chunk_target_path = action_path
+                        if state.create_phase == "chunk_begin" and action_type != "begin_file_rewrite":
+                            action = _format_violation_action(
+                                "CHUNK PROTOCOL VIOLATION: chunk_begin phase requires begin_file_rewrite."
+                            )
+                        elif state.create_phase == "chunk_append" and state.chunk_finalize_pending and action_type != "finalize_file_rewrite":
+                            action = _format_violation_action(
+                                "CHUNK PROTOCOL VIOLATION: all parts received; finalize_file_rewrite required."
+                            )
+                        elif state.create_phase == "chunk_append" and action_type not in {"append_file_chunk", "finalize_file_rewrite"}:
+                            action = _format_violation_action(
+                                "CHUNK PROTOCOL VIOLATION: chunk_append phase expects append_file_chunk (or finalize_file_rewrite when complete)."
+                            )
+                        elif state.create_phase == "chunk_append" and action_type == "finalize_file_rewrite" and not state.chunk_finalize_pending:
+                            action = _format_violation_action(
+                                "CHUNK PROTOCOL VIOLATION: finalize_file_rewrite is too early; append missing parts first."
+                            )
+                        elif state.create_phase == "chunk_finalize" and action_type != "finalize_file_rewrite":
+                            action = _format_violation_action(
+                                "CHUNK PROTOCOL VIOLATION: chunk_finalize phase requires finalize_file_rewrite."
+                            )
+                        if action_type in {"begin_file_rewrite", "append_file_chunk", "finalize_file_rewrite"}:
+                            if state.chunk_target_path and os.path.normcase(os.path.normpath(action_path)) != os.path.normcase(os.path.normpath(state.chunk_target_path)):
+                                action = _format_violation_action(
+                                    f"CHUNK PROTOCOL VIOLATION: target drift ({action_path}) != active chunk target ({state.chunk_target_path})"
+                                )
+                            elif action_type == "begin_file_rewrite" and state.chunk_session_open:
+                                action = _format_violation_action(
+                                    "CHUNK PROTOCOL VIOLATION: repeated begin_file_rewrite for open session. Continue with append_file_chunk/finalize_file_rewrite."
+                                )
+                            elif state.create_phase == "chunk_append" and action_type == "begin_file_rewrite":
+                                action = _format_violation_action(
+                                    "CHUNK PROTOCOL VIOLATION: phase chunk_append requires append_file_chunk or finalize_file_rewrite."
+                                )
+                            elif state.create_phase == "chunk_finalize" and action_type in {"begin_file_rewrite", "append_file_chunk"}:
+                                action = _format_violation_action(
+                                    "CHUNK PROTOCOL VIOLATION: phase chunk_finalize requires finalize_file_rewrite."
+                                )
+
+                    if (
+                        state.mode == "patch"
+                        and state.patch_strategy == "chunked_rewrite_existing_file"
+                        and action.get("type") in {"write_file", "replace_in_file", "insert_before", "insert_after", "replace_block", "patch_lines"}
+                    ):
+                        action = _format_violation_action(
+                            "PATCH STRATEGY VIOLATION: chunked_rewrite_existing_file active; use begin_file_rewrite/append_file_chunk/finalize_file_rewrite on active_patch_target"
+                        )
 
                     action_key = json.dumps(action, ensure_ascii=False, sort_keys=True)
                     repeated_count = state.duplicate_action_cache.get(action_key, 0)
@@ -1523,6 +2640,19 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None):
 
                     history.append(_format_history_observation(observation.summary, observation.details))
 
+                    if (
+                        state.mode == "create"
+                        and state.create_strategy == "chunked_rewrite"
+                        and observation.tool == "action_format_violation"
+                        and "CHUNK PROTOCOL VIOLATION" in str(observation.details or "")
+                    ):
+                        chunk_protocol_violation_seen = True
+                        history.append(
+                            "CHUNK PROTOCOL GUIDANCE STRENGTHENED: previous response violated phase contract. "
+                            "Continue with CHUNK NEXT REQUIRED ACTION only."
+                        )
+                        log("CHUNK PROTOCOL GUIDANCE STRENGTHENED")
+
                     progress_signal = observation.changed and (
                         observation.tool in PROGRESS_TOOLS
                         or bool((observation.metadata or {}).get("progress"))
@@ -1534,10 +2664,69 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None):
                     else:
                         state.duplicate_action_cache[action_key] = repeated_count + 1
 
+                    if observation.ok and (
+                        bool((observation.metadata or {}).get("touches_file"))
+                        or (observation.changed and observation.tool in PROGRESS_TOOLS)
+                    ):
+                        meaningful_materialization = True
+
                     if observation.tool == "run_cmd":
                         had_run_cmd = True
                         if not observation.ok:
                             iteration_error = observation.details or observation.summary
+                        else:
+                            meaningful_materialization = True
+
+                    if state.mode == "create" and state.create_strategy == "chunked_rewrite":
+                        if observation.tool == "begin_file_rewrite" and observation.ok:
+                            expected_raw = action.get("args", {}).get("expected_parts")
+                            try:
+                                expected_val = int(expected_raw)
+                            except Exception:
+                                expected_val = 0
+                            state.chunk_session_open = True
+                            state.chunk_target_path = normalize_rel_path(action.get("args", {}).get("path", "") or state.chunk_target_path or "app.py")
+                            state.chunk_expected_parts = max(0, expected_val)
+                            state.chunk_received_parts = 0
+                            state.chunk_missing_parts = list(range(1, state.chunk_expected_parts + 1))
+                            state.chunk_finalize_pending = False
+                            state.create_phase = "chunk_append"
+                            state.chunk_protocol_violation_streak = 0
+                            log(f"CHUNK PHASE: {state.create_phase}")
+                        elif observation.tool == "append_file_chunk" and observation.ok:
+                            summary_text = str(observation.summary or "")
+                            match = CHUNK_STATUS_RE.search(summary_text)
+                            if match:
+                                try:
+                                    expected_val = int(match.group(2))
+                                    received_val = int(match.group(3))
+                                except Exception:
+                                    expected_val = state.chunk_expected_parts
+                                    received_val = state.chunk_received_parts
+                                state.chunk_session_open = True
+                                state.chunk_expected_parts = max(state.chunk_expected_parts, expected_val)
+                                state.chunk_received_parts = max(state.chunk_received_parts, received_val)
+                            rewrite_data = _load_rewrite_state_for(state.chunk_target_path, state.active_project_root)
+                            if isinstance(rewrite_data, dict):
+                                missing_parts = _compute_missing_parts(state.chunk_expected_parts, rewrite_data.get("parts"))
+                                state.chunk_missing_parts = missing_parts
+                            state.create_phase = "chunk_finalize" if (
+                                state.chunk_expected_parts > 0 and state.chunk_received_parts >= state.chunk_expected_parts
+                            ) else "chunk_append"
+                            state.chunk_finalize_pending = state.create_phase == "chunk_finalize"
+                            state.chunk_protocol_violation_streak = 0
+                            log(f"CHUNK SESSION STATUS: received {state.chunk_received_parts}/{state.chunk_expected_parts} parts")
+                            log(f"CHUNK PHASE: {state.create_phase}")
+                        elif observation.tool == "finalize_file_rewrite" and observation.ok:
+                            state.chunk_session_open = False
+                            state.chunk_finalize_pending = False
+                            state.chunk_received_parts = 0
+                            state.chunk_expected_parts = 0
+                            state.chunk_missing_parts = []
+                            state.create_phase = "verify_or_run"
+                            state.chunk_protocol_violation_streak = 0
+                            meaningful_materialization = True
+                            log("CHUNK PHASE: verify_or_run")
 
                     metadata = observation.metadata or {}
                     touches_file = False
@@ -1563,14 +2752,31 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None):
                             )
                             history.append("Fresh file snapshot after failed patch:\n" + truncate_middle(fresh, 1200))
                             details_lower = (observation.details or "").lower()
+                            if observation.tool == "replace_in_file" and ("not found" in details_lower or "miss" in _normalize_prompt_text(observation.summary)):
+                                state.patch_replace_miss_streak += 1
+                                if state.patch_replace_miss_streak >= 2:
+                                    state.patch_phase = "inspect_target"
+                                    state.patch_exact_snippet = fresh
+                                    log("PATCH MISS RECOVERY: switching to anchor-based edit")
+                                    history.append(
+                                        "PATCH MISS RECOVERY: repeated replace_in_file miss. "
+                                        "Use replace_block/insert_before/insert_after with real anchors from fresh snippet."
+                                    )
                             if "anchor not found" in details_lower or "missing anchor" in details_lower:
+                                patch_anchor_failure = True
                                 grounded = _grounded_patch_retry_context(target_path, state.active_project_root, prompt)
+                                state.patch_phase = "inspect_target"
+                                log("PATCH GROUNDING REFRESH: missing anchor")
                                 log("GROUNDING RETRY WITH REAL OUTLINE/ANCHORS")
                                 history.append("Grounded retry context after missing anchor:\n" + truncate_middle(grounded, 2200))
 
                     if not observation.ok and not iteration_error:
                         iteration_error = observation.details or observation.summary
-                    if observation.tool == "off_target_patch_action":
+                    if observation.tool in {"write_file", "begin_file_rewrite", "append_file_chunk", "finalize_file_rewrite"} and not observation.ok:
+                        critical_generation_failed = True
+                    if observation.tool in {"off_target_patch_action", "action_format_violation"}:
+                        break
+                    if critical_generation_failed:
                         break
 
                     _save_session_state(state)
@@ -1593,7 +2799,7 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None):
                 msg = "NO EXECUTED ACTIONS"
                 log(msg)
                 history.append(msg)
-                if _hard_rescue_handoff(state, history, log, reason=msg):
+                if _hard_rescue_handoff(state, history, log, reason=msg, rescue_decider=rescue_decider):
                     _save_session_state(state)
                     continue
                 break
@@ -1611,16 +2817,106 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None):
                 history.append(_format_history_observation(verify_observation.summary, verify_observation.details))
                 if not verify_observation.ok:
                     iteration_error = verify_observation.details or verify_observation.summary
+                elif state.mode == "patch":
+                    state.patch_phase = "verify_patch"
 
             if iteration_error:
                 state.last_runtime_error = iteration_error
+                if state.mode == "create" and (state.last_written_files or state.created_files):
+                    state.create_phase = "fix_existing_file"
+                if state.mode == "create" and state.create_strategy == "chunked_rewrite":
+                    err_lower = _normalize_prompt_text(iteration_error)
+                    if "missing rewrite state" in err_lower or "corrupted rewrite state" in err_lower:
+                        reason = "stale or missing rewrite state during chunk protocol"
+                        log("CHUNK SESSION RESET: stale state after restart")
+                        log(f"CHUNK SESSION RESET REASON: {reason}")
+                        _reset_chunk_session(state, reason=reason, clear_rewrite_state=True)
+                        state.create_phase = "chunk_begin"
+                        log("CHUNK PHASE: chunk_begin")
+                    elif chunk_protocol_violation_seen and state.chunk_session_open and state.chunk_expected_parts > 0 and state.chunk_received_parts == 0:
+                        state.chunk_protocol_violation_streak += 1
+                        if state.chunk_protocol_violation_streak >= 2:
+                            reason = (
+                                "repeated protocol violations with no chunk progress "
+                                f"(0/{state.chunk_expected_parts})"
+                            )
+                            log("CHUNK LOOP BREAKER: repeated protocol violations with no chunk progress")
+                            if state.model_route in {"local/default", "standard"}:
+                                state.stuck_iterations = max(state.stuck_iterations, 2)
+                                log("CHUNK ROUTE ESCALATION REASON: repeated chunk protocol failure")
+                            log(f"CHUNK SESSION RESET REASON: {reason}")
+                            _reset_chunk_session(state, reason=reason, clear_rewrite_state=True)
+                            state.create_phase = "chunk_begin"
+                            log("CHUNK PHASE: chunk_begin")
+                if state.mode == "patch":
+                    state.patch_failure_streak += 1
+                    if patch_anchor_failure:
+                        state.patch_anchor_failure_streak += 1
+                    if patch_broad_attempt:
+                        state.patch_broad_patch_streak += 1
+                    if _is_syntax_like_failure(iteration_error):
+                        state.patch_syntax_failure_streak += 1
+                    if (
+                        verify_observation
+                        and not verify_observation.ok
+                        and (
+                            _is_syntax_like_failure(verify_observation.details or "")
+                            or _is_syntax_like_failure(verify_observation.summary or "")
+                        )
+                    ):
+                        state.patch_verify_failure_streak += 1
+                    state.patch_phase = "inspect_target"
+                    strategy_escalation_reason = _maybe_escalate_patch_strategy(state)
+                    if strategy_escalation_reason:
+                        log(f"PATCH REWRITE ESCALATION REASON: {strategy_escalation_reason}")
                 log("ITERATION FAILED -> CONTINUE")
                 _save_session_state(state)
                 continue
 
             state.last_runtime_error = ""
 
-            if iteration_progress and config.AUTO_GIT_CHECKPOINTS:
+            if state.mode == "create":
+                if had_run_cmd and verify_observation.ok:
+                    state.create_phase = "complete"
+                elif touched_paths and verify_observation.ok:
+                    if state.create_phase == "initial_create":
+                        state.create_phase = "verify_or_run"
+
+                if requested_large_writes > 0 and not had_run_cmd:
+                    state.create_full_write_streak += 1
+                else:
+                    state.create_full_write_streak = 0
+
+                should_escalate = False
+                escalation_reason = ""
+                if state.create_strategy != "chunked_rewrite":
+                    if state.create_full_write_streak >= 2:
+                        should_escalate = True
+                        escalation_reason = "repeated full write_file"
+                    elif state.stuck_iterations >= 1 and requested_large_writes > 0:
+                        should_escalate = True
+                        escalation_reason = "no execution progress with large rewrite"
+                if should_escalate:
+                    state.create_strategy = "chunked_rewrite"
+                    state.create_strategy_reason = escalation_reason
+                    state.create_phase = "chunk_begin"
+                    _reset_chunk_session(state)
+                    log(f"CHUNK ESCALATION REASON: {escalation_reason}")
+                elif state.create_strategy == "chunked_rewrite" and chunk_ops_requested == 0 and requested_large_writes == 0 and had_run_cmd:
+                    state.create_strategy = "write_file"
+                    state.create_strategy_reason = "execution reached; normal flow"
+                    _reset_chunk_session(state, reason="chunk flow complete")
+
+            if state.mode == "patch":
+                state.patch_failure_streak = 0
+                state.patch_verify_failure_streak = 0
+                state.patch_syntax_failure_streak = 0
+                state.patch_anchor_failure_streak = 0
+                state.patch_replace_miss_streak = 0
+                if not patch_broad_attempt:
+                    state.patch_broad_patch_streak = 0
+
+            if meaningful_materialization and config.AUTO_GIT_CHECKPOINTS:
                 ok, msg = git_checkpoint(
                     state.active_project_root,
                     f"checkpoint iter {iteration + 1}: {state.mode}",
@@ -1637,6 +2933,8 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None):
                 verify_observation=verify_observation,
             )
             if should_stop:
+                if state.mode == "patch":
+                    state.patch_phase = "complete"
                 log(stop_reason)
                 _save_session_state(state)
                 break

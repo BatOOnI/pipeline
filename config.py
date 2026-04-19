@@ -1,4 +1,5 @@
 PROVIDER = "lmstudio"  # "lmstudio" or "openai"
+MODE_CONTROL = "AUTO"  # AUTO | FORCE_CREATE | FORCE_PATCH
 
 # LM Studio
 LMSTUDIO_URL = "http://127.0.0.1:1235/v1/chat/completions"
@@ -9,6 +10,7 @@ LMSTUDIO_TIMEOUT = 120
 OPENAI_API_KEY = ""
 OPENAI_MODEL = "gpt-5.4-nano"
 OPENAI_RESCUE_ENABLED = True
+RESCUE_MODE = "OFF"  # OFF | ON | ASK_BEFORE_RESCUE
 
 # Runtime
 MAX_ITERATIONS = 10

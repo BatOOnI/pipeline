@@ -8,12 +8,12 @@ pygame.init()
 # Stałe
 SCREEN_WIDTH = 800
 SCREEN_HEIGHT = 600
-PLAYER_SIZE = 30
-ENEMY_SIZE = 20
+PLAYER_SIZE = 20
+ENEMY_SIZE = 15
 BULLET_SIZE = 5
 PLAYER_SPEED = 5
 BULLET_SPEED = 10
-ENEMY_SPAWN_DISTANCE = 100
+ENEMY_SPAWN_RATE = 60  # co ile klatek spawnuje sie wrog
 
 # Kolory
 WHITE = (255, 255, 255)
@@ -52,15 +52,15 @@ class Enemy:
         self.x = x
         self.y = y
         self.size = ENEMY_SIZE
-        self.speed = random.uniform(1.0, 3.0)
+        self.speed = random.uniform(0.5, 2.0)
         
     def move_towards_player(self, player_x, player_y):
-        # Oblicz kierunek do gracza
+        # Oblicz wektor kierunku do gracza
         dx = player_x - self.x
         dy = player_y - self.y
         distance = max(1, math.sqrt(dx*dx + dy*dy))
         
-        # Normalizacja wektora i przesunięcie
+        # Normalizuj wektor i przesuń wroga
         dx /= distance
         dy /= distance
         
@@ -77,13 +77,14 @@ class Bullet:
         self.y = y
         self.size = BULLET_SIZE
         
-        # Oblicz kierunek
+        # Oblicz wektor kierunku do celu
         dx = target_x - x
         dy = target_y - y
         distance = max(1, math.sqrt(dx*dx + dy*dy))
         
-        self.dx = (dx / distance) * BULLET_SPEED
-        self.dy = (dy / distance) * BULLET_SPEED
+        # Normalizuj wektor i ustaw prędkość
+        self.dx = dx / distance * BULLET_SPEED
+        self.dy = dy / distance * BULLET_SPEED
         
     def update(self):
         self.x += self.dx
@@ -95,19 +96,16 @@ class Bullet:
 # Inicjalizacja gracza
 player = Player(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
 
-# Lista wrogów i pocisków
+# Listy obiektów
 enemies = []
 bullets = []
 
-# Zegar spawnowania wrogów
-enemy_spawn_timer = 0
-enemy_spawn_delay = 1000  # ms
+# Zmienna do śledzenia spawnowania wrogów
+spawn_timer = 0
 
 # Główna pętla gry
 running = True
 while running:
-    current_time = pygame.time.get_ticks()
-    
     # Obsługa zdarzeń
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
@@ -120,46 +118,47 @@ while running:
     # Obsługa klawiszy
     keys = pygame.key.get_pressed()
     dx, dy = 0, 0
-    if keys[pygame.K_w] or keys[pygame.K_UP]:
+    if keys[pygame.K_w]:
         dy -= 1
-    if keys[pygame.K_s] or keys[pygame.K_DOWN]:
+    if keys[pygame.K_s]:
         dy += 1
-    if keys[pygame.K_a] or keys[pygame.K_LEFT]:
+    if keys[pygame.K_a]:
         dx -= 1
-    if keys[pygame.K_d] or keys[pygame.K_RIGHT]:
+    if keys[pygame.K_d]:
         dx += 1
     
-    # Ruch gracza
     player.move(dx, dy)
     
     # Spawnowanie wrogów
-    if current_time - enemy_spawn_timer > enemy_spawn_delay:
-        # Wybierz losową stronę ekranu
+    spawn_timer += 1
+    if spawn_timer >= ENEMY_SPAWN_RATE:
+        spawn_timer = 0
+        
+        # Wybierz stronę, z której się pojawi wrog
         side = random.choice(['top', 'bottom', 'left', 'right'])
         
         if side == 'top':
-            x = random.randint(-ENEMY_SIZE, SCREEN_WIDTH)
-            y = -ENEMY_SIZE - ENEMY_SPAWN_DISTANCE
+            x = random.randint(-ENEMY_SIZE*2, SCREEN_WIDTH + ENEMY_SIZE*2)
+            y = -ENEMY_SIZE
         elif side == 'bottom':
-            x = random.randint(-ENEMY_SIZE, SCREEN_WIDTH)
-            y = SCREEN_HEIGHT + ENEMY_SIZE + ENEMY_SPAWN_DISTANCE
+            x = random.randint(-ENEMY_SIZE*2, SCREEN_WIDTH + ENEMY_SIZE*2)
+            y = SCREEN_HEIGHT
         elif side == 'left':
-            x = -ENEMY_SIZE - ENEMY_SPAWN_DISTANCE
-            y = random.randint(-ENEMY_SIZE, SCREEN_HEIGHT)
+            x = -ENEMY_SIZE
+            y = random.randint(-ENEMY_SIZE*2, SCREEN_HEIGHT + ENEMY_SIZE*2)
         else:  # right
-            x = SCREEN_WIDTH + ENEMY_SIZE + ENEMY_SPAWN_DISTANCE
-            y = random.randint(-ENEMY_SIZE, SCREEN_HEIGHT)
+            x = SCREEN_WIDTH
+            y = random.randint(-ENEMY_SIZE*2, SCREEN_HEIGHT + ENEMY_SIZE*2)
             
         enemies.append(Enemy(x, y))
-        enemy_spawn_timer = current_time
     
     # Aktualizacja wrogów
     for enemy in enemies[:]:
         enemy.move_towards_player(player.x + PLAYER_SIZE//2, player.y + PLAYER_SIZE//2)
         
         # Usuń wroga jeśli wyjdzie poza ekran
-        if (enemy.x < -ENEMY_SIZE or enemy.x > SCREEN_WIDTH or
-            enemy.y < -ENEMY_SIZE or enemy.y > SCREEN_HEIGHT):
+        if (enemy.x < -ENEMY_SIZE*3 or enemy.x > SCREEN_WIDTH + ENEMY_SIZE*3 or
+            enemy.y < -ENEMY_SIZE*3 or enemy.y > SCREEN_HEIGHT + ENEMY_SIZE*3):
             enemies.remove(enemy)
     
     # Aktualizacja pocisków
@@ -171,11 +170,11 @@ while running:
             bullet.y < 0 or bullet.y > SCREEN_HEIGHT):
             bullets.remove(bullet)
     
-    # Sprawdzenie kolizji pocisków z wrogami
+    # Kolizje pocisków z wrogami
     for bullet in bullets[:]:
         for enemy in enemies[:]:
             distance = math.sqrt((bullet.x - (enemy.x + ENEMY_SIZE//2))**2 + 
-                                (bullet.y - (enemy.y + ENEMY_SIZE//2))**2)
+                               (bullet.y - (enemy.y + ENEMY_SIZE//2))**2)
             if distance < (BULLET_SIZE + ENEMY_SIZE//2):
                 if bullet in bullets:
                     bullets.remove(bullet)
@@ -186,14 +185,11 @@ while running:
     # Rysowanie
     screen.fill(WHITE)
     
-    # Rysowanie gracza
     player.draw(screen)
     
-    # Rysowanie wrogów
     for enemy in enemies:
         enemy.draw(screen)
     
-    # Rysowanie pocisków
     for bullet in bullets:
         bullet.draw(screen)
     

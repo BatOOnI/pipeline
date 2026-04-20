@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Template Page</title>
+</head>
+<body>
+    <header>
+        <h1>Website Header</h1>
+        <nav>
+            <ul>
+                <li><a href="#">Home</a></li>
+                <li><a href="#">About</a></li>
+                <li><a href="#">Contact</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <section>
+            <h1>Introduction to Our Services</h1>
+            <p>This is a detailed description of our services. We provide high-quality solutions tailored to your needs. Our team has years of experience in delivering exceptional results.</p>
+            <img src="image1.jpg" alt="Service Image">
+            <p>We focus on innovation and excellence in every project we undertake. Our approach ensures that clients receive value-driven outcomes.</p>
+        </section>
+
+        <section>
+            <h2>Our Core Values</h2>
+            <p>Integrity, collaboration, and customer satisfaction are at the heart of our operations. These values guide us in all aspects of our work.</p>
+            <img src="image2.jpg" alt="Core Values Image">
+            <p>We believe that strong partnerships lead to sustainable success. Our commitment to transparency fosters trust with our clients.</p>
+        </section>
+
+        <section>
+            <h2>Why Choose Us</h2>
+            <p>Choosing us means choosing reliability, expertise, and a personalized service experience. We go beyond expectations to deliver outstanding results.</p>
+            <img src="image3.jpg" alt="Why Choose Us Image">
+            <p>Our track record speaks for itself. We have successfully completed numerous projects across various industries.</p>
+        </section>
+    </main>
+
+    <footer>
+        <p>&copy; 2025 Company Name. All rights reserved.</p>
+    </footer>
+</body>
+</html>

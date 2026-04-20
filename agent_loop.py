@@ -31,7 +31,7 @@ from executor import (
 from git_tools import git_checkpoint, git_init, git_is_repo
 from parser import parse_response
 from providers import call_model
-from utils import ensure_gitignore, is_subpath, read_json_file, truncate_middle, write_json_file
+from utils import coerce_int, ensure_gitignore, is_subpath, read_json_file, truncate_middle, write_json_file
 
 
 PATCH_KEYWORDS = (
@@ -235,6 +235,10 @@ class PipelineState:
     large_read_cache: dict = field(default_factory=dict)
     transform_last_verify_ok: bool = False
     transform_source_hash: str = ""
+    transform_source_read_seen: bool = False
+    transform_no_material_progress_streak: int = 0
+    transform_phase: str = "transform_analyze"
+    transform_analysis_complete: bool = False
 
 
 def normalize_rel_path(rel_path: str) -> str:
@@ -921,6 +925,8 @@ def _build_transform_file_policy(state, user_prompt):
     state.derived_allowed_files = []
     state.transform_primary_source = ""
     state.transform_source_hash = ""
+    state.transform_phase = "transform_analyze"
+    state.transform_analysis_complete = False
     if state.task_shape not in TRANSFORM_TASK_SHAPES:
         state.large_file_mode = "disabled"
         return
@@ -1133,6 +1139,121 @@ def _verify_transform_outputs(state):
     )
 
 
+def _is_transform_plain_source_read(action, state):
+    if state.task_shape != "transform_copy_task":
+        return False
+    if str(action.get("type") or "").strip() != "read_file":
+        return False
+    source = normalize_rel_path(state.transform_primary_source or "")
+    if not source:
+        return False
+    args = action.get("args", {}) if isinstance(action.get("args"), dict) else {}
+    path = normalize_rel_path(args.get("path", ""))
+    if path != source:
+        return False
+    targeted = bool(
+        args.get("section_id")
+        or args.get("line_start")
+        or args.get("line_end")
+        or args.get("around_anchor")
+        or args.get("query")
+    )
+    return not targeted
+
+
+SHORTCODE_TEXT_BLOCK_RE = re.compile(r"\[fusion_text[^\]]*\](.*?)\[/fusion_text\]", re.IGNORECASE | re.DOTALL)
+SHORTCODE_IMAGE_VALUE_RE = re.compile(
+    r'((?:image|images|src|url|href)\s*=\s*")(.*?)(")',
+    re.IGNORECASE | re.DOTALL,
+)
+SHORTCODE_MARKERS = ("[fusion_text", "[fusion_imageframe", "[fusion_images", "[fusion_content_box", "[fusion_checklist")
+
+
+def _looks_like_shortcode_content(text):
+    lower = _normalize_prompt_text(text or "")
+    return any(marker in lower for marker in SHORTCODE_MARKERS)
+
+
+def _deterministic_transform_copy(state):
+    source_rel = normalize_rel_path(state.transform_primary_source or "")
+    outputs = _required_transform_outputs(state)
+    if not source_rel:
+        return False, [], "missing transform source"
+    if not outputs:
+        return False, [], "missing derived outputs"
+
+    source_abs = os.path.abspath(os.path.join(state.active_project_root, source_rel))
+    try:
+        with open(source_abs, "r", encoding="utf-8") as handle:
+            source_text = handle.read()
+    except Exception as exc:
+        return False, [], f"source read failed: {exc}"
+
+    if not _looks_like_shortcode_content(source_text):
+        return False, [], "builtin deterministic transform expects shortcode content"
+
+    records = []
+    text_counter = 0
+    picture_counter = 0
+
+    def _replace_text_block(match):
+        nonlocal text_counter
+        original = match.group(1) or ""
+        stripped = original.strip()
+        if not stripped:
+            return match.group(0)
+        text_counter += 1
+        placeholder = f"PLACEHOLDER_TEXT_{text_counter}"
+        records.append(f"{placeholder}|fusion_text|{truncate_middle(stripped.replace(chr(10), ' '), 240)}")
+        return match.group(0).replace(original, placeholder)
+
+    transformed = SHORTCODE_TEXT_BLOCK_RE.sub(_replace_text_block, source_text)
+
+    def _replace_image_attr(match):
+        nonlocal picture_counter
+        value = (match.group(2) or "").strip()
+        if not value:
+            return match.group(0)
+        if "placeholder_picture_" in _normalize_prompt_text(value):
+            return match.group(0)
+        picture_counter += 1
+        placeholder = f"PLACEHOLDER_PICTURE_{picture_counter}"
+        records.append(f"{placeholder}|image_attr|{truncate_middle(value, 240)}")
+        return f'{match.group(1)}{placeholder}{match.group(3)}'
+
+    transformed = SHORTCODE_IMAGE_VALUE_RE.sub(_replace_image_attr, transformed)
+
+    if text_counter == 0 and picture_counter == 0:
+        return False, [], "no user-facing blocks detected for deterministic transform"
+
+    data_lines = [
+        f"source={source_rel}",
+        f"text_placeholders={text_counter}",
+        f"picture_placeholders={picture_counter}",
+        "",
+    ]
+    data_lines.extend(records)
+    data_text = "\n".join(data_lines).strip() + "\n"
+
+    written = []
+    for rel in outputs:
+        if rel == source_rel:
+            return False, written, "derived output points to source file"
+        content = transformed if rel.lower().endswith("szablon2.txt") else data_text
+        observation = write_file(
+            rel,
+            content,
+            project_root=state.active_project_root,
+            patch_mode=False,
+            allow_create=True,
+        )
+        if not observation.ok:
+            return False, written, observation.details or observation.summary
+        written.append(rel)
+
+    return True, written, ""
+
+
 def _file_signature(project_root, rel_path):
     try:
         abs_path = os.path.abspath(os.path.join(project_root, normalize_rel_path(rel_path)))
@@ -1297,6 +1418,14 @@ def _attempt_local_fallback(state, history, log, reason):
         return True
     if step == 2:
         state.local_fallback_step = 3
+        if not getattr(config, "ALLOW_LOCAL_MODEL_SWITCH", False):
+            if _rescue_mode() == "OFF" and str(state.current_provider or "").lower() == "lmstudio":
+                message = "model switch blocked: rescue disabled, staying on selected local model"
+            else:
+                message = "model switch blocked: no_allowed_model_switch"
+            history.append(f"LOCAL FALLBACK STEP BLOCKED: {message}")
+            log(message)
+            return False
         if state.current_provider.lower() == "lmstudio" and _rotate_local_model(state, log=log):
             history.append(f"LOCAL FALLBACK STEP: switched local model after: {reason}")
             return True
@@ -1462,6 +1591,10 @@ def _soft_reset_runtime_state(state):
     state.no_progress_streak = 0
     state.large_read_cache = {}
     state.transform_last_verify_ok = False
+    state.transform_source_read_seen = False
+    state.transform_no_material_progress_streak = 0
+    state.transform_phase = "transform_analyze"
+    state.transform_analysis_complete = False
 
 
 def _hydrate_state_from_session(state, session_data):
@@ -1519,6 +1652,10 @@ def _hydrate_state_from_session(state, session_data):
     state.large_read_cache = dict(cached_large_reads) if isinstance(cached_large_reads, dict) else {}
     state.transform_last_verify_ok = bool(session_data.get("transform_last_verify_ok") or False)
     state.transform_source_hash = str(session_data.get("transform_source_hash") or state.transform_source_hash)
+    state.transform_source_read_seen = bool(session_data.get("transform_source_read_seen") or False)
+    state.transform_no_material_progress_streak = int(session_data.get("transform_no_material_progress_streak") or 0)
+    state.transform_phase = str(session_data.get("transform_phase") or state.transform_phase)
+    state.transform_analysis_complete = bool(session_data.get("transform_analysis_complete") or False)
 
     if not state.prompt_changed:
         state.last_runtime_error = str(session_data.get("last_runtime_error") or "")
@@ -1602,8 +1739,65 @@ def _save_session_state(state):
         "large_read_cache": dict(state.large_read_cache),
         "transform_last_verify_ok": state.transform_last_verify_ok,
         "transform_source_hash": state.transform_source_hash,
+        "transform_source_read_seen": state.transform_source_read_seen,
+        "transform_no_material_progress_streak": state.transform_no_material_progress_streak,
+        "transform_phase": state.transform_phase,
+        "transform_analysis_complete": state.transform_analysis_complete,
     }
     write_json_file(_session_path(), payload)
+
+
+def _clear_runtime_session(project_root=None):
+    targets = [_session_path(), os.path.join(os.getcwd(), config.RAW_LOG_FILE)]
+    if project_root:
+        root = os.path.abspath(project_root)
+        targets.extend(
+            [
+                os.path.join(root, REWRITE_STATE_DIR),
+                os.path.join(root, ".agent", "iteration_stage"),
+            ]
+        )
+    for target in targets:
+        if not target:
+            continue
+        try:
+            if os.path.isdir(target):
+                shutil.rmtree(target, ignore_errors=True)
+            elif os.path.exists(target):
+                os.remove(target)
+        except Exception:
+            pass
+
+
+def clear_runtime_session(project_root=None, *args, **kwargs):
+    _clear_runtime_session(project_root=project_root)
+
+
+def _compact_log_message(message):
+    text = str(message or "").strip()
+    if not text:
+        return ""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        if len(text) <= 260:
+            return text
+        return truncate_middle(text, 260)
+    if text.upper().count("SECTION") > 12:
+        return f"output collapsed: {len(lines)} lines, repeated token SECTION"
+    unique = []
+    seen = set()
+    for line in lines:
+        if line in seen:
+            continue
+        seen.add(line)
+        unique.append(line)
+        if len(unique) >= 3:
+            break
+    if len(set(lines[: min(len(lines), 12)])) == 1:
+        return f"{lines[0]} [same event repeated x{len(lines)}]"
+    if len(unique) == 1:
+        return f"{unique[0]} [collapsed: {len(lines)} lines, {len(text)} chars]"
+    return f"{unique[0]} ... [collapsed: {len(lines)} lines, {len(text)} chars]"
 
 
 def _build_state(user_prompt):
@@ -3312,7 +3506,7 @@ def _normalize_action(action, state):
     return {"type": action_type, "args": args}
 
 
-def _execute_action(action, state, project_root_override=None):
+def _execute_action(action, state, project_root_override=None, stop_checker=None):
     action_type = action.get("type")
     args = action.get("args", {})
     project_root = project_root_override or state.active_project_root
@@ -3458,6 +3652,7 @@ def _execute_action(action, state, project_root_override=None):
             args.get("cmd", ""),
             cwd=project_root,
             project_root=project_root,
+            stop_checker=stop_checker,
         )
 
     from contracts import Observation
@@ -3526,7 +3721,14 @@ def _single_file_patch_retry_note(state):
     )
 
 
-def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, rescue_decider=None):
+def run(
+    prompt,
+    logger=print,
+    stop_checker=None,
+    model_timeout_handler=None,
+    rescue_decider=None,
+    max_iterations_handler=None,
+):
     state = _build_state(prompt)
     os.makedirs(state.active_project_root, exist_ok=True)
     ensure_gitignore(state.active_project_root)
@@ -3535,20 +3737,62 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
     _save_session_state(state)
 
     log_path = os.path.join(os.getcwd(), config.LOG_FILE)
+    raw_log_path = os.path.join(os.getcwd(), config.RAW_LOG_FILE)
+    os.makedirs(os.path.dirname(raw_log_path), exist_ok=True)
 
-    with open(log_path, "w", encoding="utf-8") as log_file:
+    with open(log_path, "w", encoding="utf-8") as log_file, open(raw_log_path, "w", encoding="utf-8") as raw_log_file:
         tee = Tee(sys.stdout, log_file)
 
-        def log(msg=""):
-            tee.write(str(msg) + "\n")
+        pending_log_line = None
+        pending_log_count = 0
+
+        def flush_pending_log():
+            nonlocal pending_log_line, pending_log_count
+            if not pending_log_line:
+                return
+            line = pending_log_line
+            if pending_log_count > 1:
+                line = f"{line} [same event repeated x{pending_log_count}]"
+            tee.write(line + "\n")
             if logger is not None:
-                logger(str(msg))
+                logger(str(line))
+            pending_log_line = None
+            pending_log_count = 0
+
+        def log(msg=""):
+            nonlocal pending_log_line, pending_log_count
+            raw_text = str(msg)
+            try:
+                raw_log_file.write(raw_text + "\n")
+                raw_log_file.flush()
+            except Exception:
+                pass
+            compact = _compact_log_message(raw_text)
+            if compact == pending_log_line:
+                pending_log_count += 1
+                return
+            flush_pending_log()
+            pending_log_line = compact
+            pending_log_count = 1
+
+        def stop_requested():
+            return bool(stop_checker and stop_checker())
+
+        def request_max_iteration_extension(current_iteration, current_limit):
+            if not callable(max_iterations_handler):
+                return "kill"
+            try:
+                return max_iterations_handler(current_iteration, current_limit)
+            except Exception:
+                return "kill"
 
         history = []
         consecutive_parse_errors = 0
         empty_done_retry_used = False
         finished_success = False
         terminal_reason = ""
+        run_executed_actions = 0
+        run_blocked_actions = 0
 
         log(f"MODE: {state.mode}")
         log(f"MODE CONTROL: {str(getattr(config, 'MODE_CONTROL', 'AUTO') or 'AUTO').strip().upper()}")
@@ -3602,10 +3846,28 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                 if next_required:
                     log(f"CHUNK NEXT REQUIRED ACTION: {next_required}")
 
-        for iteration in range(config.MAX_ITERATIONS):
+        for iteration in range(1000000):
+            current_limit = max(1, coerce_int(config.MAX_ITERATIONS, 10, minimum=1, maximum=100000))
+            if iteration >= current_limit:
+                log(f"MAX ITERATIONS REACHED: {iteration}/{current_limit}")
+                decision = request_max_iteration_extension(iteration, current_limit)
+                if isinstance(decision, str) and decision.strip().lower() == "kill":
+                    terminal_reason = f"MAX ITERATIONS REACHED ({iteration}/{current_limit})"
+                    log("MAX ITERATIONS DIALOG -> KILL")
+                    break
+                add_more = coerce_int(decision, 0, minimum=0, maximum=100)
+                if add_more > 0:
+                    config.MAX_ITERATIONS = current_limit + add_more
+                    log(f"MAX ITERATIONS EXTENDED -> {config.MAX_ITERATIONS}")
+                    history.append(f"MAX ITERATIONS EXTENDED by +{add_more}")
+                    _save_session_state(state)
+                    continue
+                terminal_reason = f"MAX ITERATIONS REACHED ({iteration}/{current_limit})"
+                log("MAX ITERATIONS DIALOG -> KILL")
+                break
             state.iteration_count = iteration + 1
             _save_session_state(state)
-            if stop_checker and stop_checker():
+            if stop_requested():
                 log("STOP REQUESTED")
                 break
 
@@ -3720,6 +3982,8 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                     _save_session_state(state)
                     continue
             if state.mode == "create":
+                if state.task_shape == "transform_copy_task":
+                    log(f"TRANSFORM PHASE: {state.transform_phase}")
                 if state.create_strategy == "chunked_rewrite":
                     _sync_chunk_session_from_rewrite_state(state, log=log, startup=False)
                 if (
@@ -3752,9 +4016,12 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                     if next_required:
                         log(f"CHUNK NEXT REQUIRED ACTION: {next_required}")
 
-            log(f"\nITER {iteration}")
+            log(
+                f"ITER {iteration + 1} | route={state.model_route}/{state.current_provider} "
+                f"| reason={truncate_middle(state.route_reason or 'n/a', 120)}"
+            )
             prompt_payload = build_prompt(prompt, history, state)
-            log(f"PROMPT CHARS: {len(prompt_payload)}")
+            log(f"PROMPT: {len(prompt_payload)} chars")
             try:
                 raw = call_model(
                     prompt_payload,
@@ -3762,12 +4029,17 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                     max_output_tokens=config.MAX_OUTPUT_TOKENS,
                     timeout_handler=model_timeout_handler,
                     timeout_seconds=config.MODEL_TIMEOUT,
+                    stop_checker=stop_requested,
                 )
             except Exception as e:
                 message = str(e)
                 log(message)
                 history.append(message)
                 if "MODEL REQUEST KILLED BY USER" in message:
+                    if stop_requested():
+                        log("STOP REQUESTED")
+                        terminal_reason = "user stop"
+                        break
                     log("MODEL REQUEST KILLED -> CONTINUE")
                     _save_session_state(state)
                     continue
@@ -3785,7 +4057,27 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                 terminal_reason = message
                 break
 
-            log("RAW: " + truncate_middle(str(raw), 3000))
+            raw_text = str(raw)
+            raw_lines = raw_text.splitlines()
+            collapsed_reason = ""
+            if len(raw_lines) > 24:
+                collapsed_reason = f"{len(raw_lines)} lines"
+            if "SECTION" in raw_text and raw_text.count("SECTION") > 12:
+                collapsed_reason = (collapsed_reason + ", " if collapsed_reason else "") + "repeated token SECTION"
+            try:
+                raw_log_file.write("RAW RESPONSE FULL:\n" + raw_text + "\n")
+                raw_log_file.flush()
+            except Exception:
+                pass
+            if collapsed_reason:
+                log(f"RAW RESPONSE COLLAPSED: {collapsed_reason} ({len(raw_text)} chars)")
+            else:
+                log(f"RAW RESPONSE: {truncate_middle(raw_text, 900)}")
+
+            if stop_requested():
+                log("STOP REQUESTED")
+                terminal_reason = "user stop"
+                break
 
             try:
                 data = parse_response(
@@ -3833,7 +4125,50 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                     break
                 continue
 
+            if stop_requested():
+                log("STOP REQUESTED")
+                terminal_reason = "user stop"
+                break
+
             actions = [_normalize_action(action, state) for action in data.get("actions", [])]
+            if state.task_shape == "transform_copy_task" and state.transform_analysis_complete:
+                only_reads = bool(actions) and all(str(a.get("type", "")) in {"read_file", "find_in_file"} for a in actions)
+                if only_reads:
+                    log("TRANSFORM LOOP GUARD 2/2 -> deterministic path")
+                    log("TRANSFORM FALLBACK: builtin deterministic executor")
+                    ok, written, err = _deterministic_transform_copy(state)
+                    if ok:
+                        log(f"TRANSFORM OUTPUTS WRITTEN: {', '.join(written)}")
+                        state.transform_phase = "transform_verify"
+                        state.transform_no_material_progress_streak = 0
+                    else:
+                        log(f"TRANSFORM FALLBACK FAILED: {err}")
+                        iteration_error = err or "deterministic transform failed"
+                        terminal_reason = "transform_loop_repeated_plain_read"
+                        _save_session_state(state)
+                        break
+                    touched_paths = list(written)
+                    verify_observation = verify_touched_paths(
+                        touched_paths,
+                        project_root=state.active_project_root,
+                        smoke_run=False,
+                    )
+                    transform_verify = _verify_transform_outputs(state)
+                    state.transform_last_verify_ok = bool(transform_verify.ok)
+                    log(f"TRANSFORM VERIFY: {'pass' if transform_verify.ok else 'fail'}")
+                    if not transform_verify.ok:
+                        log(transform_verify.details or transform_verify.summary)
+                        terminal_reason = "transform_loop_repeated_plain_read"
+                        _save_session_state(state)
+                        break
+                    state.transform_phase = "complete"
+                    success_msg = "SUCCESSFUL RUN -> STOP (transform outputs verified)"
+                    log(success_msg)
+                    history.append(success_msg)
+                    finished_success = True
+                    terminal_reason = "transform_verified_success"
+                    _save_session_state(state)
+                    break
             if state.mode == "patch":
                 switched, reason = _negotiate_hotspot_from_actions(state, actions)
                 if switched:
@@ -3926,13 +4261,17 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
             patch_anchor_failure = False
             meaningful_materialization = False
             chunk_protocol_violation_seen = False
+            blocked_plain_source_read_seen = False
+            transform_material_progress = False
+            transform_material_reason = ""
             stage_context = _build_atomic_patch_stage(actions, state)
 
             try:
                 for action in actions:
                     if stop_checker and stop_checker():
                         log("STOP REQUESTED")
-                        return log_path
+                        terminal_reason = "user stop"
+                        break
 
                     if (
                         state.mode == "create"
@@ -4011,6 +4350,7 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                             "REPEATED ACTION ESCALATION: same failing action exceeded retry budget. "
                             "Switch strategy/model instead of repeating unchanged call."
                         )
+                        run_blocked_actions += 1
                         if state.mode == "patch":
                             _refresh_patch_context(state)
                         state.stuck_iterations = max(state.stuck_iterations + 1, config.STALL_TRIGGER)
@@ -4027,6 +4367,12 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                     action_root = _stage_action_project_root(action, state, stage_context)
                     staged_action = action_root != state.active_project_root
                     observation = None
+                    if _is_transform_plain_source_read(action, state) and state.transform_source_read_seen:
+                        blocked_plain_source_read_seen = True
+                        run_blocked_actions += 1
+                        log(f"BLOCK REPEATED PLAIN SOURCE READ: {state.transform_primary_source}")
+                        history.append(f"BLOCK REPEATED PLAIN SOURCE READ: {state.transform_primary_source}")
+                        continue
                     if (
                         action.get("type") == "read_file"
                         and state.task_shape in TRANSFORM_TASK_SHAPES
@@ -4059,7 +4405,12 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                                 path=os.path.abspath(os.path.join(state.active_project_root, rel_path)),
                             )
                         else:
-                            observation = _execute_action(action, state, project_root_override=action_root)
+                            observation = _execute_action(
+                                action,
+                                state,
+                                project_root_override=action_root,
+                                stop_checker=stop_requested,
+                            )
                             if not targeted_read:
                                 transport_text, cache_entry = _structured_large_read_observation(
                                     rel_path,
@@ -4074,7 +4425,12 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                                         2200,
                                     )
                     else:
-                        observation = _execute_action(action, state, project_root_override=action_root)
+                        observation = _execute_action(
+                            action,
+                            state,
+                            project_root_override=action_root,
+                            stop_checker=stop_requested,
+                        )
                     if staged_action:
                         metadata = dict(observation.metadata or {})
                         metadata["touches_file"] = False
@@ -4083,6 +4439,7 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                         observation.summary = observation.summary + " [staged]"
 
                     executed_count += 1
+                    run_executed_actions += 1
                     log(observation.summary)
                     if observation.details:
                         log(observation.details)
@@ -4136,6 +4493,39 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                             iteration_error = observation.details or observation.summary
                         else:
                             meaningful_materialization = True
+
+                    if state.task_shape == "transform_copy_task" and observation.ok:
+                        tool = str(observation.tool or "")
+                        args = action.get("args", {}) if isinstance(action.get("args"), dict) else {}
+                        rel_path = normalize_rel_path(args.get("path", ""))
+                        targeted_read = bool(
+                            args.get("section_id")
+                            or args.get("line_start")
+                            or args.get("line_end")
+                            or args.get("around_anchor")
+                            or args.get("query")
+                        )
+                        if tool in {"write_file", "finalize_file_rewrite"} and rel_path in (state.derived_allowed_files or []):
+                            transform_material_progress = True
+                            transform_material_reason = f"derived output write: {rel_path}"
+                        elif tool == "read_file" and targeted_read:
+                            transform_material_progress = True
+                            transform_material_reason = "targeted section read"
+                        elif tool == "find_in_file" and str(args.get("query", "")).strip():
+                            transform_material_progress = True
+                            transform_material_reason = "targeted query"
+                        elif tool == "run_cmd":
+                            cmd_text = _normalize_prompt_text(args.get("cmd", ""))
+                            if "transform" in cmd_text and "helper" in cmd_text:
+                                transform_material_progress = True
+                                transform_material_reason = "helper transform script run"
+
+                    if state.task_shape == "transform_copy_task" and _is_transform_plain_source_read(action, state) and observation.ok:
+                        state.transform_source_read_seen = True
+                        if not state.transform_analysis_complete:
+                            state.transform_analysis_complete = True
+                            state.transform_phase = "transform_write_outputs"
+                            log("TRANSFORM PHASE: transform_write_outputs")
 
                     if state.mode == "create" and state.create_strategy == "chunked_rewrite":
                         if observation.tool == "begin_file_rewrite" and observation.ok:
@@ -4259,6 +4649,7 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                     } and not observation.ok:
                         critical_generation_failed = True
                     if observation.tool in {"off_target_patch_action", "action_format_violation"}:
+                        run_blocked_actions += 1
                         break
                     if critical_generation_failed:
                         break
@@ -4279,7 +4670,76 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
             finally:
                 _cleanup_atomic_patch_stage(stage_context)
 
+            if stop_requested():
+                log("STOP REQUESTED")
+                terminal_reason = "user stop"
+                break
+
+            if state.task_shape == "transform_copy_task":
+                if transform_material_progress:
+                    state.transform_no_material_progress_streak = 0
+                    log(f"MATERIAL PROGRESS: yes ({transform_material_reason or 'transform change'})")
+                    if state.transform_phase == "transform_analyze":
+                        state.transform_phase = "transform_write_outputs"
+                        state.transform_analysis_complete = True
+                        log("TRANSFORM PHASE: transform_write_outputs")
+                else:
+                    state.transform_no_material_progress_streak += 1
+                    log("MATERIAL PROGRESS: no")
+
+                outputs_ok, missing_outputs = _transform_outputs_exist(state)
+                if (
+                    state.transform_source_read_seen
+                    and not outputs_ok
+                    and state.transform_no_material_progress_streak >= 2
+                ):
+                    state.route_reason = "repeated_plain_read_transform_loop"
+                    state.local_fallback_step = max(state.local_fallback_step, 3)
+                    log("TRANSFORM LOOP GUARD 2/2 -> deterministic path")
+                    history.append("TRANSFORM LOOP GUARD 2/2 -> deterministic path")
+                    log("TRANSFORM FALLBACK: builtin deterministic executor")
+                    ok, written, err = _deterministic_transform_copy(state)
+                    if ok:
+                        log(f"TRANSFORM OUTPUTS WRITTEN: {', '.join(written)}")
+                        touched_paths = list(written)
+                        verify_observation = verify_touched_paths(
+                            touched_paths,
+                            project_root=state.active_project_root,
+                            smoke_run=False,
+                        )
+                        transform_verify = _verify_transform_outputs(state)
+                        state.transform_last_verify_ok = bool(transform_verify.ok)
+                        log(f"TRANSFORM VERIFY: {'pass' if transform_verify.ok else 'fail'}")
+                        if not transform_verify.ok:
+                            log(transform_verify.details or transform_verify.summary)
+                            terminal_reason = "transform_loop_repeated_plain_read"
+                            _save_session_state(state)
+                            break
+                        state.transform_phase = "complete"
+                        state.transform_no_material_progress_streak = 0
+                        success_msg = "SUCCESSFUL RUN -> STOP (transform outputs verified)"
+                        log(success_msg)
+                        history.append(success_msg)
+                        finished_success = True
+                        terminal_reason = "transform_verified_success"
+                        _save_session_state(state)
+                        break
+                    if _attempt_local_fallback(state, history, log, reason="repeated_plain_read_transform_loop"):
+                        _save_session_state(state)
+                        continue
+                    terminal_reason = "transform_loop_repeated_plain_read"
+                    break
+                elif (
+                    state.transform_source_read_seen
+                    and not outputs_ok
+                    and state.transform_no_material_progress_streak == 1
+                ):
+                    log("TRANSFORM LOOP GUARD 1/2")
+
             if executed_count == 0:
+                if state.task_shape == "transform_copy_task" and blocked_plain_source_read_seen:
+                    _save_session_state(state)
+                    continue
                 msg = "NO EXECUTED ACTIONS"
                 log(msg)
                 history.append(msg)
@@ -4506,6 +4966,22 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                     break
             _save_session_state(state)
 
+        output_status = "(none)"
+        if state.task_shape == "transform_copy_task":
+            outputs_ok, missing = _transform_outputs_exist(state)
+            if outputs_ok:
+                output_status = "outputs=ok"
+            else:
+                output_status = f"outputs_missing={','.join(missing)}"
+        elif state.touched_files:
+            output_status = f"outputs={len(state.touched_files)} touched"
+        log(
+            f"RUN SUMMARY: executed={run_executed_actions} blocked={run_blocked_actions} "
+            f"stop_reason={terminal_reason or state.last_runtime_error or 'n/a'} "
+            f"status={'success' if finished_success else 'stopped'} {output_status}"
+        )
+        flush_pending_log()
+
         if not finished_success:
             blocked = [
                 line for line in history[-14:]
@@ -4532,5 +5008,6 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
             log(f"- blocked/failed observations: {truncate_middle(blocked_preview, 600)}")
 
         log(f"LOG SAVED TO: {log_path}")
+        flush_pending_log()
         _save_session_state(state)
         return log_path

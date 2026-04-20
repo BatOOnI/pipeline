@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 
 import requests
 
@@ -115,20 +116,28 @@ def _request_worker(handle, provider_name, url, *, headers=None, payload=None):
         handle.finished.set()
 
 
-def _wait_for_model_result(handle, provider_name, timeout_seconds, timeout_handler=None):
+def _wait_for_model_result(handle, provider_name, timeout_seconds, timeout_handler=None, stop_checker=None):
     timeout_seconds = max(1, int(timeout_seconds or config.MODEL_TIMEOUT or 120))
     timeout_attempt = 1
+    deadline = time.monotonic() + timeout_seconds
     while True:
-        if handle.finished.wait(timeout_seconds):
-            break
-        if timeout_handler is None:
-            handle.cancel()
-            raise Exception(f"{provider_name} REQUEST TIMEOUT after {timeout_seconds}s")
-        decision = timeout_handler(handle, timeout_seconds, timeout_attempt)
-        if decision == "kill":
+        if callable(stop_checker) and stop_checker():
             handle.cancel()
             raise Exception("MODEL REQUEST KILLED BY USER")
-        timeout_attempt += 1
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if timeout_handler is None:
+                handle.cancel()
+                raise Exception(f"{provider_name} REQUEST TIMEOUT after {timeout_seconds}s")
+            decision = timeout_handler(handle, timeout_seconds, timeout_attempt)
+            if decision == "kill":
+                handle.cancel()
+                raise Exception("MODEL REQUEST KILLED BY USER")
+            timeout_attempt += 1
+            deadline = time.monotonic() + timeout_seconds
+            continue
+        if handle.finished.wait(min(0.2, remaining)):
+            break
 
     if handle.cancel_requested.is_set() and handle.error is None:
         raise Exception("MODEL REQUEST KILLED BY USER")
@@ -137,7 +146,14 @@ def _wait_for_model_result(handle, provider_name, timeout_seconds, timeout_handl
     return handle.result
 
 
-def call_model(prompt: str, provider_override=None, max_output_tokens=None, timeout_handler=None, timeout_seconds=None) -> str:
+def call_model(
+    prompt: str,
+    provider_override=None,
+    max_output_tokens=None,
+    timeout_handler=None,
+    timeout_seconds=None,
+    stop_checker=None,
+) -> str:
     provider = (provider_override or config.PROVIDER).lower().strip()
     max_output_tokens = max_output_tokens or config.MAX_OUTPUT_TOKENS
     timeout_seconds = timeout_seconds or config.MODEL_TIMEOUT
@@ -157,7 +173,13 @@ def call_model(prompt: str, provider_override=None, max_output_tokens=None, time
             daemon=True,
         )
         thread.start()
-        return _wait_for_model_result(handle, "LMSTUDIO", timeout_seconds, timeout_handler=timeout_handler)
+        return _wait_for_model_result(
+            handle,
+            "LMSTUDIO",
+            timeout_seconds,
+            timeout_handler=timeout_handler,
+            stop_checker=stop_checker,
+        )
 
     if provider == "openai":
         if not config.OPENAI_API_KEY.strip():
@@ -185,7 +207,13 @@ def call_model(prompt: str, provider_override=None, max_output_tokens=None, time
             daemon=True,
         )
         thread.start()
-        return _wait_for_model_result(handle, "OPENAI", timeout_seconds, timeout_handler=timeout_handler)
+        return _wait_for_model_result(
+            handle,
+            "OPENAI",
+            timeout_seconds,
+            timeout_handler=timeout_handler,
+            stop_checker=stop_checker,
+        )
 
     raise Exception(f"Unknown PROVIDER: {provider_override or config.PROVIDER}")
 

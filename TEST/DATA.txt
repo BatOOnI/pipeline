@@ -1,0 +1,69 @@
+source=szablon.txt
+text_placeholders=25
+picture_placeholders=14
+
+PLACEHOLDER_TEXT_1|fusion_text|Garden Rooms in Southend-on-Sea – Practical, High-Quality Garden Offices & Outdoor Rooms  Looking for high-quality ga
+...
+nternal pages for House Extensions in Southend-on-Sea, Structural Work Southend and General Building Repairs Southend.
+PLACEHOLDER_TEXT_2|fusion_text|Bespoke Garden Rooms in Southend-on-Sea     Not every client wants the same type of garden building. Some need a quie
+...
+ our garden rooms are built by experienced local builders with years of hands-on construction experience across Essex.
+PLACEHOLDER_TEXT_3|fusion_text|Built Properly from the Ground Up
+PLACEHOLDER_TEXT_4|fusion_text|Insulation, Membranes and Year-Round Comfort  One of the biggest differences between a bespoke BTOM build and a store
+...
+ higher standard. That is one of the main reasons clients choose bespoke construction over a “posh shed” type product.
+PLACEHOLDER_TEXT_5|fusion_text|Why We Use Cold Roof Construction  All of these projects were built with a cold roof design. For many clients, that i
+...
+acturer-backed warranties of around 25 years, which gives clients confidence in the long-term durability of the build.
+PLACEHOLDER_TEXT_6|fusion_text|Drainage and Ground Conditions Matter  A garden room is only as good as the ground and drainage around it.  On some s
+...
+ture over the long term. It is one more reason why a properly built garden room performs better than a shortcut build.
+PLACEHOLDER_TEXT_7|fusion_text|Doors, Windows and Exterior Finishes  Our garden offices and garden rooms in Southend can be finished in a wide range
+...
+ng on the design  This gives a finished result that looks clean, modern and practical while also performing thermally.
+PLACEHOLDER_TEXT_8|fusion_text|Interior Finish Options  Not every client wants the same interior.  Some garden rooms are finished as clean, practica
+...
+with decorative wood-based wall finishes, more rustic internal cladding or a more straightforward functional interior.
+PLACEHOLDER_TEXT_9|fusion_text|In every case, we offer a full-service build:
+PLACEHOLDER_TEXT_10|fusion_text|This means the client is not just buying a shell. They are getting a usable room.
+PLACEHOLDER_TEXT_11|fusion_text|Garden Room Costs in Southend-on-Sea  How much does a garden room in Southend-on-Sea cost?  The honest answer is that
+...
+ more  The best way to price a build properly is through a site visit and quote based on the actual design and access.
+PLACEHOLDER_TEXT_12|fusion_text|Get a free quote for your garden room
+PLACEHOLDER_TEXT_13|fusion_text|How Long Does a Garden Room Take to Build?  Most of our builds are completed in around 3 to 5 weeks, depending on siz
+...
+nts  The important point is this: we build for quality first, not for pretending a serious structure is a one-day job.
+PLACEHOLDER_TEXT_14|fusion_text|Why Our Garden Rooms Are Better Than Store-Bought Garden Buildings  This is where the difference really shows.  Many 
+...
+s and less robust detailing.  We cover Southend-on-Sea, Westcliff, Leigh-on-Sea, Rochford and surrounding Essex areas.
+PLACEHOLDER_TEXT_15|fusion_text|Our garden rooms in Southend-on-Sea are different because they are built more like real construction projects:
+PLACEHOLDER_TEXT_16|fusion_text|That is why they stay warmer in winter, cooler in summer and hold up better over time.
+PLACEHOLDER_TEXT_17|fusion_text|Do You Need Planning Permission for a Garden Room in Southend?  In many cases, a garden room can be built under permi
+...
+tal accommodation such as an office, gym or studio, that is generally simpler than a fully self-contained living unit.
+PLACEHOLDER_TEXT_18|fusion_text|Request a garden room quote today
+PLACEHOLDER_TEXT_19|fusion_text|Frequently Asked Questions About Garden Rooms in Southend-on-Sea
+PLACEHOLDER_TEXT_20|fusion_text|How much does a garden room cost in Southend-on-Sea? A good-quality bespoke garden room typically starts from around 
+...
+r m², with many completed insulated builds landing in the £20,000–£35,000 range depending on size, glazing and finish.
+PLACEHOLDER_TEXT_21|fusion_text|Can a garden room be used all year round? Yes. With proper insulation, membranes, double glazing and electric heating, a garden room can be comfortable throughout the year.
+PLACEHOLDER_TEXT_22|fusion_text|Do I need planning permission for a garden office? Often not, but it depends on size, height, position and distance from the boundary. In many cases, garden offices fall under permitted development if they stay within the standard limits.
+PLACEHOLDER_TEXT_23|fusion_text|How long does it take to build a garden room? Many bespoke builds take around 3 to 5 weeks on a practical project timeline, with broader UK examples often falling around 4 to 6 weeks depending on complexity.
+PLACEHOLDER_TEXT_24|fusion_text|What can a garden room be used for? Common uses include home office, gym, studio, private room, guest room, hobby space, storage or mixed-use room.
+PLACEHOLDER_TEXT_25|fusion_text|Get a Quote for Garden Rooms in Southend-on-Sea  If you are looking for garden rooms in Southend-on-Sea, a bespoke ga
+...
+or your garden.   Looking to build a garden room in Southend-on-Sea? Contact BTOM Construction today for a free quote.
+PLACEHOLDER_PICTURE_1|image_attr|https://btomconstruction.co.uk/wp-content/uploads/2026/04/black-garden-room-modern-finish-southend.jpg
+PLACEHOLDER_PICTURE_2|image_attr|https://btomconstruction.co.uk/wp-content/uploads/2026/04/modern-garden-room-cladding-southend-scaled.jpg
+PLACEHOLDER_PICTURE_3|image_attr|https://btomconstruction.co.uk/wp-content/uploads/2026/04/garden-room-structure-build-southend-scaled.jpg
+PLACEHOLDER_PICTURE_4|image_attr|https://btomconstruction.co.uk/wp-content/uploads/2026/04/garden-room-osb-installation-southend-scaled.jpg
+PLACEHOLDER_PICTURE_5|image_attr|https://btomconstruction.co.uk/wp-content/uploads/2026/04/garden-room-internal-structure-southend-scaled.jpg
+PLACEHOLDER_PICTURE_6|image_attr|https://btomconstruction.co.uk/wp-content/uploads/2026/04/garden-room-interior-finish-southend-scaled.jpg
+PLACEHOLDER_PICTURE_7|image_attr|https://btomconstruction.co.uk/wp-content/uploads/2026/04/garden-room-insulation-and-framing-southend-scaled.jpg
+PLACEHOLDER_PICTURE_8|image_attr|https://btomconstruction.co.uk/wp-content/uploads/2026/04/garden-room-foundations-and-frame-southend-scaled.jpg
+PLACEHOLDER_PICTURE_9|image_attr|https://btomconstruction.co.uk/wp-content/uploads/2026/04/garden-room-finished-exterior-southend-scaled.jpg
+PLACEHOLDER_PICTURE_10|image_attr|https://btomconstruction.co.uk/wp-content/uploads/2026/04/garden-room-construction-frame-southend-scaled.jpg
+PLACEHOLDER_PICTURE_11|image_attr|https://btomconstruction.co.uk/wp-content/uploads/2026/04/garden-room-completed-inside-southend-scaled.jpg
+PLACEHOLDER_PICTURE_12|image_attr|https://btomconstruction.co.uk/wp-content/uploads/2026/04/garden-room-build-progress-southend-scaled.jpg
+PLACEHOLDER_PICTURE_13|image_attr|https://btomconstruction.co.uk/wp-content/uploads/2026/04/garden-woom-southend-work-progress-scaled.jpg
+PLACEHOLDER_PICTURE_14|image_attr|https://btomconstruction.co.uk/wp-content/uploads/2026/04/Garden-room-build-Southend-timber-frame-and-membrane-scaled.jpg

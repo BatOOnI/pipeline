@@ -4,7 +4,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import config
-from agent_loop import run as pipeline_run
+from agent_loop import clear_runtime_session, run as pipeline_run
 from git_tools import (
     git_add_all,
     git_branch_main,
@@ -29,6 +29,8 @@ class App:
         self.stop_flag = False
         self.timeout_dialog = None
         self.timeout_dialog_event = None
+        self.iteration_limit_dialog = None
+        self.iteration_limit_dialog_event = None
         self.settings_path = os.path.abspath(os.path.join(os.getcwd(), ".agent", "gui_settings.json"))
         self._saved_prompt_text = ""
 
@@ -167,9 +169,12 @@ class App:
         self.status_label = ttk.Label(btn_row, text="Idle")
         self.status_label.pack(side="left", padx=6)
         ttk.Button(btn_row, text="Fetch Models", command=self.fetch_models).pack(side="left", padx=6)
+        ttk.Button(btn_row, text="Start Fresh", command=self.start_fresh_run).pack(side="left", padx=6)
         ttk.Button(btn_row, text="Start", command=self.start_pipeline).pack(side="left", padx=6)
         ttk.Button(btn_row, text="Stop", command=self.stop_pipeline).pack(side="left", padx=6)
+        ttk.Button(btn_row, text="Clear Session", command=lambda: self.clear_session(stop_running=True)).pack(side="left", padx=6)
         ttk.Button(btn_row, text="Open Log", command=self.open_log).pack(side="left", padx=6)
+        ttk.Button(btn_row, text="Open Raw Log", command=self.open_raw_log).pack(side="left", padx=6)
         ttk.Button(btn_row, text="Open Project Folder", command=self.open_project_folder).pack(side="left", padx=6)
 
         git_box = ttk.LabelFrame(top, text="Git")
@@ -207,6 +212,8 @@ class App:
 
     def _bind_events(self):
         self.prompt_text.bind("<<Modified>>", self._on_prompt_modified)
+        self.max_iter_var.trace_add("write", self._sync_live_runtime_settings)
+        self.rescue_mode_var.trace_add("write", self._sync_live_runtime_settings)
 
     def _on_prompt_modified(self, _event=None):
         self.prompt_text.edit_modified(False)
@@ -216,6 +223,16 @@ class App:
         prompt = self.prompt_text.get("1.0", "end-1c")
         self.prompt_chars_var.set(str(len(prompt)))
         self.estimated_tokens_var.set(str(approx_token_count(prompt)))
+
+    def _sync_live_runtime_settings(self, *_args):
+        try:
+            config.MAX_ITERATIONS = coerce_int(self.max_iter_var.get(), config.MAX_ITERATIONS, minimum=1, maximum=100)
+        except Exception:
+            pass
+        rescue_mode = str(self.rescue_mode_var.get() or "OFF").strip().upper()
+        if rescue_mode not in {"OFF", "ON", "ASK_BEFORE_RESCUE"}:
+            rescue_mode = "OFF"
+        config.RESCUE_MODE = rescue_mode
 
     def _normalize_project_root(self, path):
         path = str(path or "").strip()
@@ -475,6 +492,63 @@ class App:
             pass
         return decision["value"]
 
+    def handle_iteration_limit(self, current_iteration, current_limit):
+        decision = {"value": "kill"}
+        finished = threading.Event()
+
+        def close_dialog(result):
+            if finished.is_set():
+                return
+            decision["value"] = result
+            finished.set()
+            dialog = self.iteration_limit_dialog
+            self.iteration_limit_dialog = None
+            self.iteration_limit_dialog_event = None
+            if dialog is not None and dialog.winfo_exists():
+                dialog.grab_release()
+                dialog.destroy()
+
+        def show_dialog():
+            if self.iteration_limit_dialog is not None and self.iteration_limit_dialog.winfo_exists():
+                try:
+                    self.iteration_limit_dialog.destroy()
+                except Exception:
+                    pass
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Iteration Limit Reached")
+            dialog.transient(self.root)
+            dialog.grab_set()
+            dialog.resizable(False, False)
+            message = (
+                f"Reached iteration limit {int(current_iteration)}/{int(current_limit)}.\n"
+                "Add more iterations or kill the current run?"
+            )
+            ttk.Label(dialog, text=message, justify="left").pack(padx=16, pady=(16, 12))
+            button_row = ttk.Frame(dialog)
+            button_row.pack(fill="x", padx=16, pady=(0, 16))
+            ttk.Button(button_row, text="Add +5", command=lambda: close_dialog(5)).pack(side="left", padx=(0, 8))
+            ttk.Button(button_row, text="Add +10", command=lambda: close_dialog(10)).pack(side="left", padx=(0, 8))
+            ttk.Button(button_row, text="Kill", command=lambda: close_dialog("kill")).pack(side="left")
+            dialog.protocol("WM_DELETE_WINDOW", lambda: close_dialog("kill"))
+            self.iteration_limit_dialog = dialog
+            self.iteration_limit_dialog_event = finished
+
+            def poll_dialog():
+                if finished.is_set():
+                    return
+                if self.stop_flag:
+                    close_dialog("kill")
+                    return
+                dialog.after(200, poll_dialog)
+
+            poll_dialog()
+
+        self.root.after(0, show_dialog)
+        while not finished.wait(0.2):
+            if self.stop_flag:
+                self.root.after(0, lambda: close_dialog("kill"))
+        return decision["value"]
+
     def start_pipeline(self):
         if self.worker and self.worker.is_alive():
             messagebox.showinfo("Busy", "Pipeline is already running.")
@@ -499,6 +573,7 @@ class App:
                     stop_checker=lambda: self.stop_flag,
                     model_timeout_handler=self.handle_model_timeout,
                     rescue_decider=self.handle_rescue_request,
+                    max_iterations_handler=self.handle_iteration_limit,
                 )
                 self.log("PIPELINE FINISHED")
                 if config.ACTIVE_PROJECT_ROOT:
@@ -511,12 +586,35 @@ class App:
         self.worker = threading.Thread(target=job, daemon=True)
         self.worker.start()
 
+    def start_fresh_run(self):
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("Busy", "Pipeline is already running.")
+            return
+        self.clear_session(stop_running=False)
+        self.start_pipeline()
+
     def stop_pipeline(self):
         self.stop_flag = True
         self.status_label.config(text="Stopping...")
 
+    def clear_session(self, stop_running=False):
+        if stop_running:
+            self.stop_flag = True
+            self.status_label.config(text="Stopping...")
+        project_root = self._normalize_project_root(self.project_root_var.get()) or config.ACTIVE_PROJECT_ROOT or ""
+        try:
+            clear_runtime_session(project_root or None)
+        except Exception:
+            pass
+        config.ACTIVE_PROJECT_ROOT = ""
+        self.status_label.config(text="Session cleared")
+        self.log("SESSION CLEARED")
+
     def open_log(self):
         open_path(os.path.join(os.getcwd(), config.LOG_FILE))
+
+    def open_raw_log(self):
+        open_path(os.path.join(os.getcwd(), config.RAW_LOG_FILE))
 
     def open_project_folder(self):
         target = config.ACTIVE_PROJECT_ROOT or os.path.join(os.getcwd(), config.PROJECT_ROOT)

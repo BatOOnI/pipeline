@@ -76,12 +76,23 @@ def is_subpath(parent, child):
     return child == parent or child.startswith(parent + os.sep)
 
 
-def coerce_int(value, default, minimum=None, maximum=None):
-    try:
-        number = int(str(value).strip())
-    except Exception:
-        number = default
+def coerce_int(value, default=None, minimum=None, maximum=None, min_value=None, max_value=None):
+    if minimum is None and min_value is not None:
+        minimum = min_value
+    if maximum is None and max_value is not None:
+        maximum = max_value
 
+    text = "" if value is None else str(value).strip()
+    if text == "":
+        number = default
+    else:
+        try:
+            number = int(text)
+        except Exception:
+            number = default
+
+    if number is None:
+        return None
     if minimum is not None:
         number = max(minimum, number)
     if maximum is not None:

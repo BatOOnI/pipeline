@@ -20,10 +20,13 @@ SESSION_FILE = ".agent/session.json"
 RUN_TIMEOUT = 15
 MODEL_TIMEOUT = 120
 LOG_FILE = "pipeline_log.txt"
+RAW_LOG_FILE = ".agent/raw_pipeline_log.txt"
+LOG_LEVEL = "COMPACT"  # COMPACT | VERBOSE | RAW
 AUTO_RUN_COMMANDS = True
 AUTO_VERIFY_PYTHON = True
 AUTO_SMOKE_RUN = False
 AUTO_GIT_CHECKPOINTS = True
+ALLOW_LOCAL_MODEL_SWITCH = False
 
 # Prompt / context control
 PROMPT_CHAR_LIMIT = 12000

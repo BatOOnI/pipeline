@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import subprocess
+import time
 import sys
 import tempfile
 
@@ -1163,7 +1164,7 @@ def _normalize_simple_windows_launch(cmd, cwd=None, project_root=None):
     return remainder, normalized_cwd, "Normalized simple Windows launch command."
 
 
-def run_cmd(cmd, cwd=None, project_root=None):
+def run_cmd(cmd, cwd=None, project_root=None, stop_checker=None):
     project_root = project_root or cwd
     normalized_cmd, normalized_cwd, normalization_note = _normalize_simple_windows_launch(
         cmd, cwd=cwd, project_root=project_root
@@ -1173,38 +1174,50 @@ def run_cmd(cmd, cwd=None, project_root=None):
         return Observation(False, f"CMD BLOCKED: {cmd}", changed=False, details=error, tool="run_cmd")
 
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             prepared,
             shell=False,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             cwd=normalized_cwd,
-            input="",
-            timeout=config.RUN_TIMEOUT,
         )
-        details = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()[:4000]
+        timeout_seconds = max(1, int(config.RUN_TIMEOUT or 15))
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            if callable(stop_checker) and stop_checker():
+                process.kill()
+                try:
+                    stdout, stderr = process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    stdout, stderr = process.communicate()
+                details = ((stdout or "") + "\n" + (stderr or "")).strip()[:4000]
+                return Observation(False, "CMD KILLED BY USER", changed=False, details=details, tool="run_cmd")
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                details = ((stdout or "") + "\n" + (stderr or "")).strip()[:4000]
+                break
+            if time.monotonic() >= deadline:
+                process.kill()
+                try:
+                    stdout, stderr = process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    stdout, stderr = process.communicate()
+                details = ((stdout or "") + "\n" + (stderr or "")).strip()[:4000]
+                return Observation(False, f"CMD TIMEOUT: {prepared}", changed=False, details=details, tool="run_cmd")
+            time.sleep(0.2)
         if normalization_note:
             prefix = normalization_note
             if normalized_cwd:
                 prefix += f" cwd={normalized_cwd}"
             details = (prefix + "\n" + details).strip()
         return Observation(
-            result.returncode == 0,
-            f"CMD exit={result.returncode}: {prepared}",
+            process.returncode == 0,
+            f"CMD exit={process.returncode}: {prepared}",
             changed=False,
             details=details,
             tool="run_cmd",
-            metadata={"returncode": result.returncode},
-        )
-    except subprocess.TimeoutExpired as e:
-        out = e.stdout or ""
-        err = e.stderr or ""
-        return Observation(
-            False,
-            f"CMD TIMEOUT: {prepared}",
-            changed=False,
-            details=((str(out) + "\n" + str(err)).strip())[:4000],
-            tool="run_cmd",
+            metadata={"returncode": process.returncode},
         )
     except Exception as e:
         return Observation(False, f"CMD FAILED: {prepared}", changed=False, details=str(e), tool="run_cmd")

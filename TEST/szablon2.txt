@@ -1,0 +1,49 @@
+import re
+import sys
+from pathlib import Path
+
+def main():
+    src = Path('szablon.txt')
+    dst_text = Path('szablon2.txt')
+    dst_data = Path('DATA.txt')
+    text = src.read_text(encoding='utf-8')
+
+    # Patterns for headings, paragraphs and images (simplified)
+    heading_pat = re.compile(r'(<h[1-6][^>]*>)(.*?)(</h[1-6]>)', re.S)
+    para_pat   = re.compile(r'(<p[^>]*>)(.*?)(</p>)', re.S)
+    img_pat    = re.compile(r'(<img[^>]*src=[\'"]([^\'"]+)[\'"][^>]*>)', re.S)
+
+    placeholder_map = {}
+    pic_counter = 1
+    text_counter = 1
+    data_lines = []
+
+    def replace_block(match, block_type):
+        nonlocal pic_counter, text_counter
+        start, content, end = match.groups()
+        if block_type == 'img':
+            placeholder = f'PLACEHOLDER_PICTURE{pic_counter}'
+            pic_counter += 1
+            data_lines.append(f'{placeholder}: image from {match.group(2)}')
+            return placeholder
+        else:
+            # count words in content (strip tags)
+            words = len(re.findall(r"\\w+", content))
+            placeholder = f'PLACEHOLDER{text_counter}'
+            text_counter += 1
+            data_lines.append(f'{placeholder}: {block_type} with {words} words')
+            return f'{start}{placeholder}{end}'
+
+    # Replace images first to avoid interfering with other tags
+    text = img_pat.sub(lambda m: replace_block(m, 'img'), text)
+    # Replace headings
+    text = heading_pat.sub(lambda m: replace_block(m, 'heading'), text)
+    # Replace paragraphs
+    text = para_pat.sub(lambda m: replace_block(m, 'paragraph'), text)
+
+    dst_text.write_text(text, encoding='utf-8')
+    dst_data.write_text('\
+'.join(data_lines), encoding='utf-8')
+
+if __name__ == '__main__':
+    main()

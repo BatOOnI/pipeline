@@ -20,6 +20,7 @@ from executor import (
     insert_before,
     mkdir,
     patch_lines,
+    read_file,
     read_file_snippet,
     replace_in_file,
     replace_block,
@@ -110,6 +111,7 @@ PATCH_FILE_ACTIONS = {
     "append_file_chunk",
     "finalize_file_rewrite",
     "find_in_file",
+    "read_file",
 }
 ATOMIC_PATCH_FILE_ACTIONS = {
     "write_file",
@@ -122,6 +124,28 @@ ATOMIC_PATCH_FILE_ACTIONS = {
     "append_file_chunk",
     "finalize_file_rewrite",
 }
+PATCH_TASK_SHAPES = {"single_file_patch", "multi_file_patch"}
+TRANSFORM_TASK_SHAPES = {"transform_copy_task", "analysis_report_task"}
+NON_PATCH_TASK_SHAPES = TRANSFORM_TASK_SHAPES.union({"generate_new_files_task", "project_generation_task"})
+LARGE_FILE_ENABLED_THRESHOLD = 20000
+LARGE_FILE_CHUNK_THRESHOLD = 60000
+LARGE_FILE_STRICT_THRESHOLD = 120000
+TEXT_TRANSFORM_HINTS = (
+    "transform",
+    "template",
+    "placeholder",
+    "analysis",
+    "report",
+    "summary",
+    "map",
+    "metadata",
+    "scan",
+    "analyze",
+    "przeksztalc",
+    "szablon",
+    "copy",
+    "kopia",
+)
 
 
 class Tee:
@@ -199,6 +223,18 @@ class PipelineState:
     task_profile: str = ""
     model_route: str = ""
     route_reason: str = ""
+    task_shape: str = "project_generation_task"
+    task_shape_reason: str = ""
+    task_fingerprint: str = ""
+    source_readonly_files: list = field(default_factory=list)
+    derived_allowed_files: list = field(default_factory=list)
+    transform_primary_source: str = ""
+    large_file_mode: str = "disabled"
+    local_fallback_step: int = 0
+    no_progress_streak: int = 0
+    large_read_cache: dict = field(default_factory=dict)
+    transform_last_verify_ok: bool = False
+    transform_source_hash: str = ""
 
 
 def normalize_rel_path(rel_path: str) -> str:
@@ -424,6 +460,12 @@ def _choose_task_profile(state, user_prompt, consecutive_parse_errors=0):
         return "standard_create", "repeated parse failures or no progress"
 
     if state.mode == "create":
+        if state.task_shape in TRANSFORM_TASK_SHAPES:
+            if state.large_file_mode in {"chunk", "strict_chunk"}:
+                return "standard_create", "transform text-heavy task"
+            if token_count <= 26 and len(text) <= 220:
+                return "simple_create", "small transform/create task"
+            return "standard_create", "transform copy/report task"
         if state.create_strategy == "chunked_rewrite" or _is_likely_large_create_prompt(user_prompt):
             return "standard_create", "large/code-heavy create task"
         if token_count <= 32 and len(text) <= 260:
@@ -676,7 +718,108 @@ def _looks_like_existing_feature_edit(user_prompt, words):
     return bool(words.intersection(feature_tokens) and words.intersection(context_tokens))
 
 
-def _infer_mode_with_reason(user_prompt):
+def _looks_like_in_place_patch_request(text_norm):
+    in_place_markers = (
+        "in place",
+        "in-place",
+        "w miejscu",
+        "edytuj",
+        "napraw",
+        "zmien",
+        "popraw",
+        "replace text in",
+        "replace in",
+        "patch",
+        "fix ",
+        "modify ",
+        "change ",
+    )
+    return any(marker in text_norm for marker in in_place_markers)
+
+
+def _resolve_prompt_tokens_in_root(user_prompt, project_root, existing_only=False):
+    rels = []
+    seen = set()
+    for token in _extract_prompt_target_candidates(user_prompt):
+        clean = _sanitize_target_token(token, project_root, patch_mode=bool(existing_only))
+        if not clean:
+            continue
+        if clean in seen:
+            continue
+        seen.add(clean)
+        rels.append(clean)
+    return rels
+
+
+def _infer_output_files_from_prompt(user_prompt, project_root, source_files=None):
+    source_files = set(source_files or [])
+    outputs = []
+    seen = set()
+    for rel_path in _resolve_prompt_tokens_in_root(user_prompt, project_root, existing_only=False):
+        if rel_path in source_files:
+            continue
+        if rel_path in seen:
+            continue
+        seen.add(rel_path)
+        outputs.append(rel_path)
+    return outputs
+
+
+def detect_task_shape(user_prompt, selected_files="", project_context=None):
+    text_norm = _normalize_prompt_text(user_prompt)
+    words = set(_prompt_word_tokens(user_prompt))
+    selected_files = str(selected_files or "").strip()
+    project_context = project_context or {}
+    roots = list(project_context.get("candidate_roots") or _candidate_existing_roots())
+    existing_tokens = []
+    all_tokens = []
+    for root in roots[:3]:
+        if not os.path.isdir(root):
+            continue
+        existing_tokens.extend(_resolve_prompt_tokens_in_root(user_prompt, root, existing_only=True))
+        all_tokens.extend(_resolve_prompt_tokens_in_root(user_prompt, root, existing_only=False))
+    existing_tokens = list(dict.fromkeys(existing_tokens))
+    all_tokens = list(dict.fromkeys(all_tokens))
+    has_patch_words = any(keyword in words for keyword in PATCH_KEYWORDS)
+    has_create_words = any(keyword in words for keyword in CREATE_KEYWORDS)
+    has_transform_words = any(hint in text_norm for hint in TEXT_TRANSFORM_HINTS)
+    has_report_words = any(token in text_norm for token in ("report", "summary", "analysis", "data.txt", "raport", "podsumowanie"))
+    has_copy_words = any(token in text_norm for token in ("copy", "kopia", "template", "szablon", "based on", "from "))
+    has_output_words = any(token in text_norm for token in ("create", "new file", "output", "plik", "utworz", "stworz", "zapisz"))
+    multiple_files = len(all_tokens) >= 2
+
+    if selected_files:
+        sanitized_selected = []
+        for chunk in re.split(r"[,;\n]+", selected_files):
+            token = chunk.strip()
+            if token:
+                sanitized_selected.append(token)
+        if len(sanitized_selected) > 1:
+            return "multi_file_patch", "PATCH_FILES selected multiple files"
+        return "single_file_patch", "PATCH_FILES selected single file"
+
+    if has_transform_words and multiple_files and (has_copy_words or has_report_words):
+        return "transform_copy_task", "source + derived outputs requested"
+    if has_patch_words and has_create_words and multiple_files and has_output_words:
+        return "transform_copy_task", "prompt mixes replace/change with new output files"
+    if has_report_words and not has_patch_words and (multiple_files or "create" in words or "stworz" in words):
+        return "analysis_report_task", "analysis/report artifact request"
+    if has_patch_words and existing_tokens and _looks_like_in_place_patch_request(text_norm):
+        if len(existing_tokens) > 1:
+            return "multi_file_patch", "in-place patch request against existing files"
+        return "single_file_patch", "in-place patch request against existing file"
+    if has_patch_words and existing_tokens and not has_create_words and not has_transform_words:
+        if len(existing_tokens) > 1:
+            return "multi_file_patch", "patch keywords with existing files"
+        return "single_file_patch", "patch keywords with existing file"
+    if has_create_words and (multiple_files or has_transform_words or has_report_words):
+        return "generate_new_files_task", "explicit create/generate new files"
+    if has_transform_words and existing_tokens:
+        return "transform_copy_task", "transform wording with source file context"
+    return "project_generation_task", "default project generation flow"
+
+
+def _infer_mode_with_reason(user_prompt, task_shape="", task_shape_reason=""):
     mode_control = str(getattr(config, "MODE_CONTROL", "AUTO") or "AUTO").strip().upper()
     if mode_control == "FORCE_CREATE":
         return "create", "forced by MODE_CONTROL=FORCE_CREATE"
@@ -686,6 +829,11 @@ def _infer_mode_with_reason(user_prompt):
     patch_files_value = str(config.PATCH_FILES or "")
     if patch_files_value.strip():
         return "patch", "PATCH_FILES non-empty"
+
+    if task_shape in PATCH_TASK_SHAPES:
+        return "patch", f"task shape routed to patch: {task_shape} ({task_shape_reason or 'shape match'})"
+    if task_shape in NON_PATCH_TASK_SHAPES:
+        return "create", f"task shape routed to create: {task_shape} ({task_shape_reason or 'shape match'})"
 
     words = set(_prompt_word_tokens(user_prompt))
     matched_patch = next((keyword for keyword in PATCH_KEYWORDS if keyword in words), "")
@@ -731,6 +879,442 @@ def _infer_mode_with_reason(user_prompt):
 def _infer_mode(user_prompt):
     mode, _ = _infer_mode_with_reason(user_prompt)
     return mode
+
+
+def _compute_task_fingerprint(user_prompt, project_root, selected_files, task_shape):
+    payload = {
+        "prompt": " ".join(_prompt_word_tokens(user_prompt)),
+        "project_root": os.path.normcase(os.path.abspath(project_root or _configured_root_path())),
+        "patch_files": str(selected_files or "").strip(),
+        "task_shape": str(task_shape or ""),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _classify_large_file_mode(state):
+    if state.task_shape not in TRANSFORM_TASK_SHAPES:
+        return "disabled"
+    candidates = list(state.source_readonly_files or [])
+    if not candidates:
+        return "disabled"
+    max_size = 0
+    for rel_path in candidates:
+        abs_path = os.path.abspath(os.path.join(state.active_project_root, rel_path))
+        try:
+            size = os.path.getsize(abs_path)
+        except Exception:
+            size = 0
+        if size > max_size:
+            max_size = size
+    if max_size > LARGE_FILE_STRICT_THRESHOLD:
+        return "strict_chunk"
+    if max_size > LARGE_FILE_CHUNK_THRESHOLD:
+        return "chunk"
+    if max_size > LARGE_FILE_ENABLED_THRESHOLD:
+        return "enabled"
+    return "disabled"
+
+
+def _build_transform_file_policy(state, user_prompt):
+    state.source_readonly_files = []
+    state.derived_allowed_files = []
+    state.transform_primary_source = ""
+    state.transform_source_hash = ""
+    if state.task_shape not in TRANSFORM_TASK_SHAPES:
+        state.large_file_mode = "disabled"
+        return
+
+    source_files = []
+    for rel in _resolve_prompt_tokens_in_root(user_prompt, state.active_project_root, existing_only=True):
+        if rel not in source_files:
+            source_files.append(rel)
+    output_files = _infer_output_files_from_prompt(user_prompt, state.active_project_root, source_files=source_files)
+    if not source_files:
+        for rel in _resolve_prompt_tokens_in_root(user_prompt, state.active_project_root, existing_only=False):
+            abs_path = os.path.abspath(os.path.join(state.active_project_root, rel))
+            if os.path.exists(abs_path):
+                source_files.append(rel)
+                break
+    state.source_readonly_files = source_files
+    state.transform_primary_source = source_files[0] if source_files else ""
+    if state.transform_primary_source:
+        abs_source = os.path.abspath(os.path.join(state.active_project_root, state.transform_primary_source))
+        try:
+            with open(abs_source, "rb") as handle:
+                state.transform_source_hash = hashlib.sha256(handle.read()).hexdigest()
+        except Exception:
+            state.transform_source_hash = ""
+    state.derived_allowed_files = output_files
+    state.large_file_mode = _classify_large_file_mode(state)
+
+
+def _is_text_like_output(path):
+    ext = os.path.splitext(str(path or ""))[1].lower()
+    return ext in {
+        ".txt",
+        ".md",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".csv",
+        ".html",
+        ".xml",
+        ".py",
+        ".js",
+        ".ts",
+        ".css",
+        ".bat",
+        ".cmd",
+        ".ps1",
+        ".sh",
+    }
+
+
+def _is_safe_transform_output(rel_path, state):
+    rel = normalize_rel_path(rel_path or "")
+    if not rel:
+        return False
+    if rel in (state.derived_allowed_files or []):
+        return True
+    if not _is_text_like_output(rel):
+        return False
+    lower = _normalize_prompt_text(rel)
+    if any(marker in lower for marker in ("data", "report", "summary", "analysis", "template", "copy", "map", "szablon")):
+        return True
+    source = str(state.transform_primary_source or "")
+    if source:
+        src_stem = _normalize_prompt_text(os.path.splitext(os.path.basename(source))[0])
+        dst_stem = _normalize_prompt_text(os.path.splitext(os.path.basename(rel))[0])
+        if src_stem and src_stem in dst_stem and src_stem != dst_stem:
+            return True
+    return False
+
+
+def _is_transform_mutation_blocked(action_type, rel_path, state):
+    if state.mode != "create" or state.task_shape not in TRANSFORM_TASK_SHAPES:
+        return False, ""
+    mutating = {
+        "write_file",
+        "replace_in_file",
+        "insert_before",
+        "insert_after",
+        "replace_block",
+        "patch_lines",
+        "begin_file_rewrite",
+        "append_file_chunk",
+        "finalize_file_rewrite",
+    }
+    if action_type not in mutating:
+        return False, ""
+    rel = normalize_rel_path(rel_path or "")
+    if not rel:
+        return False, ""
+    if rel in (state.source_readonly_files or []):
+        return True, f"SOURCE FILE POLICY VIOLATION: {rel} is read-only in {state.task_shape}"
+    allowed = list(state.derived_allowed_files or [])
+    if allowed and rel not in allowed and not _is_safe_transform_output(rel, state):
+        return True, f"DERIVED FILE POLICY VIOLATION: {rel} is not an allowed transform output"
+    return False, ""
+
+
+def _transform_source_context(state):
+    if state.task_shape not in TRANSFORM_TASK_SHAPES or not state.transform_primary_source:
+        return "", ""
+    rel_path = state.transform_primary_source
+    abs_path = os.path.abspath(os.path.join(state.active_project_root, rel_path))
+    try:
+        with open(abs_path, "r", encoding="utf-8") as handle:
+            content = handle.read()
+    except Exception:
+        return "", ""
+    chars = len(content)
+    lines = len(content.splitlines())
+    summary = f"{rel_path} -> chars={chars}, lines={lines}"
+    snippet_lines = 70
+    if chars > LARGE_FILE_CHUNK_THRESHOLD:
+        snippet_lines = 36
+    elif chars > LARGE_FILE_ENABLED_THRESHOLD:
+        snippet_lines = 52
+    snippet = read_file_snippet(rel_path, project_root=state.active_project_root, max_lines=snippet_lines)
+    return summary, snippet
+
+
+def _required_transform_outputs(state):
+    outputs = []
+    for rel in (state.derived_allowed_files or state.target_files or []):
+        clean = normalize_rel_path(rel)
+        if clean and clean not in outputs:
+            outputs.append(clean)
+    return outputs
+
+
+def _transform_outputs_exist(state):
+    required = _required_transform_outputs(state)
+    if not required:
+        return False, []
+    missing = []
+    for rel in required:
+        abs_path = os.path.abspath(os.path.join(state.active_project_root, rel))
+        if not os.path.exists(abs_path):
+            missing.append(rel)
+    return len(missing) == 0, missing
+
+
+def _placeholder_hits(text):
+    raw = str(text or "")
+    markers = [
+        "PLACEHOLDER",
+        "{{PLACEHOLDER",
+        "[[PLACEHOLDER",
+        "__PLACEHOLDER",
+    ]
+    return sum(1 for marker in markers if marker.lower() in raw.lower())
+
+
+def _verify_transform_outputs(state):
+    from contracts import Observation
+
+    if state.task_shape != "transform_copy_task":
+        return Observation(True, "TRANSFORM VERIFY SKIP", changed=False, details="not a transform_copy_task", tool="verify_transform")
+
+    required = _required_transform_outputs(state)
+    if not required:
+        return Observation(False, "TRANSFORM VERIFY FAIL", changed=False, details="No required derived outputs inferred.", tool="verify_transform")
+
+    missing = []
+    bad = []
+    for rel in required:
+        abs_path = os.path.abspath(os.path.join(state.active_project_root, rel))
+        if not os.path.exists(abs_path):
+            missing.append(rel)
+            continue
+        try:
+            with open(abs_path, "r", encoding="utf-8") as handle:
+                content = handle.read()
+        except Exception as exc:
+            bad.append(f"{rel}: unreadable ({exc})")
+            continue
+        if _placeholder_hits(content) <= 0:
+            bad.append(f"{rel}: no placeholder markers detected")
+
+    source_changed = False
+    if state.transform_primary_source and state.transform_source_hash:
+        source_abs = os.path.abspath(os.path.join(state.active_project_root, state.transform_primary_source))
+        try:
+            with open(source_abs, "rb") as handle:
+                current_hash = hashlib.sha256(handle.read()).hexdigest()
+            source_changed = current_hash != state.transform_source_hash
+        except Exception:
+            source_changed = True
+
+    if missing or bad or source_changed:
+        details = []
+        if missing:
+            details.append("missing outputs: " + ", ".join(missing))
+        if bad:
+            details.append("content checks: " + "; ".join(bad))
+        if source_changed:
+            details.append(f"source changed unexpectedly: {state.transform_primary_source}")
+        return Observation(
+            False,
+            "TRANSFORM VERIFY FAIL",
+            changed=False,
+            details=" | ".join(details),
+            tool="verify_transform",
+        )
+
+    return Observation(
+        True,
+        "TRANSFORM VERIFY OK",
+        changed=False,
+        details="required outputs present; placeholder markers detected; source unchanged",
+        tool="verify_transform",
+    )
+
+
+def _file_signature(project_root, rel_path):
+    try:
+        abs_path = os.path.abspath(os.path.join(project_root, normalize_rel_path(rel_path)))
+        stat = os.stat(abs_path)
+        return f"{int(stat.st_mtime_ns)}:{int(stat.st_size)}"
+    except Exception:
+        return ""
+
+
+def _structured_large_read_observation(rel_path, project_root, large_mode="enabled"):
+    abs_path = os.path.abspath(os.path.join(project_root, normalize_rel_path(rel_path)))
+    try:
+        with open(abs_path, "r", encoding="utf-8") as handle:
+            content = handle.read()
+    except Exception as exc:
+        return "", {"summary": "", "details": f"READ CACHE ERROR: {exc}"}
+
+    lines = content.splitlines()
+    total_lines = len(lines)
+    total_chars = len(content)
+    if large_mode == "strict_chunk":
+        section_size = 180
+    elif large_mode == "chunk":
+        section_size = 280
+    else:
+        section_size = 420
+
+    sections = []
+    idx = 1
+    for start in range(0, total_lines, section_size):
+        end = min(total_lines, start + section_size)
+        preview = ""
+        fusion_preview = ""
+        for line in lines[start:end]:
+            cleaned = line.strip()
+            if cleaned:
+                if not preview:
+                    preview = truncate_middle(cleaned, 100)
+                if "[fusion_" in cleaned.lower():
+                    fusion_preview = truncate_middle(cleaned, 120)
+                    break
+        sections.append(
+            {
+                "id": f"S{idx}",
+                "start_line": start + 1,
+                "end_line": end,
+                "preview": fusion_preview or preview or "(blank/markup-heavy section)",
+            }
+        )
+        idx += 1
+        if len(sections) >= 24:
+            break
+
+    checkpoints = [1, max(1, total_lines // 2), max(1, total_lines - 40)]
+    snippets = []
+    used = set()
+    for center in checkpoints:
+        if center in used:
+            continue
+        used.add(center)
+        snippets.append(
+            {
+                "center": center,
+                "snippet": read_file_snippet(rel_path, project_root=project_root, max_lines=30, around_line=center),
+            }
+        )
+
+    detail_lines = [
+        f"LARGE FILE TRANSPORT: {rel_path}",
+        f"- total_chars={total_chars}, total_lines={total_lines}",
+        f"- sections={len(sections)} (use section ids for targeted extraction)",
+        "- section index:",
+    ]
+    for item in sections[:16]:
+        detail_lines.append(
+            f'  {item["id"]}: L{item["start_line"]}-L{item["end_line"]} preview="{item["preview"]}"'
+        )
+    detail_lines.append("- targeted excerpts:")
+    for window in snippets:
+        detail_lines.append(f'  window around L{window["center"]}:')
+        detail_lines.append(truncate_middle(window["snippet"], 500))
+    detail_lines.append(
+        "- next step: use find_in_file/query and anchored extraction around relevant sections; avoid full-file reread."
+    )
+
+    try:
+        stat = os.stat(abs_path)
+        signature = f"{int(stat.st_mtime_ns)}:{int(stat.st_size)}"
+    except Exception:
+        signature = ""
+
+    cache_entry = {
+        "path": rel_path,
+        "summary": f"LARGE FILE TRANSPORT READY {rel_path} sections={len(sections)}",
+        "details": "\n".join(detail_lines),
+        "chars": total_chars,
+        "lines": total_lines,
+        "sections": sections,
+        "signature": signature,
+    }
+    return "\n".join(detail_lines), cache_entry
+
+
+def _rotate_local_model(state, log=None):
+    chain = []
+    configured = getattr(config, "LOCAL_MODEL_CHAIN", None)
+    if isinstance(configured, (list, tuple)):
+        chain.extend([str(item).strip() for item in configured if str(item).strip()])
+    configured_csv = str(getattr(config, "LMSTUDIO_MODEL_CHAIN", "") or "").strip()
+    if configured_csv:
+        chain.extend([chunk.strip() for chunk in configured_csv.split(",") if chunk.strip()])
+    if not chain:
+        if state.task_shape in TRANSFORM_TASK_SHAPES:
+            chain = [config.LMSTUDIO_MODEL, "openai/gpt-oss-20b", "qwen/qwen3-coder-30b", "deepseek-coder"]
+        else:
+            chain = [config.LMSTUDIO_MODEL, "qwen/qwen3-coder-30b", "openai/gpt-oss-20b", "deepseek-coder"]
+    unique_chain = []
+    seen = set()
+    for item in chain:
+        norm = item.strip()
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        unique_chain.append(norm)
+    current = str(config.LMSTUDIO_MODEL or "").strip()
+    if current in unique_chain:
+        idx = unique_chain.index(current)
+    else:
+        unique_chain.insert(0, current)
+        idx = 0
+    if idx + 1 >= len(unique_chain):
+        return False
+    next_model = unique_chain[idx + 1]
+    config.LMSTUDIO_MODEL = next_model
+    if log:
+        log(f"LOCAL FALLBACK STEP: alternate local model -> {next_model}")
+    return True
+
+
+def _attempt_local_fallback(state, history, log, reason):
+    step = int(getattr(state, "local_fallback_step", 0) or 0)
+    if step == 0:
+        state.local_fallback_step = 1
+        state.prompt_compaction_level = min(state.prompt_compaction_level + 1, 5)
+        history.append(f"LOCAL FALLBACK STEP: prompt rewrite/compaction after: {reason}")
+        log("LOCAL FALLBACK STEP: prompt rewrite / stronger grounding")
+        return True
+    if step == 1:
+        state.local_fallback_step = 2
+        if state.mode == "create":
+            if state.create_strategy == "chunked_rewrite":
+                state.create_strategy = "write_file"
+                state.create_strategy_reason = "local fallback alternate strategy"
+                state.create_phase = "fix_existing_file" if (state.last_written_files or state.created_files) else "initial_create"
+                _reset_chunk_session(state, reason="local fallback strategy downgrade", clear_rewrite_state=False)
+            else:
+                state.create_phase = "fix_existing_file" if (state.last_written_files or state.created_files) else "initial_create"
+        else:
+            state.patch_phase = "inspect_target"
+        history.append(f"LOCAL FALLBACK STEP: alternate strategy after: {reason}")
+        log("LOCAL FALLBACK STEP: alternate strategy")
+        return True
+    if step == 2:
+        state.local_fallback_step = 3
+        if state.current_provider.lower() == "lmstudio" and _rotate_local_model(state, log=log):
+            history.append(f"LOCAL FALLBACK STEP: switched local model after: {reason}")
+            return True
+        history.append(f"LOCAL FALLBACK STEP: no alternate local model available after: {reason}")
+        log("LOCAL FALLBACK STEP: no alternate local model available")
+        return True
+    if step == 3:
+        state.local_fallback_step = 4
+        if state.task_shape in TRANSFORM_TASK_SHAPES:
+            state.create_strategy = "write_file"
+            state.create_phase = "initial_create"
+            history.append(
+                "LOCAL FALLBACK STEP: deterministic transform mode. "
+                "Use read-only source policy, extract blocks incrementally, then write derived artifacts."
+            )
+            log("LOCAL FALLBACK STEP: deterministic transform path")
+            return True
+    return False
 
 
 def _find_by_basename(project_root, basename):
@@ -874,6 +1458,10 @@ def _soft_reset_runtime_state(state):
     state.chunk_missing_parts = []
     state.chunk_finalize_pending = False
     state.chunk_protocol_violation_streak = 0
+    state.local_fallback_step = 0
+    state.no_progress_streak = 0
+    state.large_read_cache = {}
+    state.transform_last_verify_ok = False
 
 
 def _hydrate_state_from_session(state, session_data):
@@ -918,6 +1506,19 @@ def _hydrate_state_from_session(state, session_data):
     state.chunk_missing_parts = list(session_data.get("chunk_missing_parts") or [])
     state.chunk_finalize_pending = bool(session_data.get("chunk_finalize_pending") or False)
     state.chunk_protocol_violation_streak = int(session_data.get("chunk_protocol_violation_streak") or 0)
+    state.local_fallback_step = int(session_data.get("local_fallback_step") or 0)
+    state.no_progress_streak = int(session_data.get("no_progress_streak") or 0)
+    state.task_shape = str(session_data.get("task_shape") or state.task_shape)
+    state.task_shape_reason = str(session_data.get("task_shape_reason") or state.task_shape_reason)
+    state.task_fingerprint = str(session_data.get("task_fingerprint") or state.task_fingerprint)
+    state.source_readonly_files = list(session_data.get("source_readonly_files") or state.source_readonly_files)
+    state.derived_allowed_files = list(session_data.get("derived_allowed_files") or state.derived_allowed_files)
+    state.transform_primary_source = str(session_data.get("transform_primary_source") or state.transform_primary_source)
+    state.large_file_mode = str(session_data.get("large_file_mode") or state.large_file_mode)
+    cached_large_reads = session_data.get("large_read_cache") or {}
+    state.large_read_cache = dict(cached_large_reads) if isinstance(cached_large_reads, dict) else {}
+    state.transform_last_verify_ok = bool(session_data.get("transform_last_verify_ok") or False)
+    state.transform_source_hash = str(session_data.get("transform_source_hash") or state.transform_source_hash)
 
     if not state.prompt_changed:
         state.last_runtime_error = str(session_data.get("last_runtime_error") or "")
@@ -989,15 +1590,37 @@ def _save_session_state(state):
         "task_profile": state.task_profile,
         "model_route": state.model_route,
         "route_reason": state.route_reason,
+        "task_shape": state.task_shape,
+        "task_shape_reason": state.task_shape_reason,
+        "task_fingerprint": state.task_fingerprint,
+        "source_readonly_files": list(state.source_readonly_files),
+        "derived_allowed_files": list(state.derived_allowed_files),
+        "transform_primary_source": state.transform_primary_source,
+        "large_file_mode": state.large_file_mode,
+        "local_fallback_step": state.local_fallback_step,
+        "no_progress_streak": state.no_progress_streak,
+        "large_read_cache": dict(state.large_read_cache),
+        "transform_last_verify_ok": state.transform_last_verify_ok,
+        "transform_source_hash": state.transform_source_hash,
     }
     write_json_file(_session_path(), payload)
 
 
 def _build_state(user_prompt):
     session_data = _load_session_state()
-    mode, mode_reason = _infer_mode_with_reason(user_prompt)
+    project_context = {"candidate_roots": _candidate_existing_roots()}
+    task_shape, task_shape_reason = detect_task_shape(
+        user_prompt,
+        selected_files=str(config.PATCH_FILES or ""),
+        project_context=project_context,
+    )
+    mode, mode_reason = _infer_mode_with_reason(
+        user_prompt,
+        task_shape=task_shape,
+        task_shape_reason=task_shape_reason,
+    )
     previous_prompt = str(session_data.get("prompt") or session_data.get("goal") or "")
-    prompt_changed = bool(previous_prompt and previous_prompt.strip() != (user_prompt or "").strip())
+    previous_fingerprint = str(session_data.get("task_fingerprint") or "").strip()
     session_root = str(session_data.get("project_root", "")).strip()
     configured_root = _explicit_configured_root_path()
     explicit_gui_root = bool(configured_root)
@@ -1007,6 +1630,14 @@ def _build_state(user_prompt):
         active_project_root = session_root
     else:
         active_project_root = _choose_project_root(mode)
+    task_fingerprint = _compute_task_fingerprint(
+        user_prompt,
+        active_project_root,
+        str(config.PATCH_FILES or ""),
+        task_shape,
+    )
+    prompt_changed = bool(previous_prompt and previous_prompt.strip() != (user_prompt or "").strip())
+    task_changed = bool(previous_fingerprint and previous_fingerprint != task_fingerprint)
     state = PipelineState(
         goal=user_prompt,
         mode=mode,
@@ -1014,16 +1645,32 @@ def _build_state(user_prompt):
         current_provider=config.PROVIDER,
         base_provider=config.PROVIDER,
         mode_reason=mode_reason,
-        prompt_changed=prompt_changed,
+        prompt_changed=(prompt_changed or task_changed),
         required_b64_fields=_required_b64_fields(user_prompt),
+        task_shape=task_shape,
+        task_shape_reason=task_shape_reason,
+        task_fingerprint=task_fingerprint,
     )
     if mode == "create":
-        strategy, strategy_reason = _choose_initial_create_strategy(user_prompt, active_project_root)
+        if task_shape in TRANSFORM_TASK_SHAPES:
+            strategy, strategy_reason = "write_file", "transform/analysis task default"
+        else:
+            strategy, strategy_reason = _choose_initial_create_strategy(user_prompt, active_project_root)
         state.create_strategy = strategy
         state.create_strategy_reason = strategy_reason
         state.create_phase = "chunk_begin" if strategy == "chunked_rewrite" else "initial_create"
     _hydrate_state_from_session(state, session_data)
+    state.task_shape = task_shape
+    state.task_shape_reason = task_shape_reason
+    state.task_fingerprint = task_fingerprint
+    if task_changed:
+        _soft_reset_runtime_state(state)
+        state.patch_task_intent = ""
+        state.patch_hotspot_label = ""
+        state.patch_hotspot_candidates = []
+        state.patch_exact_snippet = ""
     config.ACTIVE_PROJECT_ROOT = state.active_project_root
+    _build_transform_file_policy(state, user_prompt)
 
     fallback_target = _prefer_last_sensible_py(active_project_root)
     target_files = _sanitize_target_files(
@@ -1048,9 +1695,12 @@ def _build_state(user_prompt):
         if not state.patch_strategy:
             state.patch_strategy = "surgical_patch"
     else:
-        state.target_files = target_files
-        state.expected_file_count = max(1, len(target_files) or 1)
-        state.single_file_task = len(target_files) <= 1
+        if state.task_shape in TRANSFORM_TASK_SHAPES and state.derived_allowed_files:
+            state.target_files = list(state.derived_allowed_files)
+        else:
+            state.target_files = target_files
+        state.expected_file_count = max(1, len(state.target_files) or 1)
+        state.single_file_task = len(state.target_files) <= 1
 
     return state
 
@@ -1609,10 +2259,19 @@ def build_instruction_bits(
     stale_error_reason="",
     task_profile="",
     model_route="",
+    task_shape="project_generation_task",
+    source_readonly_files=None,
+    derived_allowed_files=None,
+    transform_primary_source="",
+    large_file_mode="disabled",
+    transform_source_summary="",
+    transform_source_snippet="",
 ):
     target_files = target_files or []
     history = history or []
     chunk_missing_parts = list(chunk_missing_parts or [])
+    source_readonly_files = list(source_readonly_files or [])
+    derived_allowed_files = list(derived_allowed_files or [])
     compact_history = _compact_history(history, compact_level)
     required_b64 = _required_b64_fields(user_prompt)
 
@@ -1649,6 +2308,7 @@ def build_instruction_bits(
             f"PATCH TASK INTENT: {patch_task_intent or 'targeted behavior fix'}",
             f"TASK PROFILE: {task_profile or 'standard_patch'}",
             f"MODEL ROUTE: {model_route or 'local/default'}",
+            f"TASK SHAPE: {task_shape or 'single_file_patch'}",
             f"User patch request: {user_prompt}",
             f"canonical active_patch_target: {active_patch_target or 'app.py'}",
             f"target_files: {json.dumps(target_files or [active_patch_target or 'app.py'])}",
@@ -1734,12 +2394,13 @@ def build_instruction_bits(
         "Mode: create",
         f"TASK PROFILE: {task_profile or 'standard_create'}",
         f"MODEL ROUTE: {model_route or 'local/default'}",
+        f"TASK SHAPE: {task_shape or 'project_generation_task'}",
         f"User task: {user_prompt}",
         "",
         "Return ONLY JSON with this exact shape:",
         '{"plan":"short plan","reasoning_short":"short reason","actions":[{"type":"write_file","args":{"path":"app.py","content":"print(\\"Hello World\\")"}}]}',
         "",
-            "Allowed actions: write_file, replace_in_file, insert_before, insert_after, replace_block, begin_file_rewrite, append_file_chunk, finalize_file_rewrite, patch_lines, find_in_file, run_cmd, mkdir",
+            "Allowed actions: read_file, write_file, replace_in_file, insert_before, insert_after, replace_block, begin_file_rewrite, append_file_chunk, finalize_file_rewrite, patch_lines, find_in_file, run_cmd, mkdir",
             "Rules:",
             "- All file paths must stay inside the project root.",
             "- Prefer writing project files inside this run's folder.",
@@ -1757,10 +2418,51 @@ def build_instruction_bits(
             f"- CHUNK NEXT REQUIRED ACTION: {next_required or 'none'}",
             "- In verify_or_run phase, prefer run_cmd, verify, and targeted edits over full-file rewrite.",
             "- In fix_existing_file phase, prefer replace_in_file/insert_before/insert_after/replace_block on existing files.",
+            f"- LARGE FILE MODE: {large_file_mode}",
             "",
             "Recent observations:",
             compact_history or "None",
     ]
+    if task_shape in TRANSFORM_TASK_SHAPES:
+        readonly_preview = ", ".join(source_readonly_files[:8]) if source_readonly_files else "(none)"
+        derived_preview = ", ".join(derived_allowed_files[:12]) if derived_allowed_files else "(model may propose safe derived outputs)"
+        base.extend(
+            [
+                "",
+                "TRANSFORM COPY CONTRACT:",
+                "- This is a source-to-derived artifact task, not in-place patching.",
+                f"- SOURCE FILE POLICY: read-only -> {readonly_preview}",
+                f"- DERIVED FILES ALLOWED: {derived_preview}",
+                f"- PRIMARY SOURCE: {transform_primary_source or '(auto)'}",
+                "- Do not modify source files unless the user explicitly requests overwrite/in-place edit.",
+                "- Prefer deterministic flow: inspect structure -> extract content blocks -> build placeholder map -> write derived outputs.",
+                "- For large files, use tool-first incremental analysis and bounded snippets; avoid dumping full raw source each iteration.",
+                "- If read_file already returned large-file transport, reuse cached section index/handles instead of repeating identical full-file reads.",
+                "- For repeated read_file on same large source, switch to targeted extraction using section ids + find_in_file queries.",
+                "- Targeted read patterns: read_file(section_id=\"S4\") OR read_file(line_start=840,line_end=980) OR read_file(around_anchor=\"[fusion_text\")",
+                "EXECUTION FRAME:",
+                f"- INPUTS: {readonly_preview}",
+                f"- OUTPUTS: {derived_preview}",
+                f"- OBJECTIVE: {truncate_middle(user_prompt, 260)}",
+                "- CONSTRAINTS: keep boilerplate/mockup syntax stable; replace only user-content blocks when requested.",
+            ]
+        )
+        if transform_source_summary:
+            base.extend(["- SOURCE SUMMARY: " + transform_source_summary])
+        if large_file_mode in {"enabled", "chunk", "strict_chunk"}:
+            base.extend(
+                [
+                    "- LARGE FILE STRATEGY ACTIVE: Step 1 inspect structure only, Step 2 extract bounded blocks, Step 3 build placeholder map, Step 4 assemble outputs, Step 5 verify.",
+                ]
+            )
+        if large_file_mode in {"chunk", "strict_chunk"}:
+            base.extend(
+                [
+                    "- CHUNK ANALYSIS MODE: analyze source in bounded ranges and preserve shortcodes/boilerplate syntax.",
+                ]
+            )
+        if transform_source_snippet:
+            base.extend(["", "SOURCE SNIPPET (bounded):", transform_source_snippet])
     if create_strategy == "chunked_rewrite" and chunk_missing_parts:
         preview = ",".join(str(x) for x in chunk_missing_parts[:24])
         if len(chunk_missing_parts) > 24:
@@ -1834,6 +2536,8 @@ def build_prompt(user_prompt, history, state):
     hotspot_candidates_text = _hotspot_candidates_text(getattr(state, "patch_hotspot_candidates", []) or [])
     hotspot_primary_label = str(getattr(state, "patch_hotspot_label", "") or "")
     hotspot_secondary_label = ""
+    transform_source_summary = ""
+    transform_source_snippet = ""
     secondary_item = _candidate_by_index(
         getattr(state, "patch_hotspot_candidates", []) or [],
         int(getattr(state, "patch_hotspot_secondary_index", 1) if getattr(state, "patch_hotspot_secondary_index", 1) is not None else 1),
@@ -1866,6 +2570,8 @@ def build_prompt(user_prompt, history, state):
             snippet_lines,
         )
         exact_patch_snippet = hotspot_bundle.get("snippet") or ""
+    elif state.mode == "create" and state.task_shape in TRANSFORM_TASK_SHAPES:
+        transform_source_summary, transform_source_snippet = _transform_source_context(state)
 
     bits = build_instruction_bits(
         user_prompt,
@@ -1899,6 +2605,13 @@ def build_prompt(user_prompt, history, state):
         stale_error_reason=str(getattr(state, "patch_stale_error_reason", "") or ""),
         task_profile=state.task_profile,
         model_route=state.model_route,
+        task_shape=state.task_shape,
+        source_readonly_files=state.source_readonly_files,
+        derived_allowed_files=state.derived_allowed_files,
+        transform_primary_source=state.transform_primary_source,
+        large_file_mode=state.large_file_mode,
+        transform_source_summary=transform_source_summary,
+        transform_source_snippet=transform_source_snippet,
     )
     prompt = "\n".join(bit for bit in bits if bit is not None)
 
@@ -1965,6 +2678,13 @@ def build_prompt(user_prompt, history, state):
         hotspot_secondary_label=hotspot_secondary_label,
         task_profile=state.task_profile,
         model_route=state.model_route,
+        task_shape=state.task_shape,
+        source_readonly_files=state.source_readonly_files,
+        derived_allowed_files=state.derived_allowed_files,
+        transform_primary_source=state.transform_primary_source,
+        large_file_mode=state.large_file_mode,
+        transform_source_summary=truncate_middle(transform_source_summary, limit // 8),
+        transform_source_snippet=truncate_middle(transform_source_snippet, limit // 3),
     )
     prompt = "\n".join(bit for bit in bits if bit is not None)
     return truncate_middle(prompt, limit)
@@ -2316,13 +3036,20 @@ def _refresh_patch_context(state):
 
 
 def _sanitize_action_path(raw_path, state):
-    fallback = state.active_patch_target if state.mode == "patch" else "app.py"
+    if state.mode == "patch":
+        fallback = state.active_patch_target
+    elif state.task_shape in TRANSFORM_TASK_SHAPES:
+        fallback = (state.derived_allowed_files[0] if state.derived_allowed_files else "")
+    else:
+        fallback = "app.py"
     clean = _sanitize_target_token(raw_path or fallback, state.active_project_root, patch_mode=state.mode == "patch")
     if clean:
         return clean
 
     if state.mode == "patch":
         return state.active_patch_target
+    if state.task_shape in TRANSFORM_TASK_SHAPES and not str(raw_path or fallback).strip():
+        return ""
 
     candidate = normalize_rel_path(raw_path or fallback)
     abs_candidate = os.path.abspath(os.path.join(state.active_project_root, candidate))
@@ -2369,6 +3096,13 @@ def _normalize_action_path_or_reject(raw_path, state):
 def _normalize_action(action, state):
     action_type = str(action.get("type", "")).strip()
     args = action.get("args") if isinstance(action.get("args"), dict) else {}
+    args = dict(args)
+
+    def _first_arg(*keys, default=""):
+        for key in keys:
+            if key in args and args.get(key) not in (None, ""):
+                return args.get(key)
+        return default
 
     if action_type in PATCH_FILE_ACTIONS:
         normalized_path, rejection = _normalize_action_path_or_reject(args.get("path"), state)
@@ -2378,9 +3112,13 @@ def _normalize_action(action, state):
         normalized_path = ""
 
     if action_type == "write_file":
+        blocked, message = _is_transform_mutation_blocked(action_type, normalized_path, state)
+        if blocked:
+            return _format_violation_action(message)
+        content_value = _first_arg("content", "text", "body", "code", "contents", default="")
         if "content_b64" in state.required_b64_fields:
             if not args.get("content_b64"):
-                content_text = str(args.get("content", ""))
+                content_text = str(content_value)
                 if _looks_like_base64_text(content_text):
                     return _format_violation_action("ACTION FORMAT VIOLATION: base64 payload was placed in plain content instead of content_b64")
                 if content_text:
@@ -2390,16 +3128,36 @@ def _normalize_action(action, state):
             "type": action_type,
             "args": {
                 "path": normalized_path,
-                "content": str(args.get("content", "")),
+                "content": str(content_value),
                 "content_b64": args.get("content_b64"),
             },
         }
 
+    if action_type == "read_file":
+        line_window = _first_arg("lines", "line_range", default="")
+        return {
+            "type": action_type,
+            "args": {
+                "path": _sanitize_action_path(args.get("path"), state),
+                "max_chars": args.get("max_chars", args.get("limit")),
+                "section_id": _first_arg("section_id", "section", "section_handle", default=""),
+                "line_start": args.get("line_start", args.get("start_line", line_window)),
+                "line_end": args.get("line_end", args.get("end_line")),
+                "around_anchor": _first_arg("around_anchor", "anchor", default=""),
+                "query": _first_arg("query", "pattern", "needle", "search", default=""),
+            },
+        }
+
     if action_type == "replace_in_file":
+        blocked, message = _is_transform_mutation_blocked(action_type, normalized_path, state)
+        if blocked:
+            return _format_violation_action(message)
+        old_value = _first_arg("old", "find", "from_text", "old_content", default="")
+        new_value = _first_arg("new", "replace", "to_text", "new_text", "replacement", default="")
         if "old_b64" in state.required_b64_fields and not args.get("old_b64") and str(args.get("old", "")):
             return _format_violation_action("ACTION FORMAT VIOLATION: old_b64 required but plain old was returned")
         if "new_b64" in state.required_b64_fields and not args.get("new_b64"):
-            new_text = str(args.get("new", ""))
+            new_text = str(new_value)
             if _looks_like_base64_text(new_text):
                 return _format_violation_action("ACTION FORMAT VIOLATION: base64 payload was placed in plain new instead of new_b64")
             if new_text:
@@ -2409,14 +3167,17 @@ def _normalize_action(action, state):
             "type": action_type,
             "args": {
                 "path": normalized_path,
-                "old": str(args.get("old", "")),
-                "new": str(args.get("new", "")),
+                "old": str(old_value),
+                "new": str(new_value),
                 "old_b64": args.get("old_b64"),
                 "new_b64": args.get("new_b64"),
             },
         }
 
     if action_type == "patch_lines":
+        blocked, message = _is_transform_mutation_blocked(action_type, normalized_path, state)
+        if blocked:
+            return _format_violation_action(message)
         return {
             "type": action_type,
             "args": {
@@ -2428,6 +3189,9 @@ def _normalize_action(action, state):
         }
 
     if action_type in {"insert_before", "insert_after"}:
+        blocked, message = _is_transform_mutation_blocked(action_type, normalized_path, state)
+        if blocked:
+            return _format_violation_action(message)
         if "content_b64" in state.required_b64_fields and not args.get("content_b64") and not args.get("new_content_b64"):
             content_text = str(args.get("content", args.get("new_content", "")))
             if _looks_like_base64_text(content_text):
@@ -2449,6 +3213,9 @@ def _normalize_action(action, state):
         }
 
     if action_type == "replace_block":
+        blocked, message = _is_transform_mutation_blocked(action_type, normalized_path, state)
+        if blocked:
+            return _format_violation_action(message)
         if "content_b64" in state.required_b64_fields and not args.get("content_b64") and not args.get("new_content_b64"):
             content_text = str(args.get("content", args.get("new_content", "")))
             if _looks_like_base64_text(content_text):
@@ -2475,6 +3242,9 @@ def _normalize_action(action, state):
         }
 
     if action_type == "begin_file_rewrite":
+        blocked, message = _is_transform_mutation_blocked(action_type, normalized_path, state)
+        if blocked:
+            return _format_violation_action(message)
         return {
             "type": action_type,
             "args": {
@@ -2484,6 +3254,9 @@ def _normalize_action(action, state):
         }
 
     if action_type == "append_file_chunk":
+        blocked, message = _is_transform_mutation_blocked(action_type, normalized_path, state)
+        if blocked:
+            return _format_violation_action(message)
         if "content_b64" in state.required_b64_fields and not args.get("content_b64"):
             content_text = str(args.get("content", args.get("chunk", "")))
             if _looks_like_base64_text(content_text):
@@ -2501,6 +3274,9 @@ def _normalize_action(action, state):
         }
 
     if action_type == "finalize_file_rewrite":
+        blocked, message = _is_transform_mutation_blocked(action_type, normalized_path, state)
+        if blocked:
+            return _format_violation_action(message)
         return {
             "type": action_type,
             "args": {
@@ -2513,7 +3289,7 @@ def _normalize_action(action, state):
             "type": action_type,
             "args": {
                 "path": normalized_path,
-                "query": str(args.get("query", "")),
+                "query": str(_first_arg("query", "pattern", "text", "needle", "search", default="")),
             },
         }
 
@@ -2529,7 +3305,7 @@ def _normalize_action(action, state):
         return {
             "type": action_type,
             "args": {
-                "cmd": normalize_cmd_paths(args.get("cmd", "")),
+                "cmd": normalize_cmd_paths(_first_arg("cmd", "command", default="")),
             },
         }
 
@@ -2571,6 +3347,18 @@ def _execute_action(action, state, project_root_override=None):
             patch_mode=(state.mode == "patch"),
             allow_create=(state.mode != "patch"),
             content_b64=args.get("content_b64"),
+        )
+
+    if action_type == "read_file":
+        return read_file(
+            args.get("path", ""),
+            project_root=project_root,
+            max_chars=args.get("max_chars"),
+            section_id=args.get("section_id"),
+            line_start=args.get("line_start"),
+            line_end=args.get("line_end"),
+            around_anchor=args.get("around_anchor"),
+            query=args.get("query"),
         )
 
     if action_type == "replace_in_file":
@@ -2759,15 +3547,29 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
         history = []
         consecutive_parse_errors = 0
         empty_done_retry_used = False
+        finished_success = False
+        terminal_reason = ""
 
         log(f"MODE: {state.mode}")
         log(f"MODE CONTROL: {str(getattr(config, 'MODE_CONTROL', 'AUTO') or 'AUTO').strip().upper()}")
         log(f"RESCUE MODE: {_rescue_mode()}")
         log(f"MODE REASON: {state.mode_reason or 'unknown'}")
+        log(f"TASK SHAPE: {state.task_shape or 'unknown'}")
+        log(f"TASK SHAPE REASON: {state.task_shape_reason or 'n/a'}")
         log(f"PATCH_FILES REPR: {repr(config.PATCH_FILES)}")
         log(f"ACTIVE PROJECT ROOT: {state.active_project_root}")
+        if state.task_shape in TRANSFORM_TASK_SHAPES:
+            source_preview = ", ".join(state.source_readonly_files[:12]) if state.source_readonly_files else "(none)"
+            derived_preview = ", ".join(state.derived_allowed_files[:12]) if state.derived_allowed_files else "(none)"
+            log(f"SOURCE FILE POLICY: read-only -> {source_preview}")
+            log(f"DERIVED FILES ALLOWED: {derived_preview}")
+            log(f"LARGE FILE MODE: {state.large_file_mode}")
+            log("PATCH HEURISTICS: disabled")
+        else:
+            log("PATCH HEURISTICS: enabled" if state.mode == "patch" else "PATCH HEURISTICS: disabled")
         if _rescue_mode() == "OFF":
             log(f"RESCUE SUPPRESSED: {_rescue_suppressed_reason()}")
+            log("LOCAL FALLBACK STEP: active (OpenAI rescue disabled)")
         initial_profile, initial_profile_reason = _choose_task_profile(state, prompt, consecutive_parse_errors=0)
         initial_route, initial_provider, initial_route_reason = _route_for_task_profile(state, initial_profile)
         state.task_profile = initial_profile
@@ -2776,6 +3578,8 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
         state.current_provider = initial_provider
         log(f"TASK PROFILE: {state.task_profile}")
         log(f"MODEL ROUTE: {state.model_route} ({state.current_provider})")
+        if str(state.current_provider or "").lower() == "lmstudio":
+            log(f"LOCAL MODEL: {config.LMSTUDIO_MODEL}")
         if state.mode == "patch":
             log(f"ACTIVE PATCH TARGET: {state.active_patch_target}")
             log(f"PATCH PHASE: {state.patch_phase}")
@@ -2815,6 +3619,8 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
             state.current_provider = provider_for_iter
             log(f"TASK PROFILE: {state.task_profile}")
             log(f"MODEL ROUTE: {state.model_route} ({state.current_provider})")
+            if str(state.current_provider or "").lower() == "lmstudio":
+                log(f"LOCAL MODEL: {config.LMSTUDIO_MODEL}")
             if state.task_profile == "rescue" and state.model_route != "rescue":
                 log(f"RESCUE SUPPRESSED: {_rescue_suppressed_reason()}")
             if (previous_profile and previous_profile != state.task_profile) or (previous_route and previous_route != state.model_route):
@@ -2920,6 +3726,10 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                     state.create_strategy != "chunked_rewrite"
                     and state.create_full_write_streak >= (3 if "chunk protocol failure fallback" in str(state.create_strategy_reason or "") else 2)
                     and state.create_phase in {"verify_or_run", "fix_existing_file"}
+                    and (
+                        state.task_shape not in TRANSFORM_TASK_SHAPES
+                        or state.large_file_mode in {"chunk", "strict_chunk"}
+                    )
                 ):
                     state.create_strategy = "chunked_rewrite"
                     state.create_strategy_reason = "repeated full write_file"
@@ -2969,6 +3779,10 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                 if _hard_rescue_handoff(state, history, log, reason=message, rescue_decider=rescue_decider):
                     _save_session_state(state)
                     continue
+                if _attempt_local_fallback(state, history, log, reason=message):
+                    _save_session_state(state)
+                    continue
+                terminal_reason = message
                 break
 
             log("RAW: " + truncate_middle(str(raw), 3000))
@@ -3011,6 +3825,11 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                     continue
                 if consecutive_parse_errors >= config.MAX_PARSE_ERRORS:
                     log("STOP: repeated parse errors")
+                    if _attempt_local_fallback(state, history, log, reason=message):
+                        consecutive_parse_errors = 0
+                        _save_session_state(state)
+                        continue
+                    terminal_reason = "repeated parse errors"
                     break
                 continue
 
@@ -3072,6 +3891,20 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                     history.append(msg)
                     _save_session_state(state)
                     continue
+                if state.task_shape == "transform_copy_task":
+                    outputs_ok, missing = _transform_outputs_exist(state)
+                    if not outputs_ok:
+                        msg = f"EMPTY DONE BLOCKED: missing required transform outputs -> {', '.join(missing)}"
+                        log(msg)
+                        history.append(msg)
+                        _save_session_state(state)
+                        continue
+                    if not state.transform_last_verify_ok:
+                        msg = "EMPTY DONE BLOCKED: verification has not passed for transform outputs"
+                        log(msg)
+                        history.append(msg)
+                        _save_session_state(state)
+                        continue
                 if config.ALLOW_EMPTY_DONE_RETRY and not empty_done_retry_used and not state.progress_happened:
                     empty_done_retry_used = True
                     msg = "EMPTY DONE TOO EARLY -> RETRY. You did nothing yet."
@@ -3080,6 +3913,8 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                     _save_session_state(state)
                     continue
                 log("DONE")
+                finished_success = True
+                terminal_reason = "model returned done with no pending runtime error"
                 break
 
             executed_count = 0
@@ -3172,10 +4007,16 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                         msg = f"BLOCK REPEATED ACTION: {action.get('type')}"
                         log(msg)
                         history.append(msg)
+                        history.append(
+                            "REPEATED ACTION ESCALATION: same failing action exceeded retry budget. "
+                            "Switch strategy/model instead of repeating unchanged call."
+                        )
                         if state.mode == "patch":
                             _refresh_patch_context(state)
-                        state.stuck_iterations += 1
-                        continue
+                        state.stuck_iterations = max(state.stuck_iterations + 1, config.STALL_TRIGGER)
+                        iteration_error = msg
+                        critical_generation_failed = True
+                        break
 
                     created_by_action = False
                     if action.get("type") in {"write_file", "finalize_file_rewrite"}:
@@ -3185,7 +4026,55 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
 
                     action_root = _stage_action_project_root(action, state, stage_context)
                     staged_action = action_root != state.active_project_root
-                    observation = _execute_action(action, state, project_root_override=action_root)
+                    observation = None
+                    if (
+                        action.get("type") == "read_file"
+                        and state.task_shape in TRANSFORM_TASK_SHAPES
+                        and state.large_file_mode in {"enabled", "chunk", "strict_chunk"}
+                    ):
+                        from contracts import Observation
+
+                        rel_path = normalize_rel_path(action.get("args", {}).get("path", ""))
+                        targeted_read = bool(
+                            action.get("args", {}).get("section_id")
+                            or action.get("args", {}).get("line_start")
+                            or action.get("args", {}).get("line_end")
+                            or action.get("args", {}).get("around_anchor")
+                            or action.get("args", {}).get("query")
+                        )
+                        cached = state.large_read_cache.get(rel_path) if rel_path else None
+                        current_sig = _file_signature(state.active_project_root, rel_path)
+                        cache_valid = (
+                            isinstance(cached, dict)
+                            and bool(cached.get("details"))
+                            and str(cached.get("signature") or "") == str(current_sig or "")
+                        )
+                        if cache_valid and not targeted_read:
+                            observation = Observation(
+                                True,
+                                f"read_file cached transport {rel_path}",
+                                changed=False,
+                                details=truncate_middle(str(cached.get("details", "")), 2200),
+                                tool="read_file",
+                                path=os.path.abspath(os.path.join(state.active_project_root, rel_path)),
+                            )
+                        else:
+                            observation = _execute_action(action, state, project_root_override=action_root)
+                            if not targeted_read:
+                                transport_text, cache_entry = _structured_large_read_observation(
+                                    rel_path,
+                                    state.active_project_root,
+                                    large_mode=state.large_file_mode,
+                                )
+                                if transport_text and isinstance(cache_entry, dict):
+                                    state.large_read_cache[rel_path] = cache_entry
+                                    observation.summary = str(cache_entry.get("summary") or observation.summary)
+                                    observation.details = truncate_middle(
+                                        str(cache_entry.get("details") or observation.details or ""),
+                                        2200,
+                                    )
+                    else:
+                        observation = _execute_action(action, state, project_root_override=action_root)
                     if staged_action:
                         metadata = dict(observation.metadata or {})
                         metadata["touches_file"] = False
@@ -3200,6 +4089,15 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                     state.last_useful_observation_summary = observation.summary
 
                     history.append(_format_history_observation(observation.summary, observation.details))
+                    if (
+                        observation.tool == "read_file"
+                        and state.task_shape in TRANSFORM_TASK_SHAPES
+                        and state.large_file_mode in {"enabled", "chunk", "strict_chunk"}
+                    ):
+                        history.append(
+                            "LARGE READ CACHE: use section index + targeted excerpts from cached transport. "
+                            "Do not repeat identical full-file read_file."
+                        )
 
                     if (
                         state.mode == "create"
@@ -3222,6 +4120,7 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                         iteration_progress = True
                         state.progress_happened = True
                         state.duplicate_action_cache.clear()
+                        state.local_fallback_step = 0
                     else:
                         state.duplicate_action_cache[action_key] = repeated_count + 1
 
@@ -3387,6 +4286,10 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                 if _hard_rescue_handoff(state, history, log, reason=msg, rescue_decider=rescue_decider):
                     _save_session_state(state)
                     continue
+                if _attempt_local_fallback(state, history, log, reason=msg):
+                    _save_session_state(state)
+                    continue
+                terminal_reason = msg
                 break
 
             verify_observation = verify_touched_paths(
@@ -3404,9 +4307,20 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                     iteration_error = verify_observation.details or verify_observation.summary
                 elif state.mode == "patch":
                     state.patch_phase = "verify_patch"
+            if state.task_shape == "transform_copy_task":
+                transform_verify = _verify_transform_outputs(state)
+                log(transform_verify.summary)
+                if transform_verify.details:
+                    log(transform_verify.details)
+                history.append(_format_history_observation(transform_verify.summary, transform_verify.details))
+                state.transform_last_verify_ok = bool(transform_verify.ok)
+                if not transform_verify.ok:
+                    iteration_error = iteration_error or (transform_verify.details or transform_verify.summary)
 
             if iteration_error:
                 state.last_runtime_error = iteration_error
+                if state.task_shape == "transform_copy_task":
+                    state.transform_last_verify_ok = False
                 if state.mode == "create" and (state.last_written_files or state.created_files):
                     state.create_phase = "fix_existing_file"
                 if state.mode == "create" and state.create_strategy == "chunked_rewrite":
@@ -3486,12 +4400,20 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                 should_escalate = False
                 escalation_reason = ""
                 if state.create_strategy != "chunked_rewrite":
-                    if state.create_full_write_streak >= 2:
-                        should_escalate = True
-                        escalation_reason = "repeated full write_file"
-                    elif state.stuck_iterations >= 1 and requested_large_writes > 0:
-                        should_escalate = True
-                        escalation_reason = "no execution progress with large rewrite"
+                    if state.task_shape in TRANSFORM_TASK_SHAPES:
+                        if state.large_file_mode in {"chunk", "strict_chunk"} and state.create_full_write_streak >= 3:
+                            should_escalate = True
+                            escalation_reason = "large transform repeated full write_file"
+                        elif state.large_file_mode in {"chunk", "strict_chunk"} and state.stuck_iterations >= 2 and requested_large_writes > 0:
+                            should_escalate = True
+                            escalation_reason = "transform no execution progress with large rewrite"
+                    else:
+                        if state.create_full_write_streak >= 2:
+                            should_escalate = True
+                            escalation_reason = "repeated full write_file"
+                        elif state.stuck_iterations >= 1 and requested_large_writes > 0:
+                            should_escalate = True
+                            escalation_reason = "no execution progress with large rewrite"
                 if should_escalate:
                     state.create_strategy = "chunked_rewrite"
                     state.create_strategy_reason = escalation_reason
@@ -3529,18 +4451,85 @@ def run(prompt, logger=print, stop_checker=None, model_timeout_handler=None, res
                 verify_observation=verify_observation,
                 meaningful_materialization=meaningful_materialization,
             )
+            if should_stop and state.task_shape == "transform_copy_task":
+                outputs_ok, missing = _transform_outputs_exist(state)
+                if not outputs_ok:
+                    should_stop = False
+                    stop_reason = f"TRANSFORM DONE BLOCKED: missing outputs -> {', '.join(missing)}"
+                    log(stop_reason)
+                    history.append(stop_reason)
+                elif not state.transform_last_verify_ok:
+                    should_stop = False
+                    stop_reason = "TRANSFORM DONE BLOCKED: verify has not passed for required outputs"
+                    log(stop_reason)
+                    history.append(stop_reason)
             if should_stop:
                 if state.mode == "patch":
                     state.patch_phase = "complete"
                 log(stop_reason)
                 _save_session_state(state)
+                finished_success = True
+                terminal_reason = stop_reason
                 break
 
+            if state.task_shape == "transform_copy_task" and not state.transform_last_verify_ok:
+                iteration_progress = False
             if iteration_progress:
+                state.no_progress_streak = 0
                 log("PROGRESS APPLIED -> CONTINUE")
             else:
+                state.no_progress_streak += 1
                 log("NO REAL PROGRESS -> CONTINUE")
+                if state.no_progress_streak >= 2:
+                    if state.mode == "create" and state.create_strategy == "chunked_rewrite":
+                        log("NO-PROGRESS SHIFT: chunked_rewrite -> write_file")
+                        state.create_strategy = "write_file"
+                        state.create_strategy_reason = "no-progress strategy shift"
+                        state.create_phase = "fix_existing_file" if (state.last_written_files or state.created_files) else "initial_create"
+                        _reset_chunk_session(state, reason="no-progress strategy shift", clear_rewrite_state=False)
+                    elif state.mode == "patch":
+                        log("NO-PROGRESS SHIFT: refresh patch grounding")
+                        state.patch_phase = "inspect_target"
+                if state.no_progress_streak >= 4:
+                    fail_reason = "repeated no real progress"
+                    if _hard_rescue_handoff(state, history, log, reason=fail_reason, rescue_decider=rescue_decider):
+                        state.no_progress_streak = 0
+                        _save_session_state(state)
+                        continue
+                    if _attempt_local_fallback(state, history, log, reason=fail_reason):
+                        state.no_progress_streak = 0
+                        _save_session_state(state)
+                        continue
+                    log("STOP: no progress after local fallback exhaustion")
+                    _save_session_state(state)
+                    terminal_reason = "repeated no real progress"
+                    break
             _save_session_state(state)
+
+        if not finished_success:
+            blocked = [
+                line for line in history[-14:]
+                if any(token in _normalize_prompt_text(line) for token in ("blocked", "violation", "missing", "failed", "rejected"))
+            ]
+            blocked_preview = " | ".join(blocked[-4:]) if blocked else "(none)"
+            log("FAILURE SUMMARY:")
+            log(f"- detected task shape: {state.task_shape}")
+            log(f"- mode: {state.mode}")
+            log(f"- route/provider: {state.model_route} ({state.current_provider})")
+            log(f"- rescue status: {_rescue_mode()} ({_rescue_suppressed_reason() if _rescue_mode() != 'ON' else 'enabled'})")
+            log(f"- terminal reason: {terminal_reason or state.last_runtime_error or 'max iterations or unresolved state'}")
+            next_route_hint = "standard create"
+            if state.task_shape in TRANSFORM_TASK_SHAPES:
+                next_route_hint = "transform_copy_task with tool-first bounded analysis"
+            elif state.mode == "patch":
+                next_route_hint = "inspect_target -> surgical_patch with grounded anchors"
+            log(f"- best next auto route: {next_route_hint}")
+            if state.task_shape in TRANSFORM_TASK_SHAPES:
+                source_preview = ", ".join(state.source_readonly_files[:8]) if state.source_readonly_files else "(none)"
+                derived_preview = ", ".join(state.derived_allowed_files[:8]) if state.derived_allowed_files else "(none)"
+                log(f"- source read-only: {source_preview}")
+                log(f"- derived allowed: {derived_preview}")
+            log(f"- blocked/failed observations: {truncate_middle(blocked_preview, 600)}")
 
         log(f"LOG SAVED TO: {log_path}")
         _save_session_state(state)

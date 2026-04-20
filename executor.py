@@ -244,6 +244,157 @@ def read_file_snippet(path, project_root=None, max_lines=60, around_line=None):
     return "\n".join(snippet)
 
 
+def read_file(
+    path,
+    project_root=None,
+    max_chars=18000,
+    section_id=None,
+    line_start=None,
+    line_end=None,
+    around_anchor=None,
+    query=None,
+):
+    try:
+        abs_path = _resolve_path(path, project_root=project_root)
+        content = _read_file(abs_path)
+    except Exception as e:
+        return Observation(False, f"read_file failed {path}", changed=False, details=str(e), tool="read_file", path=str(path))
+
+    lines = content.splitlines()
+    total_lines = len(lines)
+
+    def _clip_range(start_line, end_line):
+        start = max(1, int(start_line or 1))
+        end = max(start, int(end_line or total_lines))
+        start = min(start, max(1, total_lines))
+        end = min(end, max(1, total_lines))
+        if total_lines <= 0:
+            return ""
+        chunk = [f"{idx:04d}: {lines[idx - 1]}" for idx in range(start, end + 1)]
+        return "\n".join(chunk)
+
+    if section_id:
+        sec_text = str(section_id).strip().upper()
+        if sec_text.startswith("S"):
+            sec_text = sec_text[1:]
+        try:
+            sec_num = int(sec_text)
+        except Exception:
+            return Observation(
+                False,
+                f"read_file failed {_rel_path(abs_path, project_root)}",
+                changed=False,
+                details=f"Invalid section_id: {section_id}",
+                tool="read_file",
+                path=abs_path,
+            )
+        section_size = 280
+        start = (max(1, sec_num) - 1) * section_size + 1
+        end = min(total_lines, start + section_size - 1)
+        details = _clip_range(start, end)
+        # Regression guard: if section output is placeholder-only while file is not, treat as transport corruption.
+        stripped = [line.strip() for line in details.splitlines() if line.strip()]
+        section_like = [line for line in stripped if re.fullmatch(r"\d{4}:\s*SECTION", line, re.IGNORECASE)]
+        if stripped and len(section_like) >= max(6, int(len(stripped) * 0.8)):
+            file_has_literal_section = any(raw.strip().upper() == "SECTION" for raw in lines)
+            if not file_has_literal_section:
+                return Observation(
+                    False,
+                    f"read_file corruption {_rel_path(abs_path, project_root)}",
+                    changed=False,
+                    details="Large-file section read appears placeholder-only (SECTION) but source file does not contain literal SECTION lines.",
+                    tool="read_file",
+                    path=abs_path,
+                )
+        return Observation(
+            True,
+            f"read_file section S{sec_num} {_rel_path(abs_path, project_root)} L{start}-L{end}",
+            changed=False,
+            details=details,
+            tool="read_file",
+            path=abs_path,
+        )
+
+    line_start_norm = line_start
+    line_end_norm = line_end
+    if isinstance(line_start_norm, str):
+        line_start_norm = line_start_norm.strip()
+        if not line_start_norm:
+            line_start_norm = None
+    if isinstance(line_end_norm, str):
+        line_end_norm = line_end_norm.strip()
+        if not line_end_norm:
+            line_end_norm = None
+
+    if isinstance(line_start_norm, str) and not line_end_norm and re.match(r"^\s*L?\d+\s*-\s*L?\d+\s*$", line_start_norm, re.IGNORECASE):
+        tokens = re.findall(r"\d+", line_start_norm)
+        if len(tokens) == 2:
+            line_start_norm, line_end_norm = int(tokens[0]), int(tokens[1])
+
+    if line_start_norm is not None or line_end_norm is not None:
+        try:
+            start = int(line_start_norm or 1)
+            end = int(line_end_norm or start)
+        except Exception:
+            return Observation(
+                False,
+                f"read_file failed {_rel_path(abs_path, project_root)}",
+                changed=False,
+                details="line_start/line_end must be integers",
+                tool="read_file",
+                path=abs_path,
+            )
+        details = _clip_range(start, end)
+        return Observation(
+            True,
+            f"read_file lines {_rel_path(abs_path, project_root)} L{start}-L{end}",
+            changed=False,
+            details=details,
+            tool="read_file",
+            path=abs_path,
+        )
+
+    if around_anchor or query:
+        needle = str(around_anchor or query or "").strip()
+        lowered = content.lower()
+        pos = lowered.find(needle.lower()) if needle else -1
+        if pos < 0:
+            return Observation(
+                False,
+                f"read_file anchor miss {_rel_path(abs_path, project_root)}",
+                changed=False,
+                details=f'Anchor/query not found: "{needle}"',
+                tool="read_file",
+                path=abs_path,
+            )
+        line_no = content[:pos].count("\n") + 1
+        half = 40
+        start = max(1, line_no - half)
+        end = min(max(1, total_lines), line_no + half)
+        details = _clip_range(start, end)
+        return Observation(
+            True,
+            f"read_file around anchor {_rel_path(abs_path, project_root)} L{start}-L{end}",
+            changed=False,
+            details=details,
+            tool="read_file",
+            path=abs_path,
+        )
+
+    max_chars = max(1000, int(max_chars or 18000))
+    details = content
+    if len(content) > max_chars:
+        details = content[:max_chars] + "\n... [truncated] ..."
+    return Observation(
+        True,
+        f"read_file {_rel_path(abs_path, project_root)} chars={len(content)}",
+        changed=False,
+        details=details,
+        tool="read_file",
+        path=abs_path,
+    )
+
+
 def write_file(path, content, project_root=None, patch_mode=False, allow_create=True, content_b64=None):
     try:
         abs_path = _resolve_path(path, project_root=project_root)

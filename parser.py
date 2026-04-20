@@ -164,6 +164,9 @@ def _action_aliases(action_type: str):
         "save_file": "write_file",
         "edit_file": "replace_in_file",
         "modify_file": "replace_in_file",
+        "search_in_file": "find_in_file",
+        "read": "read_file",
+        "open_file": "read_file",
         "execute": "run_cmd",
         "run": "run_cmd",
     }
@@ -188,12 +191,34 @@ def _normalize_common_arg_aliases(args):
     if "cmd" not in args and "command" in args:
         args["cmd"] = args.get("command")
 
+    if "query" not in args:
+        for key in ("pattern", "text", "needle", "search"):
+            if key in args and str(args.get(key) or "").strip():
+                args["query"] = args.get(key)
+                break
+
+    if "section_id" not in args:
+        for key in ("section", "section_handle"):
+            if key in args and str(args.get(key) or "").strip():
+                args["section_id"] = args.get(key)
+                break
+    if "line_start" not in args and "line_range" in args:
+        args["line_start"] = args.get("line_range")
+
     if "old" not in args and "old_content" in args:
         args["old"] = args.get("old_content", "")
+    if "old" not in args and "find" in args:
+        args["old"] = args.get("find", "")
+    if "old" not in args and "from_text" in args:
+        args["old"] = args.get("from_text", "")
     if "new" not in args and "new_text" in args:
         args["new"] = args.get("new_text", "")
     if "new" not in args and "replacement" in args:
         args["new"] = args.get("replacement", "")
+    if "new" not in args and "replace" in args:
+        args["new"] = args.get("replace", "")
+    if "new" not in args and "to_text" in args:
+        args["new"] = args.get("to_text", "")
 
     return args
 

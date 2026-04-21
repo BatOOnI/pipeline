@@ -1,0 +1,671 @@
+AVADA Generation Report
+======================
+
+Runtime modes:
+- generation_mode: text-only
+- language_mode: auto
+- link_mode: strict-html-internal
+- format_mode: avada-strict
+
+Detected AVADA block types:
+- fusion_text: 25
+- fusion_content_box_title: 3
+- fusion_content_box_body: 3
+- fusion_imageframe: 9
+- fusion_image: 14
+
+Inferred logical sections:
+[
+  {
+    "section_id": 1,
+    "section_key": "section_001",
+    "section_kind": "single_text_section",
+    "role_hint": "page_intro",
+    "placeholder_ids": [
+      "TEXT_001"
+    ],
+    "image_placeholder_ids": [],
+    "block_types": [
+      "fusion_text:inner"
+    ],
+    "text_blocks": 1,
+    "images": 0,
+    "heading_candidates": [],
+    "content_box_items": [],
+    "source_preview": "Renovations Southend  BTOM Construction Limited carries out renovations in Southend-on-Sea, Essex for homeowners who want existing propertie",
+    "text_placeholders": [
+      {
+        "pid": "TEXT_001",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 195,
+        "source_excerpt": "Renovations Southend  BTOM Construction Limited carries out renovations in Southend-on-Sea, Essex for homeowners who want existing propertie"
+      }
+    ]
+  },
+  {
+    "section_id": 2,
+    "section_key": "section_002",
+    "section_kind": "text_image_section",
+    "role_hint": "general",
+    "placeholder_ids": [
+      "TEXT_002"
+    ],
+    "image_placeholder_ids": [
+      "IMG_001",
+      "IMG_002"
+    ],
+    "block_types": [
+      "fusion_text:inner"
+    ],
+    "text_blocks": 1,
+    "images": 2,
+    "heading_candidates": [],
+    "content_box_items": [],
+    "source_preview": "House Renovations in Southend-on-Sea  Not every renovation starts with a full strip-out. Some homes need a complete house renovation Southen",
+    "text_placeholders": [
+      {
+        "pid": "TEXT_002",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 146,
+        "source_excerpt": "House Renovations in Southend-on-Sea  Not every renovation starts with a full strip-out. Some homes need a complete house renovation Southen"
+      }
+    ]
+  },
+  {
+    "section_id": 3,
+    "section_key": "section_003",
+    "section_kind": "content_box_section",
+    "role_hint": "selling_points",
+    "placeholder_ids": [
+      "TEXT_003",
+      "TEXT_026",
+      "TEXT_027",
+      "TEXT_028",
+      "TEXT_029",
+      "TEXT_030",
+      "TEXT_031"
+    ],
+    "image_placeholder_ids": [],
+    "block_types": [
+      "fusion_text:inner",
+      "fusion_content_box:title",
+      "fusion_content_box:body",
+      "fusion_content_box:title",
+      "fusion_content_box:body",
+      "fusion_content_box:title",
+      "fusion_content_box:body"
+    ],
+    "text_blocks": 7,
+    "images": 0,
+    "heading_candidates": [
+      "TEXT_003",
+      "TEXT_026"
+    ],
+    "content_box_items": [
+      {
+        "title_pid": "TEXT_026",
+        "body_pid": "TEXT_027"
+      },
+      {
+        "title_pid": "TEXT_028",
+        "body_pid": "TEXT_029"
+      },
+      {
+        "title_pid": "TEXT_030",
+        "body_pid": "TEXT_031"
+      }
+    ],
+    "source_preview": "Built for Real Renovation Work",
+    "text_placeholders": [
+      {
+        "pid": "TEXT_003",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 5,
+        "source_excerpt": "Built for Real Renovation Work"
+      },
+      {
+        "pid": "TEXT_026",
+        "block_type": "fusion_content_box",
+        "field": "title",
+        "target_words": 4,
+        "source_excerpt": "Proper sequencing"
+      },
+      {
+        "pid": "TEXT_027",
+        "block_type": "fusion_content_box",
+        "field": "body",
+        "target_words": 60,
+        "source_excerpt": "Renovation work only goes smoothly when the sequence is right. We plan the strip-out, structural work, first fix, plastering, and final fini"
+      },
+      {
+        "pid": "TEXT_028",
+        "block_type": "fusion_content_box",
+        "field": "title",
+        "target_words": 4,
+        "source_excerpt": "Clean site control"
+      },
+      {
+        "pid": "TEXT_029",
+        "block_type": "fusion_content_box",
+        "field": "body",
+        "target_words": 49,
+        "source_excerpt": "A good construction company Southend should keep the site under control, especially in occupied homes. We protect existing finishes, keep ac"
+      },
+      {
+        "pid": "TEXT_030",
+        "block_type": "fusion_content_box",
+        "field": "title",
+        "target_words": 4,
+        "source_excerpt": "Technical finish"
+      },
+      {
+        "pid": "TEXT_031",
+        "block_type": "fusion_content_box",
+        "field": "body",
+        "target_words": 56,
+        "source_excerpt": "The difference between a basic builder and a proper renovation team is in the detail. We focus on straight lines, good junctions, sound repa"
+      }
+    ]
+  },
+  {
+    "section_id": 4,
+    "section_key": "section_004",
+    "section_kind": "multi_column_text_section",
+    "role_hint": "general",
+    "placeholder_ids": [
+      "TEXT_004",
+      "TEXT_005",
+      "TEXT_006"
+    ],
+    "image_placeholder_ids": [],
+    "block_types": [
+      "fusion_text:inner",
+      "fusion_text:inner",
+      "fusion_text:inner"
+    ],
+    "text_blocks": 3,
+    "images": 0,
+    "heading_candidates": [],
+    "content_box_items": [],
+    "source_preview": "Technical Upgrades That Make Old Spaces Work Better  A lot of home renovations Southend projects need more than new paint and flooring. We o",
+    "text_placeholders": [
+      {
+        "pid": "TEXT_004",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 98,
+        "source_excerpt": "Technical Upgrades That Make Old Spaces Work Better  A lot of home renovations Southend projects need more than new paint and flooring. We o"
+      },
+      {
+        "pid": "TEXT_005",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 114,
+        "source_excerpt": "Interior Finishes Matched to the House  On renovation projects, the finish has to suit the property, not fight it. We handle plastering, ski"
+      },
+      {
+        "pid": "TEXT_006",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 96,
+        "source_excerpt": "Full-Service Renovation Delivery  A proper house renovation Southend job is more than a shell and a promise. We can manage strip-out, making"
+      }
+    ]
+  },
+  {
+    "section_id": 5,
+    "section_key": "section_005",
+    "section_kind": "text_image_section",
+    "role_hint": "general",
+    "placeholder_ids": [
+      "TEXT_007"
+    ],
+    "image_placeholder_ids": [
+      "IMG_003",
+      "IMG_004",
+      "IMG_005"
+    ],
+    "block_types": [
+      "fusion_text:inner"
+    ],
+    "text_blocks": 1,
+    "images": 3,
+    "heading_candidates": [],
+    "content_box_items": [],
+    "source_preview": "&lt;h2&gt;Drzwi, okna i wykończenia w renowacjach Southend&lt;/h2&gt;  W &lt;strong&gt;renovations southend&lt;/strong&gt; liczy się nie tyl",
+    "text_placeholders": [
+      {
+        "pid": "TEXT_007",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 161,
+        "source_excerpt": "&lt;h2&gt;Drzwi, okna i wykończenia w renowacjach Southend&lt;/h2&gt;  W &lt;strong&gt;renovations southend&lt;/strong&gt; liczy się nie tyl"
+      }
+    ]
+  },
+  {
+    "section_id": 6,
+    "section_key": "section_006",
+    "section_kind": "multi_column_text_section",
+    "role_hint": "heading_plus_body",
+    "placeholder_ids": [
+      "TEXT_008",
+      "TEXT_009",
+      "TEXT_010"
+    ],
+    "image_placeholder_ids": [],
+    "block_types": [
+      "fusion_text:inner",
+      "fusion_text:inner",
+      "fusion_text:inner"
+    ],
+    "text_blocks": 3,
+    "images": 0,
+    "heading_candidates": [
+      "TEXT_009"
+    ],
+    "content_box_items": [],
+    "source_preview": "&lt;h3&gt;Full-service renovations in Southend-on-Sea&lt;/h3&gt;  We handle house renovations southend from strip-out to final finish, so th",
+    "text_placeholders": [
+      {
+        "pid": "TEXT_008",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 189,
+        "source_excerpt": "&lt;h3&gt;Full-service renovations in Southend-on-Sea&lt;/h3&gt;  We handle house renovations southend from strip-out to final finish, so th"
+      },
+      {
+        "pid": "TEXT_009",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 9,
+        "source_excerpt": "In every case, we offer a full-service renovation build:"
+      },
+      {
+        "pid": "TEXT_010",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 95,
+        "source_excerpt": "&lt;h3&gt;In every case, we deliver a full renovation:&lt;/h3&gt;  &lt;p&gt;From strip-out and prep to plastering, flooring, &lt;a href=\"htt"
+      }
+    ]
+  },
+  {
+    "section_id": 7,
+    "section_key": "section_007",
+    "section_kind": "single_text_section",
+    "role_hint": "general",
+    "placeholder_ids": [
+      "TEXT_011"
+    ],
+    "image_placeholder_ids": [],
+    "block_types": [
+      "fusion_text:inner"
+    ],
+    "text_blocks": 1,
+    "images": 0,
+    "heading_candidates": [],
+    "content_box_items": [],
+    "source_preview": "Renovation Costs in Southend-on-Sea  How much do renovations Southend projects cost? There is no honest fixed answer without seeing the prop",
+    "text_placeholders": [
+      {
+        "pid": "TEXT_011",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 125,
+        "source_excerpt": "Renovation Costs in Southend-on-Sea  How much do renovations Southend projects cost? There is no honest fixed answer without seeing the prop"
+      }
+    ]
+  },
+  {
+    "section_id": 8,
+    "section_key": "section_008",
+    "section_kind": "single_text_section",
+    "role_hint": "heading_plus_body",
+    "placeholder_ids": [
+      "TEXT_012"
+    ],
+    "image_placeholder_ids": [],
+    "block_types": [
+      "fusion_text:inner"
+    ],
+    "text_blocks": 1,
+    "images": 0,
+    "heading_candidates": [
+      "TEXT_012"
+    ],
+    "content_box_items": [],
+    "source_preview": "Request a Renovation Quote",
+    "text_placeholders": [
+      {
+        "pid": "TEXT_012",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 4,
+        "source_excerpt": "Request a Renovation Quote"
+      }
+    ]
+  },
+  {
+    "section_id": 9,
+    "section_key": "section_009",
+    "section_kind": "image_section",
+    "role_hint": "general",
+    "placeholder_ids": [],
+    "image_placeholder_ids": [
+      "IMG_006",
+      "IMG_007",
+      "IMG_008"
+    ],
+    "block_types": [],
+    "text_blocks": 0,
+    "images": 3,
+    "heading_candidates": [],
+    "content_box_items": [],
+    "source_preview": "",
+    "text_placeholders": []
+  },
+  {
+    "section_id": 10,
+    "section_key": "section_010",
+    "section_kind": "single_text_section",
+    "role_hint": "general",
+    "placeholder_ids": [
+      "TEXT_013"
+    ],
+    "image_placeholder_ids": [],
+    "block_types": [
+      "fusion_text:inner"
+    ],
+    "text_blocks": 1,
+    "images": 0,
+    "heading_candidates": [],
+    "content_box_items": [],
+    "source_preview": "Renovation Timelines in Southend  How long does a house renovation Southend project take? It depends on the size of the property, the amount",
+    "text_placeholders": [
+      {
+        "pid": "TEXT_013",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 99,
+        "source_excerpt": "Renovation Timelines in Southend  How long does a house renovation Southend project take? It depends on the size of the property, the amount"
+      }
+    ]
+  },
+  {
+    "section_id": 11,
+    "section_key": "section_011",
+    "section_kind": "multi_column_text_section",
+    "role_hint": "heading_plus_body",
+    "placeholder_ids": [
+      "TEXT_014",
+      "TEXT_015",
+      "TEXT_016"
+    ],
+    "image_placeholder_ids": [],
+    "block_types": [
+      "fusion_text:inner",
+      "fusion_text:inner",
+      "fusion_text:inner"
+    ],
+    "text_blocks": 3,
+    "images": 0,
+    "heading_candidates": [
+      "TEXT_016"
+    ],
+    "content_box_items": [],
+    "source_preview": "Why BTOM Is Different  A lot of renovation companies Southend talk about finish, but the real difference is in how the work is built. We do ",
+    "text_placeholders": [
+      {
+        "pid": "TEXT_014",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 58,
+        "source_excerpt": "Why BTOM Is Different  A lot of renovation companies Southend talk about finish, but the real difference is in how the work is built. We do "
+      },
+      {
+        "pid": "TEXT_015",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 15,
+        "source_excerpt": "Our Southend renovation work is planned like a real build, not a quick cosmetic refresh:"
+      },
+      {
+        "pid": "TEXT_016",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 13,
+        "source_excerpt": "That is why the finished rooms feel solid, line up properly, and last."
+      }
+    ]
+  },
+  {
+    "section_id": 12,
+    "section_key": "section_012",
+    "section_kind": "single_text_section",
+    "role_hint": "general",
+    "placeholder_ids": [
+      "TEXT_017"
+    ],
+    "image_placeholder_ids": [],
+    "block_types": [
+      "fusion_text:inner"
+    ],
+    "text_blocks": 1,
+    "images": 0,
+    "heading_candidates": [],
+    "content_box_items": [],
+    "source_preview": "Planning, Permissions, and Structural Checks  Most internal renovations do not need planning permission, but that does not mean every job ca",
+    "text_placeholders": [
+      {
+        "pid": "TEXT_017",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 103,
+        "source_excerpt": "Planning, Permissions, and Structural Checks  Most internal renovations do not need planning permission, but that does not mean every job ca"
+      }
+    ]
+  },
+  {
+    "section_id": 13,
+    "section_key": "section_013",
+    "section_kind": "single_text_section",
+    "role_hint": "heading_plus_body",
+    "placeholder_ids": [
+      "TEXT_018"
+    ],
+    "image_placeholder_ids": [],
+    "block_types": [
+      "fusion_text:inner"
+    ],
+    "text_blocks": 1,
+    "images": 0,
+    "heading_candidates": [
+      "TEXT_018"
+    ],
+    "content_box_items": [],
+    "source_preview": "Book a Renovation Visit",
+    "text_placeholders": [
+      {
+        "pid": "TEXT_018",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 4,
+        "source_excerpt": "Book a Renovation Visit"
+      }
+    ]
+  },
+  {
+    "section_id": 14,
+    "section_key": "section_014",
+    "section_kind": "text_image_section",
+    "role_hint": "heading_plus_body",
+    "placeholder_ids": [
+      "TEXT_019"
+    ],
+    "image_placeholder_ids": [
+      "IMG_009"
+    ],
+    "block_types": [
+      "fusion_text:inner"
+    ],
+    "text_blocks": 1,
+    "images": 1,
+    "heading_candidates": [
+      "TEXT_019"
+    ],
+    "content_box_items": [],
+    "source_preview": "Renovation FAQs for Southend",
+    "text_placeholders": [
+      {
+        "pid": "TEXT_019",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 4,
+        "source_excerpt": "Renovation FAQs for Southend"
+      }
+    ]
+  },
+  {
+    "section_id": 15,
+    "section_key": "section_015",
+    "section_kind": "faq_section",
+    "role_hint": "faq",
+    "placeholder_ids": [
+      "TEXT_020",
+      "TEXT_021",
+      "TEXT_022",
+      "TEXT_023",
+      "TEXT_024"
+    ],
+    "image_placeholder_ids": [],
+    "block_types": [
+      "fusion_text:inner",
+      "fusion_text:inner",
+      "fusion_text:inner",
+      "fusion_text:inner",
+      "fusion_text:inner"
+    ],
+    "text_blocks": 5,
+    "images": 0,
+    "heading_candidates": [],
+    "content_box_items": [],
+    "source_preview": "How much do renovations Southend projects usually cost? Prices vary a lot because every property is different. A small internal refresh is o",
+    "text_placeholders": [
+      {
+        "pid": "TEXT_020",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 56,
+        "source_excerpt": "How much do renovations Southend projects usually cost? Prices vary a lot because every property is different. A small internal refresh is o"
+      },
+      {
+        "pid": "TEXT_021",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 47,
+        "source_excerpt": "Can you renovate an occupied home? Yes, in many cases we can phase the work so the house stays usable. That needs careful planning, clear ac"
+      },
+      {
+        "pid": "TEXT_022",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 43,
+        "source_excerpt": "Do renovations need structural work? Not always, but older properties often benefit from it when walls are coming out, openings are changing"
+      },
+      {
+        "pid": "TEXT_023",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 52,
+        "source_excerpt": "How long does property refurbishment take? It depends on the scope, the condition of the house, and the amount of making good required. A st"
+      },
+      {
+        "pid": "TEXT_024",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 37,
+        "source_excerpt": "What should I plan first? Start with the layout, the budget, and the rooms that matter most. Then decide whether you need kitchen renovation"
+      }
+    ]
+  },
+  {
+    "section_id": 16,
+    "section_key": "section_016",
+    "section_kind": "image_section",
+    "role_hint": "general",
+    "placeholder_ids": [],
+    "image_placeholder_ids": [
+      "IMG_010",
+      "IMG_011",
+      "IMG_012",
+      "IMG_013",
+      "IMG_014",
+      "IMG_015",
+      "IMG_016",
+      "IMG_017",
+      "IMG_018",
+      "IMG_019",
+      "IMG_020",
+      "IMG_021",
+      "IMG_022",
+      "IMG_023"
+    ],
+    "block_types": [],
+    "text_blocks": 0,
+    "images": 14,
+    "heading_candidates": [],
+    "content_box_items": [],
+    "source_preview": "",
+    "text_placeholders": []
+  },
+  {
+    "section_id": 17,
+    "section_key": "section_017",
+    "section_kind": "single_text_section",
+    "role_hint": "cta_or_closing",
+    "placeholder_ids": [
+      "TEXT_025"
+    ],
+    "image_placeholder_ids": [],
+    "block_types": [
+      "fusion_text:inner"
+    ],
+    "text_blocks": 1,
+    "images": 0,
+    "heading_candidates": [],
+    "content_box_items": [],
+    "source_preview": "Get a Renovation Quote in Southend-on-Sea  If you are planning renovations Southend homeowners can trust, BTOM Construction Limited is ready",
+    "text_placeholders": [
+      {
+        "pid": "TEXT_025",
+        "block_type": "fusion_text",
+        "field": "inner",
+        "target_words": 73,
+        "source_excerpt": "Get a Renovation Quote in Southend-on-Sea  If you are planning renovations Southend homeowners can trust, BTOM Construction Limited is ready"
+      }
+    ]
+  }
+]
+
+Generated structured keys:
+- count: 31
+- keys: TEXT_001, TEXT_002, TEXT_003, TEXT_004, TEXT_005, TEXT_006, TEXT_007, TEXT_008, TEXT_009, TEXT_010, TEXT_011, TEXT_012, TEXT_013, TEXT_014, TEXT_015, TEXT_016, TEXT_017, TEXT_018, TEXT_019, TEXT_020, TEXT_021, TEXT_022, TEXT_023, TEXT_024, TEXT_025, TEXT_026, TEXT_027, TEXT_028, TEXT_029, TEXT_030, TEXT_031
+
+Mapping success/failure:
+- success: 31
+- missing: 0
+- changed_text_placeholders: 21
+- unchanged_text_placeholders: 10
+- changed_image_placeholders: 0
+- runtime_mapping_report:
+{
+  "placeholders_requested": 31,
+  "generated_keys": 31,
+  "missing_from_page_json": [],
+  "fallback_count": 0,
+  "mapped_success": 31
+}

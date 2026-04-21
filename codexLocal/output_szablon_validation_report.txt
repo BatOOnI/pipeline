@@ -1,0 +1,24 @@
+AVADA Validation Report
+======================
+
+Elementy wykryte podczas skanowania:
+- fusion_text: 25
+- fusion_content_box_title: 3
+- fusion_content_box_body: 3
+- fusion_imageframe: 9
+- fusion_image: 14
+- Lacznie placeholderow: 54
+- Zmienione placeholdery: 21
+
+Krytyczne problemy:
+- Brak
+
+Ostrzezenia:
+- Wykryto stare frazy domenowe: garden room, garden rooms, reinforced slab, southend-on-sea
+- Brak strategii Etap 1 - content byl generowany fallbackiem blok-po-bloku.
+- Sekcje niezmienione/prawie niezmienione ze zrodla: TEXT_003(100%), TEXT_026(100%), TEXT_027(95%), TEXT_028(100%), TEXT_029(91%), TEXT_030(100%), TEXT_009(100%), TEXT_012(100%), TEXT_015(100%), TEXT_016(100%)
+- Niezmienione tresci fusion_content_box: TEXT_026 (title), TEXT_028 (title), TEXT_030 (title)
+- Sekcja 3: mozliwy mismatch naglowka i tresci (TEXT_026 -> TEXT_027).
+- Sekcja 3: mozliwy mismatch naglowka i tresci (TEXT_030 -> TEXT_031).
+- Sekcja 3: mismatch content_box title/body (TEXT_026 -> TEXT_027).
+- Sekcja 3: mismatch content_box title/body (TEXT_030 -> TEXT_031).

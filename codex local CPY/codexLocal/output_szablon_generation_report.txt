@@ -3,7 +3,7 @@ AVADA Generation Report
 
 Runtime modes:
 - generation_mode: text-only
-- language_mode: english-only
+- language_mode: auto
 - link_mode: strict-html-internal
 - format_mode: avada-strict
 
@@ -11,7 +11,6 @@ Detected AVADA block types:
 - fusion_text: 25
 - fusion_content_box_title: 3
 - fusion_content_box_body: 3
-- fusion_checklist_item: 17
 - fusion_imageframe: 9
 - fusion_image: 14
 
@@ -32,7 +31,6 @@ Inferred logical sections:
     "text_blocks": 1,
     "images": 0,
     "heading_candidates": [],
-    "checklist_item_ids": [],
     "content_box_items": [],
     "source_preview": "<h1 style=\"text-align: center;\"><span style=\"color: #9fa0ab;\"><span style=\"color: #ff7351;\">Garden Rooms in Southend-on-Sea – Practical, Hig",
     "text_placeholders": [
@@ -63,7 +61,6 @@ Inferred logical sections:
     "text_blocks": 1,
     "images": 2,
     "heading_candidates": [],
-    "checklist_item_ids": [],
     "content_box_items": [],
     "source_preview": "<h2><span style=\"color: #9fa0ab;\"><span style=\"color: #ff7351;\">Bespoke Garden Rooms in Southend-on-Sea</span></span></h2> &nbsp; <p data-st",
     "text_placeholders": [
@@ -106,7 +103,6 @@ Inferred logical sections:
       "TEXT_003",
       "TEXT_026"
     ],
-    "checklist_item_ids": [],
     "content_box_items": [
       {
         "title_pid": "TEXT_026",
@@ -193,7 +189,6 @@ Inferred logical sections:
     "text_blocks": 3,
     "images": 0,
     "heading_candidates": [],
-    "checklist_item_ids": [],
     "content_box_items": [],
     "source_preview": "<h2 data-start=\"4915\" data-end=\"4963\"><span style=\"color: #ff7351;\"><strong data-start=\"4915\" data-end=\"4963\">Insulation, Membranes and Year",
     "text_placeholders": [
@@ -239,7 +234,6 @@ Inferred logical sections:
     "text_blocks": 1,
     "images": 3,
     "heading_candidates": [],
-    "checklist_item_ids": [],
     "content_box_items": [],
     "source_preview": "<h2 data-start=\"8044\" data-end=\"8084\"><span style=\"color: #ff7351;\"><strong data-start=\"8044\" data-end=\"8084\">Doors, Windows and Exterior Fi",
     "text_placeholders": [
@@ -255,47 +249,23 @@ Inferred logical sections:
   {
     "section_id": 6,
     "section_key": "section_006",
-    "section_kind": "checklist_section",
-    "role_hint": "feature_checklist",
+    "section_kind": "multi_column_text_section",
+    "role_hint": "heading_plus_body",
     "placeholder_ids": [
       "TEXT_008",
       "TEXT_009",
-      "TEXT_032",
-      "TEXT_033",
-      "TEXT_034",
-      "TEXT_035",
-      "TEXT_036",
-      "TEXT_037",
-      "TEXT_038",
       "TEXT_010"
     ],
     "image_placeholder_ids": [],
     "block_types": [
       "fusion_text:inner",
       "fusion_text:inner",
-      "fusion_li_item:inner",
-      "fusion_li_item:inner",
-      "fusion_li_item:inner",
-      "fusion_li_item:inner",
-      "fusion_li_item:inner",
-      "fusion_li_item:inner",
-      "fusion_li_item:inner",
       "fusion_text:inner"
     ],
-    "text_blocks": 10,
+    "text_blocks": 3,
     "images": 0,
     "heading_candidates": [
-      "TEXT_009",
-      "TEXT_032"
-    ],
-    "checklist_item_ids": [
-      "TEXT_032",
-      "TEXT_033",
-      "TEXT_034",
-      "TEXT_035",
-      "TEXT_036",
-      "TEXT_037",
-      "TEXT_038"
+      "TEXT_009"
     ],
     "content_box_items": [],
     "source_preview": "<h2 data-start=\"8758\" data-end=\"8785\"><span style=\"color: #ff7351;\"><strong data-start=\"8758\" data-end=\"8785\"><a href=\"https://btomconstruct",
@@ -313,55 +283,6 @@ Inferred logical sections:
         "field": "inner",
         "target_words": 8,
         "source_excerpt": "<h3><span style=\"color: #9fa0ab;\"><b>In every case, we offer a full-service build:</b></span></h3>"
-      },
-      {
-        "pid": "TEXT_032",
-        "block_type": "fusion_li_item",
-        "field": "inner",
-        "target_words": 4,
-        "source_excerpt": "electrical installation"
-      },
-      {
-        "pid": "TEXT_033",
-        "block_type": "fusion_li_item",
-        "field": "inner",
-        "target_words": 4,
-        "source_excerpt": "certified electrical work"
-      },
-      {
-        "pid": "TEXT_034",
-        "block_type": "fusion_li_item",
-        "field": "inner",
-        "target_words": 4,
-        "source_excerpt": "sockets and lighting"
-      },
-      {
-        "pid": "TEXT_035",
-        "block_type": "fusion_li_item",
-        "field": "inner",
-        "target_words": 4,
-        "source_excerpt": "electric radiators"
-      },
-      {
-        "pid": "TEXT_036",
-        "block_type": "fusion_li_item",
-        "field": "inner",
-        "target_words": 4,
-        "source_excerpt": "flooring"
-      },
-      {
-        "pid": "TEXT_037",
-        "block_type": "fusion_li_item",
-        "field": "inner",
-        "target_words": 5,
-        "source_excerpt": "plasterboard and paint where required"
-      },
-      {
-        "pid": "TEXT_038",
-        "block_type": "fusion_li_item",
-        "field": "inner",
-        "target_words": 7,
-        "source_excerpt": "<a href=\"https://btomconstruction.co.uk/interior-finishing-southend/\">internal finishing</a> to suit the intended use"
       },
       {
         "pid": "TEXT_010",
@@ -387,7 +308,6 @@ Inferred logical sections:
     "text_blocks": 1,
     "images": 0,
     "heading_candidates": [],
-    "checklist_item_ids": [],
     "content_box_items": [],
     "source_preview": "<h2 data-start=\"9456\" data-end=\"9496\"><span style=\"color: #ff7351;\"><strong data-start=\"9456\" data-end=\"9496\">Garden Room Costs in Southend-",
     "text_placeholders": [
@@ -417,7 +337,6 @@ Inferred logical sections:
     "heading_candidates": [
       "TEXT_012"
     ],
-    "checklist_item_ids": [],
     "content_box_items": [],
     "source_preview": "<p style=\"text-align: center;\"><strong><span style=\"color: #ff7351;\"><a style=\"color: #ff7351;\" href=\"https://btomconstruction.co.uk/contact",
     "text_placeholders": [
@@ -445,7 +364,6 @@ Inferred logical sections:
     "text_blocks": 0,
     "images": 3,
     "heading_candidates": [],
-    "checklist_item_ids": [],
     "content_box_items": [],
     "source_preview": "",
     "text_placeholders": []
@@ -465,7 +383,6 @@ Inferred logical sections:
     "text_blocks": 1,
     "images": 0,
     "heading_candidates": [],
-    "checklist_item_ids": [],
     "content_box_items": [],
     "source_preview": "<h2 data-start=\"10655\" data-end=\"10701\"><span style=\"color: #ff7351;\"><strong data-start=\"10655\" data-end=\"10701\">How Long Does a Garden Roo",
     "text_placeholders": [
@@ -481,57 +398,22 @@ Inferred logical sections:
   {
     "section_id": 11,
     "section_key": "section_011",
-    "section_kind": "checklist_section",
-    "role_hint": "feature_checklist",
+    "section_kind": "multi_column_text_section",
+    "role_hint": "general",
     "placeholder_ids": [
       "TEXT_014",
       "TEXT_015",
-      "TEXT_039",
-      "TEXT_040",
-      "TEXT_041",
-      "TEXT_042",
-      "TEXT_043",
-      "TEXT_044",
-      "TEXT_045",
-      "TEXT_046",
-      "TEXT_047",
-      "TEXT_048",
       "TEXT_016"
     ],
     "image_placeholder_ids": [],
     "block_types": [
       "fusion_text:inner",
       "fusion_text:inner",
-      "fusion_li_item:inner",
-      "fusion_li_item:inner",
-      "fusion_li_item:inner",
-      "fusion_li_item:inner",
-      "fusion_li_item:inner",
-      "fusion_li_item:inner",
-      "fusion_li_item:inner",
-      "fusion_li_item:inner",
-      "fusion_li_item:inner",
-      "fusion_li_item:inner",
       "fusion_text:inner"
     ],
-    "text_blocks": 13,
+    "text_blocks": 3,
     "images": 0,
-    "heading_candidates": [
-      "TEXT_039",
-      "TEXT_040"
-    ],
-    "checklist_item_ids": [
-      "TEXT_039",
-      "TEXT_040",
-      "TEXT_041",
-      "TEXT_042",
-      "TEXT_043",
-      "TEXT_044",
-      "TEXT_045",
-      "TEXT_046",
-      "TEXT_047",
-      "TEXT_048"
-    ],
+    "heading_candidates": [],
     "content_box_items": [],
     "source_preview": "<h2 data-start=\"11371\" data-end=\"11441\"><span style=\"color: #ff7351;\"><strong data-start=\"11371\" data-end=\"11441\">Why Our Garden Rooms Are B",
     "text_placeholders": [
@@ -548,76 +430,6 @@ Inferred logical sections:
         "field": "inner",
         "target_words": 16,
         "source_excerpt": "Our <strong data-start=\"11699\" data-end=\"11734\">garden rooms in Southend-on-Sea</strong> are different because they are built more like real"
-      },
-      {
-        "pid": "TEXT_039",
-        "block_type": "fusion_li_item",
-        "field": "inner",
-        "target_words": 4,
-        "source_excerpt": "reinforced slab base"
-      },
-      {
-        "pid": "TEXT_040",
-        "block_type": "fusion_li_item",
-        "field": "inner",
-        "target_words": 4,
-        "source_excerpt": "ventilated floor system"
-      },
-      {
-        "pid": "TEXT_041",
-        "block_type": "fusion_li_item",
-        "field": "inner",
-        "target_words": 4,
-        "source_excerpt": "treated structural timber"
-      },
-      {
-        "pid": "TEXT_042",
-        "block_type": "fusion_li_item",
-        "field": "inner",
-        "target_words": 4,
-        "source_excerpt": "Celotex insulation"
-      },
-      {
-        "pid": "TEXT_043",
-        "block_type": "fusion_li_item",
-        "field": "inner",
-        "target_words": 4,
-        "source_excerpt": "proper membranes"
-      },
-      {
-        "pid": "TEXT_044",
-        "block_type": "fusion_li_item",
-        "field": "inner",
-        "target_words": 6,
-        "source_excerpt": "double glazed domestic-quality doors and windows"
-      },
-      {
-        "pid": "TEXT_045",
-        "block_type": "fusion_li_item",
-        "field": "inner",
-        "target_words": 4,
-        "source_excerpt": "certified electrics"
-      },
-      {
-        "pid": "TEXT_046",
-        "block_type": "fusion_li_item",
-        "field": "inner",
-        "target_words": 5,
-        "source_excerpt": "drainage considered from day one"
-      },
-      {
-        "pid": "TEXT_047",
-        "block_type": "fusion_li_item",
-        "field": "inner",
-        "target_words": 4,
-        "source_excerpt": "durable roofing systems"
-      },
-      {
-        "pid": "TEXT_048",
-        "block_type": "fusion_li_item",
-        "field": "inner",
-        "target_words": 4,
-        "source_excerpt": "proper long-term weather resistance"
       },
       {
         "pid": "TEXT_016",
@@ -643,7 +455,6 @@ Inferred logical sections:
     "text_blocks": 1,
     "images": 0,
     "heading_candidates": [],
-    "checklist_item_ids": [],
     "content_box_items": [],
     "source_preview": "<h2 data-start=\"12200\" data-end=\"12266\"><span style=\"color: #ff7351;\"><strong data-start=\"12200\" data-end=\"12266\">Do You Need Planning Permi",
     "text_placeholders": [
@@ -673,7 +484,6 @@ Inferred logical sections:
     "heading_candidates": [
       "TEXT_018"
     ],
-    "checklist_item_ids": [],
     "content_box_items": [],
     "source_preview": "<p style=\"text-align: center;\"><a href=\"https://btomconstruction.co.uk/contact/\"><span style=\"color: #ff7351;\"><strong>Request a garden room",
     "text_placeholders": [
@@ -705,7 +515,6 @@ Inferred logical sections:
     "heading_candidates": [
       "TEXT_019"
     ],
-    "checklist_item_ids": [],
     "content_box_items": [],
     "source_preview": "<h2><span style=\"color: #ff7351;\">Frequently Asked Questions About Garden Rooms in Southend-on-Sea</span></h2>",
     "text_placeholders": [
@@ -741,7 +550,6 @@ Inferred logical sections:
     "text_blocks": 5,
     "images": 0,
     "heading_candidates": [],
-    "checklist_item_ids": [],
     "content_box_items": [],
     "source_preview": "<span style=\"color: #ff7351;\"><strong data-start=\"13380\" data-end=\"13436\">How much does a garden room cost in Southend-on-Sea?</strong></spa",
     "text_placeholders": [
@@ -808,7 +616,6 @@ Inferred logical sections:
     "text_blocks": 0,
     "images": 14,
     "heading_candidates": [],
-    "checklist_item_ids": [],
     "content_box_items": [],
     "source_preview": "",
     "text_placeholders": []
@@ -828,7 +635,6 @@ Inferred logical sections:
     "text_blocks": 1,
     "images": 0,
     "heading_candidates": [],
-    "checklist_item_ids": [],
     "content_box_items": [],
     "source_preview": "<h2 data-start=\"14813\" data-end=\"14864\"><span style=\"color: #ff7351;\"><strong data-start=\"14813\" data-end=\"14864\">Get a Quote for Garden Roo",
     "text_placeholders": [
@@ -844,20 +650,20 @@ Inferred logical sections:
 ]
 
 Generated structured keys:
-- count: 48
-- keys: TEXT_001, TEXT_002, TEXT_003, TEXT_004, TEXT_005, TEXT_006, TEXT_007, TEXT_008, TEXT_009, TEXT_010, TEXT_011, TEXT_012, TEXT_013, TEXT_014, TEXT_015, TEXT_016, TEXT_017, TEXT_018, TEXT_019, TEXT_020, TEXT_021, TEXT_022, TEXT_023, TEXT_024, TEXT_025, TEXT_026, TEXT_027, TEXT_028, TEXT_029, TEXT_030, TEXT_031, TEXT_032, TEXT_033, TEXT_034, TEXT_035, TEXT_036, TEXT_037, TEXT_038, TEXT_039, TEXT_040, TEXT_041, TEXT_042, TEXT_043, TEXT_044, TEXT_045, TEXT_046, TEXT_047, TEXT_048
+- count: 31
+- keys: TEXT_001, TEXT_002, TEXT_003, TEXT_004, TEXT_005, TEXT_006, TEXT_007, TEXT_008, TEXT_009, TEXT_010, TEXT_011, TEXT_012, TEXT_013, TEXT_014, TEXT_015, TEXT_016, TEXT_017, TEXT_018, TEXT_019, TEXT_020, TEXT_021, TEXT_022, TEXT_023, TEXT_024, TEXT_025, TEXT_026, TEXT_027, TEXT_028, TEXT_029, TEXT_030, TEXT_031
 
 Mapping success/failure:
-- success: 48
+- success: 31
 - missing: 0
-- changed_text_placeholders: 48
+- changed_text_placeholders: 31
 - unchanged_text_placeholders: 0
 - changed_image_placeholders: 0
 - runtime_mapping_report:
 {
-  "placeholders_requested": 48,
-  "generated_keys": 48,
+  "placeholders_requested": 31,
+  "generated_keys": 31,
   "missing_from_page_json": [],
   "fallback_count": 0,
-  "mapped_success": 48
+  "mapped_success": 31
 }

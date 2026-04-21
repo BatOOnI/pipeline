@@ -1,0 +1,17 @@
+AVADA Validation Report
+======================
+
+Elementy wykryte podczas skanowania:
+- fusion_text: 25
+- fusion_content_box_title: 3
+- fusion_content_box_body: 3
+- fusion_imageframe: 9
+- fusion_image: 14
+- Lacznie placeholderow: 54
+- Zmienione placeholdery: 0
+
+Krytyczne problemy:
+- Silna kontaminacja semantyczna ze zrodla (source-topic terms): data-start, data-end, span, room, color, ff7351, href, build, more, around, finish, built
+
+Ostrzezenia:
+- Wykryto stare frazy domenowe: garden room, garden rooms, reinforced slab, southend-on-sea

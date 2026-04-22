@@ -16,6 +16,9 @@ class AvadaParser:
         r"\[fusion_li_item\b[^\]]*\](.*?)\[/fusion_li_item\]", re.IGNORECASE | re.DOTALL
     )
     FUSION_IMAGE_RE = re.compile(r"\[fusion_image\b([^\]]*?)\s*/\]", re.IGNORECASE | re.DOTALL)
+    FUSION_IMAGES_RE = re.compile(
+        r"\[fusion_images\b([^\]]*)\](.*?)\[/fusion_images\]", re.IGNORECASE | re.DOTALL
+    )
 
     TITLE_ATTR_RE = re.compile(r'title\s*=\s*"([^"]*)"', re.IGNORECASE | re.DOTALL)
     IMAGE_ATTR_RE = re.compile(r'image\s*=\s*"([^"]*)"', re.IGNORECASE | re.DOTALL)
@@ -157,7 +160,43 @@ class AvadaParser:
             counts["fusion_imageframe"] += 1
             img_idx += 1
 
+        gallery_ranges: List[Tuple[int, int]] = []
+        for gm in self.FUSION_IMAGES_RE.finditer(raw):
+            gallery_ranges.append((gm.start(), gm.end()))
+            section_id = self._section_for_pos(gm.start(), sections)
+            inner = gm.group(2)
+            inner_start = gm.start(2)
+            for m in self.FUSION_IMAGE_RE.finditer(inner):
+                attrs = m.group(1)
+                image_attr = self.IMAGE_ATTR_RE.search(attrs)
+                if not image_attr:
+                    continue
+                placeholders.append(
+                    Placeholder(
+                        pid=f"IMG_{img_idx:03d}",
+                        kind="image",
+                        block_type="fusion_image",
+                        field="image",
+                        original=image_attr.group(1).strip(),
+                        suggested_words=0,
+                        start=inner_start + m.start(1) + image_attr.start(1),
+                        end=inner_start + m.start(1) + image_attr.end(1),
+                        section_id=section_id,
+                        in_gallery=True,
+                    )
+                )
+                counts["fusion_image"] += 1
+                img_idx += 1
+
+        def in_gallery_block(pos: int) -> bool:
+            for gs, ge in gallery_ranges:
+                if gs <= pos <= ge:
+                    return True
+            return False
+
         for m in self.FUSION_IMAGE_RE.finditer(raw):
+            if in_gallery_block(m.start()):
+                continue
             section_id = self._section_for_pos(m.start(), sections)
             attrs = m.group(1)
             image_attr = self.IMAGE_ATTR_RE.search(attrs)
@@ -174,6 +213,7 @@ class AvadaParser:
                     start=m.start(1) + image_attr.start(1),
                     end=m.start(1) + image_attr.end(1),
                     section_id=section_id,
+                    in_gallery=False,
                 )
             )
             counts["fusion_image"] += 1

@@ -13,6 +13,7 @@ class Placeholder:
     start: int
     end: int
     section_id: int
+    in_gallery: bool = False
 
 
 @dataclass

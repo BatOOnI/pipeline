@@ -94,19 +94,33 @@ class SecureApiKeyStore:
             self.store_file.unlink()
 
 
+class SecureWpPasswordStore(SecureApiKeyStore):
+    def __init__(self) -> None:
+        home = Path(os.getenv("LOCALAPPDATA", str(Path.home())))
+        self.store_file = home / "AvadaSeoGenerator" / "wp_app_password.dat"
+
+
 class SessionDraftStore:
     def __init__(self) -> None:
         home = Path(os.getenv("LOCALAPPDATA", str(Path.home())))
         self.file_path = home / "AvadaSeoGenerator" / "session_draft.json"
 
     def save(self, data: Dict[str, Any]) -> None:
-        self.file_path.parent.mkdir(parents=True, exist_ok=True)
-        self.file_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.save_to_path(data, str(self.file_path))
 
     def load(self) -> Dict[str, Any]:
-        if not self.file_path.exists():
+        return self.load_from_path(str(self.file_path))
+
+    def save_to_path(self, data: Dict[str, Any], path: str) -> None:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def load_from_path(self, path: str) -> Dict[str, Any]:
+        p = Path(path)
+        if not p.exists():
             return {}
         try:
-            return json.loads(self.file_path.read_text(encoding="utf-8"))
+            return json.loads(p.read_text(encoding="utf-8"))
         except Exception:
             return {}

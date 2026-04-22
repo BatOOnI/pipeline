@@ -374,7 +374,32 @@ class AvadaSeoEngine:
         if not checklist_placeholders:
             return {"total_items": 0, "flagged_items": 0, "items": []}
 
-        source_terms = self._source_topic_terms(limit=30)
+        contamination_terms = self._build_contamination_terms(global_prompt)
+
+        review_items: List[Dict[str, object]] = []
+        for ph in checklist_placeholders:
+            value = replacements.get(ph.pid, ph.original) if replacements else ph.original
+            low = value.lower()
+            hits = [t for t in contamination_terms if re.search(rf"\b{re.escape(t)}\b", low)]
+            review_items.append(
+                {
+                    "pid": ph.pid,
+                    "section_id": ph.section_id,
+                    "text": value.strip(),
+                    "changed": self._normalize_text(value) != self._normalize_text(ph.original),
+                    "contamination_terms": hits[:12],
+                }
+            )
+
+        flagged = len([x for x in review_items if x["contamination_terms"]])
+        return {
+            "total_items": len(review_items),
+            "flagged_items": flagged,
+            "items": review_items,
+        }
+
+    def _build_contamination_terms(self, global_prompt: str, source_limit: int = 35) -> List[str]:
+        source_terms = self._source_topic_terms(limit=source_limit)
         target_terms = set(self._target_terms_from_prompt(global_prompt))
         contamination_terms = [t for t in source_terms if t not in target_terms]
         contamination_terms.extend([kw for kw in GARDEN_TERMS if kw not in target_terms])
@@ -402,12 +427,20 @@ class AvadaSeoEngine:
             "systems",
         }
         domain_tokens = set(re.findall(r"[a-z0-9-]{3,}", " ".join(self.internal_domains).lower()))
-        contamination_terms = sorted(
-            set(t for t in contamination_terms if t not in ignore_terms and t not in domain_tokens)
-        )
+        return sorted(set(t for t in contamination_terms if t not in ignore_terms and t not in domain_tokens))
 
+    def text_contamination_review(
+        self,
+        replacements: Optional[Dict[str, str]],
+        global_prompt: str,
+    ) -> Dict[str, object]:
+        text_placeholders = [p for p in self.placeholders if p.kind == "text"]
+        if not text_placeholders:
+            return {"total_items": 0, "flagged_items": 0, "items": []}
+
+        contamination_terms = self._build_contamination_terms(global_prompt)
         review_items: List[Dict[str, object]] = []
-        for ph in checklist_placeholders:
+        for ph in text_placeholders:
             value = replacements.get(ph.pid, ph.original) if replacements else ph.original
             low = value.lower()
             hits = [t for t in contamination_terms if re.search(rf"\b{re.escape(t)}\b", low)]
@@ -415,18 +448,15 @@ class AvadaSeoEngine:
                 {
                     "pid": ph.pid,
                     "section_id": ph.section_id,
+                    "block_type": ph.block_type,
+                    "field": ph.field,
                     "text": value.strip(),
                     "changed": self._normalize_text(value) != self._normalize_text(ph.original),
                     "contamination_terms": hits[:12],
                 }
             )
-
         flagged = len([x for x in review_items if x["contamination_terms"]])
-        return {
-            "total_items": len(review_items),
-            "flagged_items": flagged,
-            "items": review_items,
-        }
+        return {"total_items": len(review_items), "flagged_items": flagged, "items": review_items}
 
     @staticmethod
     def _is_link_block_style(text: str) -> bool:
@@ -597,6 +627,11 @@ class AvadaSeoEngine:
                 warnings.append(
                     f"Checklist contamination: {checklist_qc['flagged_items']}/{checklist_qc['total_items']} pozycji ma stare terminy."
                 )
+            text_qc = self.text_contamination_review(replacements, global_prompt)
+            if text_qc["flagged_items"]:
+                warnings.append(
+                    f"Text contamination: {text_qc['flagged_items']}/{text_qc['total_items']} blokow ma stare terminy."
+                )
 
         if replacements:
             text_placeholders = [p for p in self.placeholders if p.kind == "text"]
@@ -736,3 +771,448 @@ class AvadaSeoEngine:
             lines.append("- runtime_mapping_report:")
             lines.append(json.dumps(self.last_mapping_report, ensure_ascii=False, indent=2))
         return "\n".join(lines)
+
+    def build_polishing_units(self, replacements: Dict[str, str]) -> List[Dict[str, object]]:
+        by_section: Dict[int, List[Placeholder]] = {}
+        for ph in self.placeholders:
+            if ph.kind != "text":
+                continue
+            by_section.setdefault(ph.section_id, []).append(ph)
+
+        units: List[Dict[str, object]] = []
+        for section_id in sorted(by_section.keys()):
+            items = sorted(by_section[section_id], key=lambda x: x.start)
+            used: set[str] = set()
+            cb_titles = [p for p in items if p.block_type == "fusion_content_box" and p.field == "title"]
+            cb_bodies = [p for p in items if p.block_type == "fusion_content_box" and p.field == "body"]
+            for idx, title_ph in enumerate(cb_titles):
+                body_ph = cb_bodies[idx] if idx < len(cb_bodies) else None
+                pids = [title_ph.pid] + ([body_ph.pid] if body_ph else [])
+                unit_id = f"SECTION_{section_id:03d}_CB_{idx+1:02d}"
+                title_val = replacements.get(title_ph.pid, title_ph.original)
+                body_val = replacements.get(body_ph.pid, body_ph.original) if body_ph else ""
+                text = f"TITLE: {title_val}\nBODY: {body_val}".strip()
+                units.append(
+                    {
+                        "unit_id": unit_id,
+                        "section_id": section_id,
+                        "unit_type": "fusion_content_box",
+                        "placeholder_ids": pids,
+                        "text": text,
+                    }
+                )
+                used.update(pids)
+
+            checklist_items = [p for p in items if p.block_type == "fusion_li_item"]
+            if checklist_items:
+                pids = [p.pid for p in checklist_items]
+                text_lines = [f"- {replacements.get(p.pid, p.original)}" for p in checklist_items]
+                units.append(
+                    {
+                        "unit_id": f"SECTION_{section_id:03d}_CHECKLIST",
+                        "section_id": section_id,
+                        "unit_type": "fusion_checklist",
+                        "placeholder_ids": pids,
+                        "text": "\n".join(text_lines),
+                    }
+                )
+                used.update(pids)
+
+            for ph in items:
+                if ph.pid in used:
+                    continue
+                units.append(
+                    {
+                        "unit_id": ph.pid,
+                        "section_id": section_id,
+                        "unit_type": ph.block_type,
+                        "placeholder_ids": [ph.pid],
+                        "text": replacements.get(ph.pid, ph.original),
+                    }
+                )
+
+        return units
+
+    @staticmethod
+    def _default_score_block() -> Dict[str, float]:
+        return {
+            "seo": 8.0,
+            "readability": 8.0,
+            "conversion": 8.0,
+            "topic_cleanliness": 8.0,
+            "internal_linking": 8.0,
+            "overall": 8.0,
+        }
+
+    @staticmethod
+    def _coerce_score_block(raw: object) -> Dict[str, float]:
+        base = AvadaSeoEngine._default_score_block()
+        if not isinstance(raw, dict):
+            return base
+        out: Dict[str, float] = {}
+        for k, v in base.items():
+            val = raw.get(k, v)
+            try:
+                fv = float(val)
+            except Exception:
+                fv = float(v)
+            fv = max(1.0, min(10.0, fv))
+            out[k] = round(fv * 4.0) / 4.0
+        return out
+
+    def _coerce_polishing_result(self, raw: Dict[str, object], units: List[Dict[str, object]]) -> Dict[str, object]:
+        page_scores = self._coerce_score_block(raw.get("page_scores"))
+        issues = raw.get("issues", [])
+        if not isinstance(issues, list):
+            issues = []
+        units_raw = raw.get("units", [])
+        by_id: Dict[str, Dict[str, object]] = {}
+        if isinstance(units_raw, list):
+            for u in units_raw:
+                if isinstance(u, dict) and isinstance(u.get("unit_id"), str):
+                    by_id[str(u["unit_id"])] = u
+
+        units_final: List[Dict[str, object]] = []
+        for u in units:
+            uid = str(u.get("unit_id"))
+            found = by_id.get(uid, {})
+            u_issues = found.get("issues", [])
+            if not isinstance(u_issues, list):
+                u_issues = []
+            units_final.append(
+                {
+                    "unit_id": uid,
+                    "unit_type": str(u.get("unit_type", "")),
+                    "placeholder_ids": list(u.get("placeholder_ids", [])),
+                    "original_text": str(u.get("text", "")),
+                    "scores": self._coerce_score_block(found.get("scores")),
+                    "issues": u_issues,
+                    "suggested_fix": str(found.get("suggested_fix", "")),
+                    "polished_text": str(found.get("polished_text", u.get("text", ""))),
+                }
+            )
+        return {"page_scores": page_scores, "issues": issues, "units": units_final}
+
+    def _aggregate_unit_scores(self, units: List[Dict[str, object]]) -> Dict[str, float]:
+        if not units:
+            return self._default_score_block()
+        keys = list(self._default_score_block().keys())
+        sums: Dict[str, float] = {k: 0.0 for k in keys}
+        count = 0
+        for unit in units:
+            scores = unit.get("scores", {})
+            if not isinstance(scores, dict):
+                continue
+            count += 1
+            for k in keys:
+                try:
+                    sums[k] += float(scores.get(k, 8.0))
+                except Exception:
+                    sums[k] += 8.0
+        if count == 0:
+            return self._default_score_block()
+        out: Dict[str, float] = {}
+        for k in keys:
+            out[k] = round((sums[k] / count) * 4.0) / 4.0
+        return self._coerce_score_block(out)
+
+    def _build_local_polishing_baseline(
+        self,
+        units: List[Dict[str, object]],
+        global_prompt: str,
+    ) -> Dict[str, Dict[str, object]]:
+        contamination_terms = self._build_contamination_terms(global_prompt)
+        target_terms = set(self._target_terms_from_prompt(global_prompt))
+        req_lang = self._required_language(global_prompt, "auto")
+        out: Dict[str, Dict[str, object]] = {}
+
+        for unit in units:
+            unit_id = str(unit.get("unit_id", ""))
+            text = str(unit.get("text", ""))
+            low = text.lower()
+            scores = self._default_score_block()
+            issues: List[Dict[str, object]] = []
+
+            contamination_hits = [t for t in contamination_terms if re.search(rf"\b{re.escape(t)}\b", low)]
+            if contamination_hits:
+                drop = min(3.0, 0.5 + 0.35 * len(contamination_hits))
+                scores["topic_cleanliness"] = max(1.0, scores["topic_cleanliness"] - drop)
+                issues.append(
+                    {
+                        "id": f"{unit_id}_topic_001",
+                        "severity": "medium" if len(contamination_hits) <= 2 else "high",
+                        "category": "topic_cleanliness",
+                        "message": "Possible source-topic contamination: " + ", ".join(contamination_hits[:8]),
+                    }
+                )
+
+            if self._is_link_block_style(text):
+                scores["internal_linking"] = max(1.0, scores["internal_linking"] - 2.0)
+                scores["readability"] = max(1.0, scores["readability"] - 1.0)
+                issues.append(
+                    {
+                        "id": f"{unit_id}_links_001",
+                        "severity": "medium",
+                        "category": "internal_linking",
+                        "message": "Links look too block-like; embed links naturally in sentence context.",
+                    }
+                )
+
+            lang = self._detect_lang(text)
+            if req_lang == "en" and lang in ("pl", "mixed"):
+                scores["readability"] = max(1.0, scores["readability"] - 2.0)
+                scores["topic_cleanliness"] = max(1.0, scores["topic_cleanliness"] - 1.0)
+                issues.append(
+                    {
+                        "id": f"{unit_id}_lang_001",
+                        "severity": "high",
+                        "category": "readability",
+                        "message": "English-only mode likely broken in this unit.",
+                    }
+                )
+            if req_lang == "pl" and lang in ("en", "mixed"):
+                scores["readability"] = max(1.0, scores["readability"] - 2.0)
+                scores["topic_cleanliness"] = max(1.0, scores["topic_cleanliness"] - 1.0)
+                issues.append(
+                    {
+                        "id": f"{unit_id}_lang_001",
+                        "severity": "high",
+                        "category": "readability",
+                        "message": "Polish-only mode likely broken in this unit.",
+                    }
+                )
+
+            word_tokens = re.findall(r"[A-Za-z0-9'-]+", re.sub(r"<[^>]+>", " ", text))
+            word_count = len(word_tokens)
+            if word_count < 6:
+                scores["seo"] = max(1.0, scores["seo"] - 1.5)
+                scores["conversion"] = max(1.0, scores["conversion"] - 1.0)
+                issues.append(
+                    {
+                        "id": f"{unit_id}_seo_001",
+                        "severity": "low",
+                        "category": "seo",
+                        "message": "Unit is very short; may be too thin for SEO value.",
+                    }
+                )
+
+            if word_count >= 20 and target_terms:
+                target_hits = 0
+                for kw in target_terms:
+                    if len(kw) < 4:
+                        continue
+                    if re.search(rf"\b{re.escape(kw)}\b", low):
+                        target_hits += 1
+                if target_hits == 0:
+                    scores["seo"] = max(1.0, scores["seo"] - 1.25)
+                    issues.append(
+                        {
+                            "id": f"{unit_id}_seo_002",
+                            "severity": "low",
+                            "category": "seo",
+                            "message": "Weak target-topic keyword relevance detected in this unit.",
+                        }
+                    )
+
+            flat = [t.lower() for t in word_tokens if len(t) > 3]
+            if flat:
+                freq: Dict[str, int] = {}
+                for t in flat:
+                    freq[t] = freq.get(t, 0) + 1
+                top_ratio = max(freq.values()) / max(1, len(flat))
+                if top_ratio >= 0.16:
+                    scores["readability"] = max(1.0, scores["readability"] - 1.0)
+                    scores["seo"] = max(1.0, scores["seo"] - 0.75)
+                    issues.append(
+                        {
+                            "id": f"{unit_id}_read_001",
+                            "severity": "low",
+                            "category": "readability",
+                            "message": "Possible phrase repetition or keyword stuffing.",
+                        }
+                    )
+
+            overall = (
+                scores["seo"]
+                + scores["readability"]
+                + scores["conversion"]
+                + scores["topic_cleanliness"]
+                + scores["internal_linking"]
+            ) / 5.0
+            scores["overall"] = round(overall * 4.0) / 4.0
+
+            out[unit_id] = {
+                "unit_id": unit_id,
+                "unit_type": str(unit.get("unit_type", "")),
+                "placeholder_ids": list(unit.get("placeholder_ids", [])),
+                "original_text": text,
+                "scores": self._coerce_score_block(scores),
+                "issues": issues,
+                "suggested_fix": "Local pre-check: consider targeted polishing for this unit." if issues else "",
+                "polished_text": text,
+            }
+        return out
+
+    def run_polishing_validation(
+        self,
+        client: OpenAIClient,
+        global_prompt: str,
+        replacements: Dict[str, str],
+        mode: str = "BALANCED",
+    ) -> Dict[str, object]:
+        units = self.build_polishing_units(replacements)
+        raw = client.polishing_validate_page(
+            global_prompt=global_prompt,
+            section_schema=self.section_schema,
+            units=units,
+            mode=mode,
+        )
+        return self._coerce_polishing_result(raw, units)
+
+    def run_polishing_validation_lite(
+        self,
+        client: OpenAIClient,
+        global_prompt: str,
+        replacements: Dict[str, str],
+        mode: str = "BALANCED",
+        threshold: float = 8.0,
+        max_api_units: int = 8,
+    ) -> Dict[str, object]:
+        units = self.build_polishing_units(replacements)
+        local_by_id = self._build_local_polishing_baseline(units, global_prompt)
+        ranked_local = sorted(
+            local_by_id.values(),
+            key=lambda x: float(x.get("scores", {}).get("overall", 10.0)),
+        )
+        to_api_ids = [str(x.get("unit_id", "")) for x in ranked_local if float(x.get("scores", {}).get("overall", 10.0)) < threshold]
+        if max_api_units > 0:
+            to_api_ids = to_api_ids[:max_api_units]
+        to_api_id_set = set(to_api_ids)
+        api_units = [u for u in units if str(u.get("unit_id", "")) in to_api_id_set]
+
+        api_issues: List[object] = []
+        api_by_id: Dict[str, Dict[str, object]] = {}
+        page_scores = self._aggregate_unit_scores(list(local_by_id.values()))
+        if api_units:
+            raw = client.polishing_validate_page(
+                global_prompt=global_prompt,
+                section_schema=self.section_schema,
+                units=api_units,
+                mode=mode,
+            )
+            coerced_api = self._coerce_polishing_result(raw, api_units)
+            page_scores = self._coerce_score_block(coerced_api.get("page_scores"))
+            raw_issues = coerced_api.get("issues", [])
+            if isinstance(raw_issues, list):
+                api_issues = raw_issues
+            for unit in coerced_api.get("units", []):
+                if isinstance(unit, dict):
+                    api_by_id[str(unit.get("unit_id", ""))] = unit
+
+        units_final: List[Dict[str, object]] = []
+        for base in units:
+            uid = str(base.get("unit_id", ""))
+            merged = api_by_id.get(uid) or local_by_id.get(uid)
+            if isinstance(merged, dict):
+                units_final.append(merged)
+
+        issues: List[object] = list(api_issues)
+        remaining = max(0, len([x for x in local_by_id.values() if float(x.get("scores", {}).get("overall", 10.0)) < threshold]) - len(to_api_ids))
+        if remaining > 0:
+            issues.append(
+                {
+                    "id": "page_issue_lite_prefilter_001",
+                    "severity": "low",
+                    "scope": "page",
+                    "unit_id": "",
+                    "category": "readability",
+                    "message": f"Lite mode: {remaining} low-score unit(s) not sent to API due to max_api_units={max_api_units}.",
+                }
+            )
+
+        return {
+            "page_scores": page_scores,
+            "issues": issues,
+            "units": units_final,
+            "meta": {
+                "mode": "lite",
+                "total_units": len(units),
+                "api_units": len(api_units),
+                "threshold": float(threshold),
+                "max_api_units": int(max_api_units),
+            },
+        }
+
+    def run_polishing_fix_unit(
+        self,
+        client: OpenAIClient,
+        global_prompt: str,
+        unit: Dict[str, object],
+        mode: str = "BALANCED",
+        issue_category: str = "",
+        issue_message: str = "",
+    ) -> Dict[str, object]:
+        raw = client.polishing_fix_unit(
+            global_prompt=global_prompt,
+            unit=unit,
+            mode=mode,
+            issue_category=issue_category,
+            issue_message=issue_message,
+        )
+        scores = self._coerce_score_block(raw.get("scores"))
+        issues = raw.get("issues", [])
+        if not isinstance(issues, list):
+            issues = []
+        return {
+            "unit_id": str(raw.get("unit_id", unit.get("unit_id", ""))),
+            "unit_type": str(raw.get("unit_type", unit.get("unit_type", ""))),
+            "placeholder_ids": list(unit.get("placeholder_ids", [])),
+            "original_text": str(unit.get("original_text", unit.get("text", ""))),
+            "scores": scores,
+            "issues": issues,
+            "suggested_fix": str(raw.get("suggested_fix", "")),
+            "polished_text": str(raw.get("polished_text", unit.get("text", ""))),
+        }
+
+    def polished_unit_to_replacements(
+        self,
+        unit: Dict[str, object],
+        polished_text: str,
+        current_replacements: Dict[str, str],
+    ) -> Dict[str, str]:
+        pids = [str(x) for x in unit.get("placeholder_ids", [])]
+        if not pids:
+            return {}
+        utype = str(unit.get("unit_type", ""))
+        out: Dict[str, str] = {}
+        if utype == "fusion_content_box" and len(pids) >= 2:
+            txt = polished_text.strip()
+            title = ""
+            body = ""
+            m_title = re.search(r"^\s*TITLE:\s*(.*)$", txt, flags=re.IGNORECASE | re.MULTILINE)
+            m_body = re.search(r"^\s*BODY:\s*(.*)$", txt, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
+            if m_title:
+                title = m_title.group(1).strip()
+            if m_body:
+                body = m_body.group(1).strip()
+            if not title and not body:
+                lines = [ln.strip() for ln in txt.split("\n") if ln.strip()]
+                title = lines[0] if lines else current_replacements.get(pids[0], "")
+                body = "\n".join(lines[1:]).strip() if len(lines) > 1 else current_replacements.get(pids[1], "")
+            out[pids[0]] = title or current_replacements.get(pids[0], "")
+            out[pids[1]] = body or current_replacements.get(pids[1], "")
+            return out
+        if utype == "fusion_checklist":
+            lines = []
+            for ln in polished_text.replace("\r\n", "\n").split("\n"):
+                clean = ln.strip()
+                if not clean:
+                    continue
+                clean = re.sub(r"^[-*•]\s*", "", clean).strip()
+                if clean:
+                    lines.append(clean)
+            for idx, pid in enumerate(pids):
+                out[pid] = lines[idx] if idx < len(lines) else current_replacements.get(pid, "")
+            return out
+        out[pids[0]] = polished_text.strip() or current_replacements.get(pids[0], "")
+        return out

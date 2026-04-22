@@ -844,8 +844,7 @@ Inferred logical sections:
 ]
 
 Generated structured keys:
-- count: 48
-- keys: TEXT_001, TEXT_002, TEXT_003, TEXT_004, TEXT_005, TEXT_006, TEXT_007, TEXT_008, TEXT_009, TEXT_010, TEXT_011, TEXT_012, TEXT_013, TEXT_014, TEXT_015, TEXT_016, TEXT_017, TEXT_018, TEXT_019, TEXT_020, TEXT_021, TEXT_022, TEXT_023, TEXT_024, TEXT_025, TEXT_026, TEXT_027, TEXT_028, TEXT_029, TEXT_030, TEXT_031, TEXT_032, TEXT_033, TEXT_034, TEXT_035, TEXT_036, TEXT_037, TEXT_038, TEXT_039, TEXT_040, TEXT_041, TEXT_042, TEXT_043, TEXT_044, TEXT_045, TEXT_046, TEXT_047, TEXT_048
+- brak (nie uruchomiono Etapu 2 page-first)
 
 Mapping success/failure:
 - success: 48
@@ -853,11 +852,3 @@ Mapping success/failure:
 - changed_text_placeholders: 48
 - unchanged_text_placeholders: 0
 - changed_image_placeholders: 0
-- runtime_mapping_report:
-{
-  "placeholders_requested": 48,
-  "generated_keys": 48,
-  "missing_from_page_json": [],
-  "fallback_count": 0,
-  "mapped_success": 48
-}

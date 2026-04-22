@@ -30,10 +30,13 @@ class OpenAIClient:
             self.log(f"[OpenAIClient] {message}")
 
     def _request(self, prompt: str, temperature: float = 0.7) -> str:
+        return self._request_with_input(prompt, temperature=temperature)
+
+    def _request_with_input(self, input_payload: object, temperature: float = 0.7) -> str:
         if not self.api_key:
             raise ValueError("Brak klucza OPENAI_API_KEY.")
 
-        data = self._create_background_response(prompt, temperature)
+        data = self._create_background_response(input_payload, temperature)
         data = self._wait_until_completed(data)
         self._log(f"json_keys={list(data.keys())[:12]}")
         status = str(data.get("status", "")).lower()
@@ -60,14 +63,15 @@ class OpenAIClient:
         self._log("no_text_in_response")
         raise RuntimeError("API nie zwrocilo tekstu.")
 
-    def _create_background_response(self, prompt: str, temperature: float) -> Dict[str, Any]:
+    def _create_background_response(self, input_payload: object, temperature: float) -> Dict[str, Any]:
         attempt = 0
         while True:
             if self.is_cancelled and self.is_cancelled():
                 raise RuntimeError("Operacja przerwana przez uzytkownika.")
             attempt += 1
+            payload_size = len(str(input_payload)) if isinstance(input_payload, str) else len(json.dumps(input_payload, ensure_ascii=False))
             self._log(
-                f"attempt={attempt} model={self.model} prompt_chars={len(prompt)} timeout_read={self.read_timeout_seconds}s background=true"
+                f"attempt={attempt} model={self.model} prompt_chars={payload_size} timeout_read={self.read_timeout_seconds}s background=true"
             )
             try:
                 response = requests.post(
@@ -78,7 +82,7 @@ class OpenAIClient:
                     },
                     json={
                         "model": self.model,
-                        "input": prompt,
+                        "input": input_payload,
                         "temperature": temperature,
                         "background": True,
                     },
@@ -357,3 +361,188 @@ class OpenAIClient:
             "alt": str(data.get("alt", "")).strip(),
             "description": str(data.get("description", "")).strip(),
         }
+
+    def polishing_validate_page(
+        self,
+        global_prompt: str,
+        section_schema: List[Dict[str, object]],
+        units: List[Dict[str, object]],
+        mode: str = "BALANCED",
+    ) -> Dict[str, object]:
+        prompt = (
+            "You are validating and minimally polishing already generated local SEO page content for a builder website using Avada placeholders.\n"
+            "Do NOT rewrite the page from scratch.\n"
+            "Preserve meaning, section purpose, SEO intent, tone and structure.\n"
+            "Only improve detected weak points with minimal changes.\n\n"
+            "Polishing mode: "
+            + mode
+            + "\n"
+            "STRICT = very minimal edits only.\n"
+            "BALANCED = safe improvements while preserving tone and SEO intent.\n"
+            "AGGRESSIVE = deeper local section rewrite allowed, never whole-page rewrite.\n\n"
+            "Validation rules:\n"
+            "- topic purity (no source-topic leakage)\n"
+            "- keyword usage (no stuffing, preserve intent)\n"
+            "- internal linking natural in paragraphs (no link-dump sections)\n"
+            "- readability\n"
+            "- conversion/CTA quality\n"
+            "- preserve section structure and purpose\n\n"
+            "Return ONLY valid JSON in this schema:\n"
+            "{\n"
+            '  "page_scores": {"seo": 1-10, "readability": 1-10, "conversion": 1-10, "topic_cleanliness": 1-10, "internal_linking": 1-10, "overall": 1-10},\n'
+            '  "issues": [{"id":"...", "severity":"low|medium|high", "scope":"page|unit", "unit_id":"...", "category":"seo|readability|conversion|topic_cleanliness|internal_linking", "message":"..."}],\n'
+            '  "units": [\n'
+            "    {\n"
+            '      "unit_id":"...",\n'
+            '      "unit_type":"fusion_text|fusion_content_box|fusion_checklist|... ",\n'
+            '      "scores":{"seo":1-10,"readability":1-10,"conversion":1-10,"topic_cleanliness":1-10,"internal_linking":1-10,"overall":1-10},\n'
+            '      "issues":[{"id":"...","severity":"low|medium|high","category":"seo|readability|conversion|topic_cleanliness|internal_linking","message":"..."}],\n'
+            '      "suggested_fix":"...",\n'
+            '      "polished_text":"..."\n'
+            "    }\n"
+            "  ]\n"
+            "}\n\n"
+            f"Global prompt/context:\n{global_prompt.strip()}\n\n"
+            f"Section schema:\n{json.dumps(section_schema, ensure_ascii=False)}\n\n"
+            f"Content units:\n{json.dumps(units, ensure_ascii=False)}"
+        )
+        raw = self._request(prompt, temperature=0.2)
+        return self._extract_json_object(raw)
+
+    def generate_image_plan(
+        self,
+        global_prompt: str,
+        section_schema: List[Dict[str, object]],
+        image_placeholder_ids: List[str],
+        images_manifest: List[Dict[str, object]],
+        contact_sheet_data_url: str,
+    ) -> Dict[str, object]:
+        prompt = (
+            "You are selecting project images for an AVADA page.\n"
+            "Goal: choose best images, assign them to image placeholders, and generate SEO metadata.\n"
+            "Keep decisions practical and relevant to page topic.\n"
+            "Return ONLY valid JSON.\n\n"
+            "Schema:\n"
+            "{\n"
+            '  "selected": [\n'
+            "    {\n"
+            '      "image_key": "original filename from manifest",\n'
+            '      "placeholder_id": "IMG_001",\n'
+            '      "score": 0-10,\n'
+            '      "short_reason": "short explanation",\n'
+            '      "seo_filename": "seo-friendly-name",\n'
+            '      "alt": "...",\n'
+            '      "caption": "...",\n'
+            '      "description": "...",\n'
+            '      "reason": "..."\n'
+            "    }\n"
+            "  ],\n"
+            '  "not_selected": [{"image_key":"...", "reason":"..."}]\n'
+            "}\n\n"
+            "Rules:\n"
+            "- Assign at most one image per placeholder.\n"
+            "- Use only placeholders from provided list.\n"
+            "- Use only image_key values from manifest.\n"
+            "- Keep metadata SEO-safe and natural.\n"
+            "- filename must be lowercase, ascii, hyphen-separated, no extension.\n\n"
+            f"Page context:\n{global_prompt.strip()}\n\n"
+            f"Image placeholders:\n{json.dumps(image_placeholder_ids, ensure_ascii=False)}\n\n"
+            f"Section schema:\n{json.dumps(section_schema, ensure_ascii=False)}\n\n"
+            f"Image manifest:\n{json.dumps(images_manifest, ensure_ascii=False)}\n"
+        )
+        input_payload: List[Dict[str, object]] = [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}]
+        if contact_sheet_data_url:
+            input_payload[0]["content"].append({"type": "input_image", "image_url": contact_sheet_data_url})
+        raw = self._request_with_input(input_payload, temperature=0.25)
+        return self._extract_json_object(raw)
+
+    def improve_one_image_metadata(
+        self,
+        global_prompt: str,
+        image_key: str,
+        current_metadata: Dict[str, str],
+        contact_image_data_url: str,
+        assigned_placeholder_id: str = "",
+    ) -> Dict[str, str]:
+        prompt = (
+            "Improve SEO metadata for ONE image.\n"
+            "Do minimal improvement, keep meaning.\n"
+            "Return ONLY JSON: {\"seo_filename\":\"...\",\"alt\":\"...\",\"caption\":\"...\",\"description\":\"...\"}\n"
+            "seo_filename: lowercase ascii hyphens, no extension.\n\n"
+            f"Page context:\n{global_prompt.strip()}\n\n"
+            f"Image key: {image_key}\n"
+            f"Assigned placeholder: {assigned_placeholder_id or '(none)'}\n"
+            f"Current metadata: {json.dumps(current_metadata, ensure_ascii=False)}\n"
+        )
+        input_payload: List[Dict[str, object]] = [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}]
+        if contact_image_data_url:
+            input_payload[0]["content"].append({"type": "input_image", "image_url": contact_image_data_url})
+        raw = self._request_with_input(input_payload, temperature=0.2)
+        data = self._extract_json_object(raw)
+        return {
+            "seo_filename": str(data.get("seo_filename", "")).strip(),
+            "alt": str(data.get("alt", "")).strip(),
+            "caption": str(data.get("caption", "")).strip(),
+            "description": str(data.get("description", "")).strip(),
+        }
+
+    def generate_seo_title_slug(
+        self,
+        global_prompt: str,
+        strategy: Optional[StrategyResult],
+        section_schema: List[Dict[str, object]],
+        sample_output_excerpt: str,
+    ) -> Dict[str, str]:
+        prompt = (
+            "Generate SEO-ready metadata for a local service page.\n"
+            "Return ONLY JSON: {\"title\":\"...\",\"slug\":\"...\",\"focus_keyphrase\":\"...\",\"meta_description\":\"...\"}\n"
+            "Rules:\n"
+            "- title: clear, local-intent, natural, 45-70 chars preferred\n"
+            "- slug: lowercase ascii, hyphen-separated, no stopwords if possible, no trailing slash\n"
+            "- focus_keyphrase: 2-6 words, strong local/service intent\n"
+            "- meta_description: 120-155 chars preferred, persuasive, natural, no keyword stuffing\n"
+            "- keep service/location intent strong\n\n"
+            f"Global prompt:\n{global_prompt.strip()}\n\n"
+            f"Strategy JSON:\n{json.dumps(strategy.raw if strategy else {}, ensure_ascii=False)}\n\n"
+            f"Section schema:\n{json.dumps(section_schema, ensure_ascii=False)}\n\n"
+            f"Generated page excerpt:\n{sample_output_excerpt[:2000]}"
+        )
+        raw = self._request(prompt, temperature=0.25)
+        data = self._extract_json_object(raw)
+        return {
+            "title": str(data.get("title", "")).strip(),
+            "slug": str(data.get("slug", "")).strip(),
+            "focus_keyphrase": str(data.get("focus_keyphrase", "")).strip(),
+            "meta_description": str(data.get("meta_description", "")).strip(),
+        }
+
+    def polishing_fix_unit(
+        self,
+        global_prompt: str,
+        unit: Dict[str, object],
+        mode: str = "BALANCED",
+        issue_category: str = "",
+        issue_message: str = "",
+    ) -> Dict[str, object]:
+        prompt = (
+            "You are performing targeted polishing for ONE content unit from an already generated local SEO page.\n"
+            "Do NOT rewrite the whole page and do NOT change topic.\n"
+            "Preserve meaning, service relevance, keywords intent and tone.\n"
+            "Apply minimal correction for the target issue/scope only.\n\n"
+            f"Mode: {mode}\n"
+            f"Target issue category: {issue_category or '(auto)'}\n"
+            f"Target issue message: {issue_message or '(auto)'}\n\n"
+            "Return ONLY valid JSON:\n"
+            "{\n"
+            '  "unit_id":"...",\n'
+            '  "unit_type":"...",\n'
+            '  "scores":{"seo":1-10,"readability":1-10,"conversion":1-10,"topic_cleanliness":1-10,"internal_linking":1-10,"overall":1-10},\n'
+            '  "issues":[{"id":"...","severity":"low|medium|high","category":"seo|readability|conversion|topic_cleanliness|internal_linking","message":"..."}],\n'
+            '  "suggested_fix":"...",\n'
+            '  "polished_text":"..."\n'
+            "}\n\n"
+            f"Global prompt/context:\n{global_prompt.strip()}\n\n"
+            f"Unit input:\n{json.dumps(unit, ensure_ascii=False)}"
+        )
+        raw = self._request(prompt, temperature=0.2)
+        return self._extract_json_object(raw)

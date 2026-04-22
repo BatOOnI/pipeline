@@ -17,6 +17,7 @@ Krytyczne problemy:
 
 Ostrzezenia:
 - Wykryto stare frazy domenowe: southend-on-sea
+- Text contamination: 25/48 blokow ma stare terminy.
 - Sekcja 3: mozliwy mismatch naglowka i tresci (TEXT_026 -> TEXT_027).
 - Sekcja 3: mozliwy mismatch naglowka i tresci (TEXT_030 -> TEXT_031).
 - Sekcja 3: mismatch content_box title/body (TEXT_026 -> TEXT_027).

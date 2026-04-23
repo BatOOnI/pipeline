@@ -1,11 +1,15 @@
 import subprocess
 
-# Run the dir command
-result = subprocess.run(['dir'], shell=True, capture_output=True, text=True)
+def main():
+    try:
+        # Run the dir command
+        result = subprocess.run(['dir'], shell=True, capture_output=True, text=True, check=True)
+        print("Directory listing:")
+        print(result.stdout)
+    except subprocess.CalledProcessError as e:
+        print(f"Error running dir command: {e}")
+    except Exception as e:
+        print(f"Unexpected error: {e}")
 
-# Print the output
-print(result.stdout)
-
-# Print any errors
-if result.stderr:
-    print("Errors:", result.stderr)
+if __name__ == "__main__":
+    main()

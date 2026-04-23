@@ -1,21 +1,12 @@
-import tkinter as tk
+import subprocess
 
-class CounterApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Counter Test")
-        self.counter = 0
+# Run the dir command
+result = subprocess.run(['dir'], shell=True, capture_output=True, text=True)
 
-        self.label = tk.Label(self, text=f"Count: {self.counter}", font=("Arial", 14))
-        self.label.pack(pady=10)
+# Print the output
+print(result.stdout)
 
-        self.button = tk.Button(self, text="Increment", command=self.increment)
-        self.button.pack(pady=5)
-
-    def increment(self):
-        self.counter += 1
-        self.label.config(text=f"Count: {self.counter}")
-
-if __name__ == "__main__":
-    app = CounterApp()
-    app.mainloop()
+# Print any errors if they occurred
+if result.stderr:
+    print("Errors:")
+    print(result.stderr)

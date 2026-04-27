@@ -1,9 +1,10 @@
-import base64
+﻿import base64
 import hashlib
 import json
 import os
 import re
 import shutil
+import time
 import sys
 import unicodedata
 import uuid
@@ -31,6 +32,23 @@ from executor import (
 from git_tools import git_checkpoint, git_init, git_is_repo
 from parser import parse_response
 from providers import call_model
+from contracts import ToolResultEnvelope
+from permission_flow import authorize_action, permission_context_from_config
+from session_state_store import (
+    append_journal_event,
+    append_prompt_entry,
+    ensure_session_meta,
+    journal_path_for,
+    load_latest_session_snapshot,
+    state_snapshot_from_payload,
+)
+from supervision_layer import infer_task_intent
+from runtime_supervision import (
+    decide_completion,
+    decide_empty_done,
+    decide_no_progress,
+    decide_repeated_action,
+)
 from utils import coerce_int, ensure_gitignore, is_subpath, read_json_file, truncate_middle, write_json_file
 
 
@@ -43,6 +61,8 @@ PATCH_KEYWORDS = (
     "modify",
     "change",
     "improve",
+    "improvement",
+    "improvements",
     "refactor",
     "debug",
     "edytuj",
@@ -50,6 +70,8 @@ PATCH_KEYWORDS = (
     "przerob",
     "zmien",
     "popraw",
+    "ulepsz",
+    "ulepszenie",
     "usun",
 )
 CREATE_KEYWORDS = (
@@ -73,7 +95,6 @@ EXISTING_EDIT_HINTS = (
     "existing project",
     "w mojej grze",
 )
-PATCH_DONE_KEYWORDS = ("done", "complete", "completed", "finished", "ready", "gotowe", "zakonczone")
 SESSION_DIR_RE = re.compile(r"^TEST-(\d+)$", re.IGNORECASE)
 FILE_TOKEN_RE = re.compile(r"([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_+-]+)")
 CHUNK_STATUS_RE = re.compile(r"part=(\d+)/(\d+).*received=(\d+)", re.IGNORECASE)
@@ -170,6 +191,8 @@ class PipelineState:
     current_provider: str
     base_provider: str = ""
     mode_reason: str = ""
+    permission_mode: str = "workspace-write"
+    session_id: str = ""
     target_files: list = field(default_factory=list)
     active_patch_target: str = ""
     expected_file_count: int = 1
@@ -186,6 +209,9 @@ class PipelineState:
     progress_happened: bool = False
     iteration_count: int = 0
     last_useful_observation_summary: str = ""
+    last_tool_envelope: dict = field(default_factory=dict)
+    prompt_history: list = field(default_factory=list)
+    prompt_history_hash: str = ""
     prompt_changed: bool = False
     required_b64_fields: list = field(default_factory=list)
     create_strategy: str = "write_file"
@@ -225,6 +251,7 @@ class PipelineState:
     route_reason: str = ""
     task_shape: str = "project_generation_task"
     task_shape_reason: str = ""
+    task_intent: str = "create_new_file"
     task_fingerprint: str = ""
     source_readonly_files: list = field(default_factory=list)
     derived_allowed_files: list = field(default_factory=list)
@@ -239,6 +266,7 @@ class PipelineState:
     transform_no_material_progress_streak: int = 0
     transform_phase: str = "transform_analyze"
     transform_analysis_complete: bool = False
+    last_final_answer: str = ""
 
 
 def normalize_rel_path(rel_path: str) -> str:
@@ -315,8 +343,14 @@ def _session_path():
 
 
 def _load_session_state():
-    data = read_json_file(_session_path(), default={})
-    return data if isinstance(data, dict) else {}
+    json_state = read_json_file(_session_path(), default={})
+    json_state = json_state if isinstance(json_state, dict) else {}
+    journal_state = load_latest_session_snapshot(_session_path())
+    if not isinstance(journal_state, dict) or not journal_state:
+        return json_state
+    merged = dict(json_state)
+    merged.update(journal_state)
+    return merged
 
 
 def _normalize_prompt_text(user_prompt):
@@ -737,6 +771,12 @@ def _looks_like_in_place_patch_request(text_norm):
         "fix ",
         "modify ",
         "change ",
+        "improve ",
+        "improvement",
+        "safe improvement",
+        "small safe improvement",
+        "ulepsz",
+        "ulepszenie",
     )
     return any(marker in text_norm for marker in in_place_markers)
 
@@ -756,17 +796,101 @@ def _resolve_prompt_tokens_in_root(user_prompt, project_root, existing_only=Fals
 
 
 def _infer_output_files_from_prompt(user_prompt, project_root, source_files=None):
-    source_files = set(source_files or [])
+    source_files = {normalize_rel_path(item) for item in (source_files or []) if str(item or "").strip()}
     outputs = []
     seen = set()
     for rel_path in _resolve_prompt_tokens_in_root(user_prompt, project_root, existing_only=False):
+        rel_path = normalize_rel_path(rel_path)
+        if not rel_path:
+            continue
         if rel_path in source_files:
             continue
         if rel_path in seen:
             continue
+        if not _is_text_like_output(rel_path):
+            continue
+        if _looks_like_command_artifact_path(rel_path):
+            continue
+        if not _prompt_has_output_intent_for_token(user_prompt, rel_path):
+            continue
         seen.add(rel_path)
         outputs.append(rel_path)
     return outputs
+
+
+def _looks_like_command_artifact_path(rel_path):
+    rel = normalize_rel_path(rel_path or "")
+    if not rel:
+        return True
+    lower = _normalize_prompt_text(rel.replace("\\", "/"))
+    ext = os.path.splitext(lower)[1]
+    if ext in {".exe", ".dll", ".so", ".dylib", ".msi", ".com", ".sys"}:
+        return True
+
+    basename = os.path.basename(lower)
+    if basename in {
+        "python",
+        "python.exe",
+        "python3",
+        "python3.exe",
+        "py.exe",
+        "powershell.exe",
+        "pwsh.exe",
+        "cmd.exe",
+        "bash.exe",
+    }:
+        return True
+
+    system_prefixes = (
+        "users/",
+        "appdata/",
+        "program files/",
+        "program files (x86)/",
+        "windows/",
+        "usr/bin/",
+        "bin/",
+    )
+    return any(lower.startswith(prefix) for prefix in system_prefixes)
+
+
+def _prompt_has_output_intent_for_token(user_prompt, rel_path):
+    prompt_norm = _normalize_prompt_text(user_prompt or "")
+    rel_norm = _normalize_prompt_text(str(rel_path or "").replace("\\", "/"))
+    base_norm = _normalize_prompt_text(os.path.basename(str(rel_path or "")))
+    intent_markers = (
+        "create ",
+        "write ",
+        "save ",
+        "generate ",
+        "output ",
+        "make ",
+        "build ",
+        "stworz ",
+        "utworz ",
+        "zapisz ",
+        "wygeneruj ",
+        "zrob ",
+        "dodaj plik",
+        "new file",
+    )
+
+    candidates = []
+    for token in (rel_norm, base_norm):
+        token = str(token or "").strip()
+        if token and token not in candidates:
+            candidates.append(token)
+
+    for token in candidates:
+        start = 0
+        while True:
+            idx = prompt_norm.find(token, start)
+            if idx == -1:
+                break
+            window = prompt_norm[max(0, idx - 120) : idx]
+            if any(marker in window for marker in intent_markers):
+                return True
+            start = idx + len(token)
+    return False
 
 
 def detect_task_shape(user_prompt, selected_files="", project_context=None):
@@ -784,43 +908,50 @@ def detect_task_shape(user_prompt, selected_files="", project_context=None):
         all_tokens.extend(_resolve_prompt_tokens_in_root(user_prompt, root, existing_only=False))
     existing_tokens = list(dict.fromkeys(existing_tokens))
     all_tokens = list(dict.fromkeys(all_tokens))
-    has_patch_words = any(keyword in words for keyword in PATCH_KEYWORDS)
     has_create_words = any(keyword in words for keyword in CREATE_KEYWORDS)
     has_transform_words = any(hint in text_norm for hint in TEXT_TRANSFORM_HINTS)
     has_report_words = any(token in text_norm for token in ("report", "summary", "analysis", "data.txt", "raport", "podsumowanie"))
     has_copy_words = any(token in text_norm for token in ("copy", "kopia", "template", "szablon", "based on", "from "))
-    has_output_words = any(token in text_norm for token in ("create", "new file", "output", "plik", "utworz", "stworz", "zapisz"))
     multiple_files = len(all_tokens) >= 2
 
-    if selected_files:
+    intent_decision = infer_task_intent(
+        user_prompt,
+        existing_tokens=existing_tokens,
+        all_tokens=all_tokens,
+        selected_files=selected_files,
+    )
+    intent = str(intent_decision.intent or "create_new_file")
+    intent_reason = str(intent_decision.reason or "intent evaluation")
+
+    if selected_files and intent not in {"inspect_only", "run_command_only"}:
         sanitized_selected = []
         for chunk in re.split(r"[,;\n]+", selected_files):
             token = chunk.strip()
             if token:
                 sanitized_selected.append(token)
         if len(sanitized_selected) > 1:
-            return "multi_file_patch", "PATCH_FILES selected multiple files"
-        return "single_file_patch", "PATCH_FILES selected single file"
+            return "multi_file_patch", "PATCH_FILES selected multiple files", "edit_existing_file"
+        return "single_file_patch", "PATCH_FILES selected single file", "edit_existing_file"
+
+    if intent == "transform_source_to_output":
+        return "transform_copy_task", intent_reason, intent
+
+    if intent == "edit_existing_file":
+        if len(existing_tokens) > 1:
+            return "multi_file_patch", intent_reason, intent
+        return "single_file_patch", intent_reason, intent
+
+    if intent == "inspect_only":
+        return "analysis_report_task", intent_reason, intent
+
+    if intent == "run_command_only":
+        return "analysis_report_task", intent_reason, intent
 
     if has_transform_words and multiple_files and (has_copy_words or has_report_words):
-        return "transform_copy_task", "source + derived outputs requested"
-    if has_patch_words and has_create_words and multiple_files and has_output_words:
-        return "transform_copy_task", "prompt mixes replace/change with new output files"
-    if has_report_words and not has_patch_words and (multiple_files or "create" in words or "stworz" in words):
-        return "analysis_report_task", "analysis/report artifact request"
-    if has_patch_words and existing_tokens and _looks_like_in_place_patch_request(text_norm):
-        if len(existing_tokens) > 1:
-            return "multi_file_patch", "in-place patch request against existing files"
-        return "single_file_patch", "in-place patch request against existing file"
-    if has_patch_words and existing_tokens and not has_create_words and not has_transform_words:
-        if len(existing_tokens) > 1:
-            return "multi_file_patch", "patch keywords with existing files"
-        return "single_file_patch", "patch keywords with existing file"
+        return "transform_copy_task", "source + derived outputs requested", "transform_source_to_output"
     if has_create_words and (multiple_files or has_transform_words or has_report_words):
-        return "generate_new_files_task", "explicit create/generate new files"
-    if has_transform_words and existing_tokens:
-        return "transform_copy_task", "transform wording with source file context"
-    return "project_generation_task", "default project generation flow"
+        return "generate_new_files_task", "explicit create/generate new files", "create_new_file"
+    return "project_generation_task", "default project generation flow", "create_new_file"
 
 
 def _infer_mode_with_reason(user_prompt, task_shape="", task_shape_reason=""):
@@ -832,6 +963,8 @@ def _infer_mode_with_reason(user_prompt, task_shape="", task_shape_reason=""):
 
     patch_files_value = str(config.PATCH_FILES or "")
     if patch_files_value.strip():
+        if task_shape == "analysis_report_task":
+            return "create", "PATCH_FILES ignored for inspect/read-only task shape"
         return "patch", "PATCH_FILES non-empty"
 
     if task_shape in PATCH_TASK_SHAPES:
@@ -977,6 +1110,22 @@ def _is_text_like_output(path):
     }
 
 
+def _is_reasonable_transform_output_candidate(rel_path, state):
+    rel = normalize_rel_path(rel_path or "")
+    if not rel:
+        return False
+    if rel in (state.source_readonly_files or []):
+        return False
+    if not _is_text_like_output(rel):
+        return False
+    if _looks_like_command_artifact_path(rel):
+        return False
+    stem = os.path.splitext(os.path.basename(rel))[0]
+    if not re.search(r"[A-Za-z]", stem):
+        return False
+    return True
+
+
 def _is_safe_transform_output(rel_path, state):
     rel = normalize_rel_path(rel_path or "")
     if not rel:
@@ -1048,9 +1197,14 @@ def _transform_source_context(state):
 
 def _required_transform_outputs(state):
     outputs = []
-    for rel in (state.derived_allowed_files or state.target_files or []):
+    preferred = state.derived_allowed_files or []
+    fallback = state.target_files or []
+    candidates = preferred if preferred else fallback
+    for rel in candidates:
         clean = normalize_rel_path(rel)
         if clean and clean not in outputs:
+            if state.task_shape in TRANSFORM_TASK_SHAPES and not _is_reasonable_transform_output_candidate(clean, state):
+                continue
             outputs.append(clean)
     return outputs
 
@@ -1078,6 +1232,23 @@ def _placeholder_hits(text):
     return sum(1 for marker in markers if marker.lower() in raw.lower())
 
 
+def _looks_like_obvious_placeholder_junk(text):
+    stripped = str(text or "").strip()
+    if not stripped:
+        return True
+    lowered = _normalize_prompt_text(stripped)
+    if len(stripped) <= 96 and lowered in {"placeholder", "todo", "tbd", "lorem ipsum", "sample text"}:
+        return True
+    if _placeholder_hits(stripped) > 0:
+        tokens = [token for token in re.split(r"[^a-z0-9_]+", lowered) if token]
+        if tokens and all(
+            ("placeholder" in token) or token in {"text", "picture", "image", "output", "value", "todo", "tbd"}
+            for token in tokens
+        ):
+            return True
+    return False
+
+
 def _verify_transform_outputs(state):
     from contracts import Observation
 
@@ -1088,6 +1259,22 @@ def _verify_transform_outputs(state):
     if not required:
         return Observation(False, "TRANSFORM VERIFY FAIL", changed=False, details="No required derived outputs inferred.", tool="verify_transform")
 
+    source_changed = False
+    source_text = ""
+    if state.transform_primary_source and state.transform_source_hash:
+        source_abs = os.path.abspath(os.path.join(state.active_project_root, state.transform_primary_source))
+        try:
+            with open(source_abs, "rb") as handle:
+                source_bytes = handle.read()
+            source_text = source_bytes.decode("utf-8", errors="ignore")
+            current_hash = hashlib.sha256(source_bytes).hexdigest()
+            source_changed = current_hash != state.transform_source_hash
+        except Exception:
+            source_changed = True
+
+    enforce_placeholder_markers = bool(source_text and _looks_like_shortcode_content(source_text))
+    placeholder_hits_total = 0
+    existing_required_count = 0
     missing = []
     bad = []
     for rel in required:
@@ -1095,24 +1282,19 @@ def _verify_transform_outputs(state):
         if not os.path.exists(abs_path):
             missing.append(rel)
             continue
+        existing_required_count += 1
         try:
             with open(abs_path, "r", encoding="utf-8") as handle:
                 content = handle.read()
         except Exception as exc:
             bad.append(f"{rel}: unreadable ({exc})")
             continue
-        if _placeholder_hits(content) <= 0:
-            bad.append(f"{rel}: no placeholder markers detected")
+        placeholder_hits_total += _placeholder_hits(content)
+        if _looks_like_obvious_placeholder_junk(content):
+            bad.append(f"{rel}: placeholder-only/empty content")
 
-    source_changed = False
-    if state.transform_primary_source and state.transform_source_hash:
-        source_abs = os.path.abspath(os.path.join(state.active_project_root, state.transform_primary_source))
-        try:
-            with open(source_abs, "rb") as handle:
-                current_hash = hashlib.sha256(handle.read()).hexdigest()
-            source_changed = current_hash != state.transform_source_hash
-        except Exception:
-            source_changed = True
+    if enforce_placeholder_markers and existing_required_count > 0 and placeholder_hits_total <= 0:
+        bad.append("no placeholder markers detected in derived outputs")
 
     if missing or bad or source_changed:
         details = []
@@ -1134,7 +1316,7 @@ def _verify_transform_outputs(state):
         True,
         "TRANSFORM VERIFY OK",
         changed=False,
-        details="required outputs present; placeholder markers detected; source unchanged",
+        details="required outputs present; content checks passed; source unchanged",
         tool="verify_transform",
     )
 
@@ -1553,6 +1735,9 @@ def _append_unique(items, value):
 
 
 def _soft_reset_runtime_state(state):
+    state.touched_files = []
+    state.created_files = []
+    state.last_written_files = []
     state.last_runtime_error = ""
     state.last_plan_fingerprint = ""
     state.stuck_iterations = 0
@@ -1561,6 +1746,7 @@ def _soft_reset_runtime_state(state):
     state.rescue_handoff_count = 0
     state.progress_happened = False
     state.last_useful_observation_summary = ""
+    state.last_tool_envelope = {}
     state.patch_strategy = "surgical_patch"
     state.patch_strategy_reason = ""
     state.patch_failure_streak = 0
@@ -1607,11 +1793,35 @@ def _hydrate_state_from_session(state, session_data):
     if not explicit_gui_root and state.mode != "create" and session_root and os.path.isdir(session_root):
         state.active_project_root = session_root
 
+    state.session_id = str(session_data.get("session_id") or state.session_id or "").strip()
+    raw_prompt_history = session_data.get("prompt_history") or []
+    normalized_prompt_history = []
+    if isinstance(raw_prompt_history, list):
+        for item in raw_prompt_history:
+            if isinstance(item, dict):
+                prompt_text = str(item.get("prompt") or item.get("text") or "").strip()
+                if not prompt_text:
+                    continue
+                normalized_prompt_history.append(
+                    {
+                        "ts_ms": int(item.get("ts_ms") or item.get("timestamp_ms") or 0),
+                        "prompt": prompt_text,
+                    }
+                )
+            else:
+                prompt_text = str(item or "").strip()
+                if prompt_text:
+                    normalized_prompt_history.append({"ts_ms": 0, "prompt": prompt_text})
+    state.prompt_history = normalized_prompt_history[-40:]
+    state.prompt_history_hash = str(session_data.get("prompt_history_hash") or state.prompt_history_hash or "")
+
     state.touched_files = list(session_data.get("touched_files") or [])
     state.created_files = list(session_data.get("created_files") or [])
     state.last_written_files = list(session_data.get("last_written_files") or [])
     state.iteration_count = int(session_data.get("iteration_count") or 0)
     state.last_useful_observation_summary = str(session_data.get("last_useful_observation_summary") or "")
+    state.permission_mode = str(session_data.get("permission_mode") or state.permission_mode or "workspace-write")
+    state.last_tool_envelope = dict(session_data.get("last_tool_envelope") or {}) if isinstance(session_data.get("last_tool_envelope"), dict) else {}
     state.patch_strategy = _normalize_patch_strategy(session_data.get("patch_strategy", state.patch_strategy))
     state.patch_strategy_reason = str(session_data.get("patch_strategy_reason") or "")
     state.patch_failure_streak = int(session_data.get("patch_failure_streak") or 0)
@@ -1643,6 +1853,7 @@ def _hydrate_state_from_session(state, session_data):
     state.no_progress_streak = int(session_data.get("no_progress_streak") or 0)
     state.task_shape = str(session_data.get("task_shape") or state.task_shape)
     state.task_shape_reason = str(session_data.get("task_shape_reason") or state.task_shape_reason)
+    state.task_intent = str(session_data.get("task_intent") or state.task_intent or "create_new_file")
     state.task_fingerprint = str(session_data.get("task_fingerprint") or state.task_fingerprint)
     state.source_readonly_files = list(session_data.get("source_readonly_files") or state.source_readonly_files)
     state.derived_allowed_files = list(session_data.get("derived_allowed_files") or state.derived_allowed_files)
@@ -1656,6 +1867,7 @@ def _hydrate_state_from_session(state, session_data):
     state.transform_no_material_progress_streak = int(session_data.get("transform_no_material_progress_streak") or 0)
     state.transform_phase = str(session_data.get("transform_phase") or state.transform_phase)
     state.transform_analysis_complete = bool(session_data.get("transform_analysis_complete") or False)
+    state.last_final_answer = str(session_data.get("last_final_answer") or "")
 
     if not state.prompt_changed:
         state.last_runtime_error = str(session_data.get("last_runtime_error") or "")
@@ -1670,10 +1882,13 @@ def _hydrate_state_from_session(state, session_data):
 
 def _save_session_state(state):
     test_folder = os.path.basename(state.active_project_root)
+    if not str(getattr(state, "session_id", "") or "").strip():
+        state.session_id = uuid.uuid4().hex
     if not SESSION_DIR_RE.match(test_folder):
         test_folder = ""
 
     payload = {
+        "session_id": state.session_id,
         "goal": state.goal,
         "prompt": state.goal,
         "mode": state.mode,
@@ -1692,6 +1907,10 @@ def _save_session_state(state):
         "last_plan_fingerprint": state.last_plan_fingerprint,
         "last_runtime_error": state.last_runtime_error,
         "last_useful_observation_summary": state.last_useful_observation_summary,
+        "permission_mode": state.permission_mode,
+        "last_tool_envelope": dict(state.last_tool_envelope),
+        "prompt_history": list(state.prompt_history),
+        "prompt_history_hash": state.prompt_history_hash,
         "current_test_folder": test_folder,
         "create_strategy": state.create_strategy,
         "create_phase": state.create_phase,
@@ -1729,6 +1948,7 @@ def _save_session_state(state):
         "route_reason": state.route_reason,
         "task_shape": state.task_shape,
         "task_shape_reason": state.task_shape_reason,
+        "task_intent": state.task_intent,
         "task_fingerprint": state.task_fingerprint,
         "source_readonly_files": list(state.source_readonly_files),
         "derived_allowed_files": list(state.derived_allowed_files),
@@ -1743,12 +1963,34 @@ def _save_session_state(state):
         "transform_no_material_progress_streak": state.transform_no_material_progress_streak,
         "transform_phase": state.transform_phase,
         "transform_analysis_complete": state.transform_analysis_complete,
+        "last_final_answer": state.last_final_answer,
     }
     write_json_file(_session_path(), payload)
+    try:
+        append_journal_event(
+            _session_path(),
+            "state_snapshot",
+            {
+                "session_id": state.session_id,
+                "iteration": int(state.iteration_count or 0),
+                "state": state_snapshot_from_payload(payload),
+            },
+        )
+    except Exception:
+        pass
 
 
 def _clear_runtime_session(project_root=None):
-    targets = [_session_path(), os.path.join(os.getcwd(), config.RAW_LOG_FILE)]
+    session_path = _session_path()
+    journal_path = journal_path_for(session_path)
+    targets = [
+        session_path,
+        journal_path,
+        f"{journal_path}.1",
+        f"{journal_path}.2",
+        f"{journal_path}.3",
+        os.path.join(os.getcwd(), config.RAW_LOG_FILE),
+    ]
     if project_root:
         root = os.path.abspath(project_root)
         targets.extend(
@@ -1777,6 +2019,9 @@ def _compact_log_message(message):
     text = str(message or "").strip()
     if not text:
         return ""
+    # Preserve full model result text for user-facing answer blocks.
+    if text.startswith("FINAL ANSWER:"):
+        return text
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if len(lines) <= 1:
         if len(text) <= 260:
@@ -1803,7 +2048,7 @@ def _compact_log_message(message):
 def _build_state(user_prompt):
     session_data = _load_session_state()
     project_context = {"candidate_roots": _candidate_existing_roots()}
-    task_shape, task_shape_reason = detect_task_shape(
+    task_shape, task_shape_reason, task_intent = detect_task_shape(
         user_prompt,
         selected_files=str(config.PATCH_FILES or ""),
         project_context=project_context,
@@ -1832,6 +2077,8 @@ def _build_state(user_prompt):
     )
     prompt_changed = bool(previous_prompt and previous_prompt.strip() != (user_prompt or "").strip())
     task_changed = bool(previous_fingerprint and previous_fingerprint != task_fingerprint)
+    permission_context = permission_context_from_config()
+    session_id_seed = str(session_data.get("session_id") or "").strip()
     state = PipelineState(
         goal=user_prompt,
         mode=mode,
@@ -1839,10 +2086,13 @@ def _build_state(user_prompt):
         current_provider=config.PROVIDER,
         base_provider=config.PROVIDER,
         mode_reason=mode_reason,
+        permission_mode=str(permission_context.get("mode") or "workspace-write"),
+        session_id=session_id_seed or uuid.uuid4().hex,
         prompt_changed=(prompt_changed or task_changed),
         required_b64_fields=_required_b64_fields(user_prompt),
         task_shape=task_shape,
         task_shape_reason=task_shape_reason,
+        task_intent=task_intent,
         task_fingerprint=task_fingerprint,
     )
     if mode == "create":
@@ -1856,7 +2106,23 @@ def _build_state(user_prompt):
     _hydrate_state_from_session(state, session_data)
     state.task_shape = task_shape
     state.task_shape_reason = task_shape_reason
+    state.task_intent = task_intent
     state.task_fingerprint = task_fingerprint
+    if not str(state.session_id or "").strip():
+        state.session_id = uuid.uuid4().hex
+
+    prompt_text = str(user_prompt or "").strip()
+    if prompt_text:
+        last_prompt = ""
+        if state.prompt_history:
+            last_prompt = str((state.prompt_history[-1] or {}).get("prompt") or "").strip()
+        if prompt_text != last_prompt:
+            state.prompt_history.append({"ts_ms": int(time.time() * 1000), "prompt": prompt_text})
+            state.prompt_history = state.prompt_history[-40:]
+    if state.prompt_history:
+        state.prompt_history_hash = hashlib.sha256(
+            json.dumps(state.prompt_history, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
     if task_changed:
         _soft_reset_runtime_state(state)
         state.patch_task_intent = ""
@@ -2274,6 +2540,8 @@ def _action_mentions_hotspot_candidate(action, candidate):
 def _action_outside_grounded_hotspots(action, state):
     if state.mode != "patch":
         return False
+    if not _patch_heuristics_allowed(state):
+        return False
     action_type = str(action.get("type", ""))
     if action_type not in {"insert_before", "insert_after", "replace_block", "replace_in_file"}:
         return False
@@ -2460,6 +2728,9 @@ def build_instruction_bits(
     large_file_mode="disabled",
     transform_source_summary="",
     transform_source_snippet="",
+    permission_mode="workspace-write",
+    permission_rules_summary="",
+    task_intent="create_new_file",
 ):
     target_files = target_files or []
     history = history or []
@@ -2513,7 +2784,10 @@ def build_instruction_bits(
             '{"plan":"short plan","reasoning_short":"short reason","actions":[{"type":"replace_in_file","args":{"path":"app.py","old":"x","new":"y"}}]}',
             "",
             "Allowed actions: replace_in_file, insert_before, insert_after, replace_block, begin_file_rewrite, append_file_chunk, finalize_file_rewrite, write_file, patch_lines, find_in_file, run_cmd",
+            f"PERMISSION MODE: {permission_mode}",
+            f"PERMISSION RULES: {permission_rules_summary or 'none'}",
             "Rules:",
+            "- If permission policy blocks an action, switch to allowed actions instead of retrying blocked calls.",
             "- Default to one existing file.",
             "- Keep target fixed: all file actions must stay on active_patch_target unless user explicitly expands scope.",
             "- Source-of-truth priority: current real file snapshot and anchors override older traceback/log text.",
@@ -2582,10 +2856,21 @@ def build_instruction_bits(
         elif create_phase == "chunk_append":
             next_required = "finalize_file_rewrite" if int(chunk_received_parts or 0) >= int(chunk_expected_parts or 0) and int(chunk_expected_parts or 0) > 0 else "append_file_chunk"
 
+    intent_norm = str(task_intent or "create_new_file").strip().lower()
+    inspect_like = intent_norm in {"inspect_only", "read_only"}
+    command_only = intent_norm == "run_command_only"
+    if inspect_like:
+        allowed_actions_line = "Allowed actions: read_file, find_in_file"
+    elif command_only:
+        allowed_actions_line = "Allowed actions: read_file, find_in_file, run_cmd"
+    else:
+        allowed_actions_line = "Allowed actions: read_file, write_file, replace_in_file, insert_before, insert_after, replace_block, begin_file_rewrite, append_file_chunk, finalize_file_rewrite, patch_lines, find_in_file, run_cmd, mkdir"
+
     base = [
         "You are a coding agent.",
         f"Project root: {project_root}",
         "Mode: create",
+        f"TASK INTENT: {intent_norm}",
         f"TASK PROFILE: {task_profile or 'standard_create'}",
         f"MODEL ROUTE: {model_route or 'local/default'}",
         f"TASK SHAPE: {task_shape or 'project_generation_task'}",
@@ -2594,8 +2879,11 @@ def build_instruction_bits(
         "Return ONLY JSON with this exact shape:",
         '{"plan":"short plan","reasoning_short":"short reason","actions":[{"type":"write_file","args":{"path":"app.py","content":"print(\\"Hello World\\")"}}]}',
         "",
-            "Allowed actions: read_file, write_file, replace_in_file, insert_before, insert_after, replace_block, begin_file_rewrite, append_file_chunk, finalize_file_rewrite, patch_lines, find_in_file, run_cmd, mkdir",
+            allowed_actions_line,
+            f"PERMISSION MODE: {permission_mode}",
+            f"PERMISSION RULES: {permission_rules_summary or 'none'}",
             "Rules:",
+            "- If permission policy blocks an action, adapt plan to allowed actions or request explicit approval.",
             "- All file paths must stay inside the project root.",
             "- Prefer writing project files inside this run's folder.",
             "- For Python on Windows, use python, not python3.",
@@ -2617,7 +2905,15 @@ def build_instruction_bits(
             "Recent observations:",
             compact_history or "None",
     ]
-    if task_shape in TRANSFORM_TASK_SHAPES:
+    if inspect_like or command_only:
+        base.extend(
+            [
+                "- READ-ONLY ANALYSIS CONTRACT: do not propose file writes or patch actions.",
+                "- Use read_file/find_in_file and provide the final analysis in plan/reasoning_short.",
+                "- If analysis is complete, return actions as an empty list.",
+            ]
+        )
+    if task_shape in TRANSFORM_TASK_SHAPES and not (inspect_like or command_only):
         readonly_preview = ", ".join(source_readonly_files[:8]) if source_readonly_files else "(none)"
         derived_preview = ", ".join(derived_allowed_files[:12]) if derived_allowed_files else "(model may propose safe derived outputs)"
         base.extend(
@@ -2697,6 +2993,8 @@ def _format_violation_action(message):
 def _is_small_focused_patch(state):
     if state.mode != "patch":
         return False
+    if not _patch_heuristics_allowed(state):
+        return False
     if _normalize_patch_strategy(state.patch_strategy) != "surgical_patch":
         return False
     return state.task_profile in {"simple_patch", "standard_patch"}
@@ -2738,7 +3036,7 @@ def build_prompt(user_prompt, history, state):
     )
     if secondary_item:
         hotspot_secondary_label = str(secondary_item.get("label", ""))
-    if state.mode == "patch" and state.active_patch_target:
+    if state.mode == "patch" and _patch_heuristics_allowed(state) and state.active_patch_target:
         hotspot_bundle = _derive_patch_hotspots(
             state.active_patch_target,
             state.active_project_root,
@@ -2766,6 +3064,11 @@ def build_prompt(user_prompt, history, state):
         exact_patch_snippet = hotspot_bundle.get("snippet") or ""
     elif state.mode == "create" and state.task_shape in TRANSFORM_TASK_SHAPES:
         transform_source_summary, transform_source_snippet = _transform_source_context(state)
+
+    permission_context = permission_context_from_config()
+    permission_mode = str(permission_context.get("mode") or state.permission_mode or "workspace-write")
+    permission_rules_summary = str(permission_context.get("summary") or "")
+    state.permission_mode = permission_mode
 
     bits = build_instruction_bits(
         user_prompt,
@@ -2806,6 +3109,9 @@ def build_prompt(user_prompt, history, state):
         large_file_mode=state.large_file_mode,
         transform_source_summary=transform_source_summary,
         transform_source_snippet=transform_source_snippet,
+        permission_mode=permission_mode,
+        permission_rules_summary=permission_rules_summary,
+        task_intent=state.task_intent,
     )
     prompt = "\n".join(bit for bit in bits if bit is not None)
 
@@ -2815,7 +3121,7 @@ def build_prompt(user_prompt, history, state):
 
     state.prompt_compaction_level += 1
     snippet_lines, _, _ = _prompt_budget(state.prompt_compaction_level)
-    if state.mode == "patch" and state.active_patch_target:
+    if state.mode == "patch" and _patch_heuristics_allowed(state) and state.active_patch_target:
         hotspot_bundle = _derive_patch_hotspots(
             state.active_patch_target,
             state.active_project_root,
@@ -2879,6 +3185,9 @@ def build_prompt(user_prompt, history, state):
         large_file_mode=state.large_file_mode,
         transform_source_summary=truncate_middle(transform_source_summary, limit // 8),
         transform_source_snippet=truncate_middle(transform_source_snippet, limit // 3),
+        permission_mode=permission_mode,
+        permission_rules_summary=permission_rules_summary,
+        task_intent=state.task_intent,
     )
     prompt = "\n".join(bit for bit in bits if bit is not None)
     return truncate_middle(prompt, limit)
@@ -3506,7 +3815,7 @@ def _normalize_action(action, state):
     return {"type": action_type, "args": args}
 
 
-def _execute_action(action, state, project_root_override=None, stop_checker=None):
+def _execute_action(action, state, project_root_override=None, stop_checker=None, permission_decider=None):
     action_type = action.get("type")
     args = action.get("args", {})
     project_root = project_root_override or state.active_project_root
@@ -3531,6 +3840,26 @@ def _execute_action(action, state, project_root_override=None, stop_checker=None
             changed=False,
             details=str(args.get("message", "Action path does not match active patch target.")),
             tool=action_type,
+        )
+
+    permission_check = authorize_action(
+        action_type,
+        args,
+        project_root=project_root,
+        permission_decider=permission_decider,
+    )
+    if not bool(permission_check.get("allowed")):
+        from contracts import Observation
+
+        denied_path = str(args.get("path", "")) if isinstance(args, dict) else ""
+        return Observation(
+            False,
+            "PERMISSION DENIED",
+            changed=False,
+            details=str(permission_check.get("reason") or "Blocked by permission policy."),
+            tool="permission_denied",
+            path=denied_path,
+            metadata={"permission": permission_check, "touches_file": False},
         )
 
     if action_type == "write_file":
@@ -3660,6 +3989,38 @@ def _execute_action(action, state, project_root_override=None, stop_checker=None
     return Observation(False, f"UNKNOWN ACTION: {action_type}", changed=False)
 
 
+def _attach_tool_result_envelope(action, observation, state):
+    args = action.get("args", {}) if isinstance(action.get("args"), dict) else {}
+    metadata = dict(observation.metadata or {})
+    staged = bool(metadata.get("staged"))
+    envelope = ToolResultEnvelope(
+        tool_name=str(observation.tool or action.get("type") or ""),
+        action_type=str(action.get("type", "")),
+        ok=bool(observation.ok),
+        changed=bool(observation.changed),
+        summary=str(observation.summary or ""),
+        details_preview=truncate_middle(str(observation.details or ""), 600),
+        path=str(observation.path or args.get("path", "")),
+        mode=str(state.mode or ""),
+        task_shape=str(state.task_shape or ""),
+        provider=str(state.current_provider or state.base_provider or ""),
+        iteration=int(getattr(state, "iteration_count", 0) or 0),
+        staged=staged,
+        timestamp_ms=int(time.time() * 1000),
+        metadata={
+            "phase": str(
+                getattr(state, "patch_phase", "")
+                if state.mode == "patch"
+                else getattr(state, "create_phase", "")
+            )
+        },
+    ).to_dict()
+    metadata["tool_result_envelope"] = envelope
+    observation.metadata = metadata
+    state.last_tool_envelope = envelope
+    return envelope
+
+
 def _format_history_observation(summary, details):
     if details:
         return summary + " | " + truncate_middle(details, 1200)
@@ -3678,33 +4039,261 @@ def _compact_parse_error_for_history(message):
     return truncate_middle(text, 240)
 
 
-def _plan_indicates_completion(plan):
-    lower = _normalize_prompt_text(plan)
-    return any(keyword in lower for keyword in PATCH_DONE_KEYWORDS)
+def _extract_balanced_json_snippet(text):
+    raw = str(text or "")
+    best = ""
+    for open_char, close_char in (("{", "}"), ("[", "]")):
+        start = raw.find(open_char)
+        while start != -1:
+            depth = 0
+            in_string = False
+            escaped = False
+            for idx in range(start, len(raw)):
+                ch = raw[idx]
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == '"':
+                        in_string = False
+                    continue
+                if ch == '"':
+                    in_string = True
+                elif ch == open_char:
+                    depth += 1
+                elif ch == close_char:
+                    depth -= 1
+                    if depth == 0:
+                        candidate = raw[start : idx + 1]
+                        if len(candidate) > len(best):
+                            best = candidate
+                        break
+            start = raw.find(open_char, start + 1)
+    return best
+
+
+def _extract_free_text_from_raw_response(raw_text):
+    text = str(raw_text or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"^```(?:json|text|markdown)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text).strip()
+    snippet = _extract_balanced_json_snippet(text)
+    if snippet:
+        text = text.replace(snippet, " ")
+    text = re.sub(r"\s+", " ", text).strip().strip("-*• ")
+    return text
+
+
+def _is_plan_like_answer(text):
+    lowered = _normalize_prompt_text(text)
+    if not lowered:
+        return False
+    if lowered.startswith("plan:"):
+        return True
+    if lowered.startswith(("inspect ", "read ", "analyze ", "analyse ", "check ", "review ")):
+        return True
+    if "without making changes" in lowered or "do not modify" in lowered or "read-only" in lowered:
+        return True
+    if lowered.startswith("i will "):
+        return True
+    return False
+
+
+def _is_low_quality_inspect_answer(text):
+    lowered = _normalize_prompt_text(text)
+    if not lowered:
+        return True
+
+    intent_markers = (
+        "need to analyze",
+        "need to inspect",
+        "i will check",
+        "the task is to",
+        "the task requires",
+        "task requires",
+        "requires only",
+        "inspect the file",
+        "determine if it contains",
+        "need to review",
+        "must analyze",
+        "must inspect",
+        "plan to analyze",
+        "without making changes",
+        "static analysis task",
+        "no modifications allowed",
+        "can be completed using",
+        "reading and analyzing",
+    )
+    concrete_finding_markers = (
+        "the file contains",
+        "file contains",
+        "contains a penetration testing plan",
+        "penetration testing plan",
+        "attack-style plan",
+        "found",
+        "observed",
+        "evidence",
+        "classification",
+        "high-risk",
+        "security-sensitive",
+        "attack plan",
+        "target vm",
+        "lan",
+        "recon",
+        "scanning",
+        "exploit",
+        "payload",
+        "download",
+        "persistence",
+        "scheduled task",
+        "cleanup",
+        "deletion",
+        "not empty",
+        "empty file",
+        "coherent",
+    )
+    weak_topic_markers = (
+        "sensitive information",
+        "sensitive content",
+        "risky content",
+        "penetration testing",
+    )
+    meta_only_markers = (
+        "task requires",
+        "requires only",
+        "static analysis task",
+        "can be completed using",
+        "read_file and find_in_file",
+        "no modifications allowed",
+        "only reading and analyzing",
+    )
+    intent_lead_markers = (
+        "need to ",
+        "i need to ",
+        "must ",
+        "i will ",
+        "the task is",
+        "inspect ",
+        "check ",
+        "analyze ",
+    )
+
+    has_intent = any(marker in lowered for marker in intent_markers) or _is_plan_like_answer(lowered)
+    has_concrete_findings = any(marker in lowered for marker in concrete_finding_markers)
+    has_weak_topic = any(marker in lowered for marker in weak_topic_markers)
+    has_meta_only = any(marker in lowered for marker in meta_only_markers)
+    has_intent_lead = lowered.startswith(intent_lead_markers)
+
+    if has_intent_lead and not has_concrete_findings:
+        return True
+    if has_meta_only and not has_concrete_findings:
+        return True
+    if has_intent and not has_concrete_findings:
+        return True
+    if has_intent and has_weak_topic and not has_concrete_findings:
+        return True
+
+    # Very short generic answers with no findings are not acceptable for inspect-only results.
+    if len(lowered) < 120 and not has_concrete_findings:
+        return True
+
+    return False
+
+
+def _extract_final_answer_text(parsed, raw_text="", task_intent=""):
+    parsed = parsed if isinstance(parsed, dict) else {}
+    readonly_intent = str(task_intent or "") in {"inspect_only", "read_only", "run_command_only"}
+    ignore = {
+        "",
+        "done",
+        "model completion marker",
+        "single action normalized",
+        "converted legacy action array",
+        "raw code response converted",
+        "raw_text_answer",
+        "model returned done token",
+    }
+
+    def _clean(value):
+        item = str(value or "").strip()
+        lowered = _normalize_prompt_text(item)
+        if lowered in ignore:
+            return ""
+        if lowered.startswith("model completion marker"):
+            return ""
+        if _is_done_marker(item):
+            return ""
+        return item
+
+    explicit_keys = ("final_answer", "result", "answer", "final", "analysis", "summary", "message")
+    for key in explicit_keys:
+        item = _clean(parsed.get(key))
+        if item:
+            return item
+
+    reasoning = _clean(parsed.get("reasoning_short"))
+    plan = _clean(parsed.get("plan"))
+    free_text = _clean(_extract_free_text_from_raw_response(raw_text))
+
+    if readonly_intent:
+        if reasoning:
+            return reasoning
+        if free_text:
+            return free_text
+        if plan and not _is_plan_like_answer(plan):
+            return plan
+        return plan
+
+    for candidate in (plan, reasoning, free_text):
+        if candidate:
+            return candidate
+    return ""
+
+
+def _is_done_marker(text):
+    cleaned = str(text or "").strip().lower()
+    return bool(re.fullmatch(r"done[.!?]*", cleaned))
 
 
 def _completion_decision(state, plan, had_run_cmd, touched_paths, verify_observation, meaningful_materialization=False):
     verified_ok = not touched_paths or bool(verify_observation.ok)
-    plan_done = _plan_indicates_completion(plan)
-    patch_target_touched = False
-    if state.mode == "patch" and state.active_patch_target:
-        patch_target_touched = state.active_patch_target in touched_paths
+    transform_outputs_ready = False
+    transform_missing = []
+    if state.task_shape == "transform_copy_task":
+        transform_outputs_ready, transform_missing = _transform_outputs_exist(state)
+    decision = decide_completion(
+        mode=state.mode,
+        task_profile=state.task_profile,
+        task_intent=state.task_intent,
+        task_shape=state.task_shape,
+        plan=plan,
+        had_run_cmd=bool(had_run_cmd),
+        touched_paths=list(touched_paths or []),
+        verify_ok=bool(verified_ok),
+        meaningful_materialization=bool(meaningful_materialization),
+        active_patch_target=state.active_patch_target,
+        target_files=list(state.target_files or []),
+        project_root=state.active_project_root,
+        state_touched_files=list(state.touched_files or []),
+        created_files=list(state.created_files or []),
+        last_written_files=list(state.last_written_files or []),
+        transform_outputs_ready=bool(transform_outputs_ready),
+        transform_missing=list(transform_missing or []),
+        transform_verify_ok=bool(state.transform_last_verify_ok),
+        no_progress_streak=int(getattr(state, "no_progress_streak", 0) or 0),
+    )
+    return bool(decision.stop), decision.reason
 
-    if state.mode == "create":
-        if had_run_cmd and verified_ok:
-            return True, "EXECUTION/CHECK PASSED -> STOP"
-        grounded_create_done = bool(touched_paths) or bool(meaningful_materialization) or had_run_cmd
-        if plan_done and verified_ok and grounded_create_done:
-            return True, "MODEL INDICATED COMPLETION -> STOP"
-        return False, "WRITE/VERIFY OK BUT CONTINUE"
 
-    if state.single_file_task and patch_target_touched and verified_ok:
-        return True, "SINGLE-FILE PATCH VERIFIED -> STOP"
-    if plan_done and patch_target_touched and verified_ok:
-        return True, "PATCH COMPLETE -> STOP"
-    if had_run_cmd and patch_target_touched and verified_ok:
-        return True, "PATCH VERIFIED BY RUN -> STOP"
-    return False, "PATCH APPLIED BUT CONTINUE"
+def _last_error_is_permission_block(state):
+    envelope = dict(getattr(state, "last_tool_envelope", {}) or {})
+    tool_name = str(envelope.get("tool_name") or "").strip().lower()
+    if tool_name == "permission_denied":
+        return True
+    text = _normalize_prompt_text(getattr(state, "last_runtime_error", "") or "")
+    return any(token in text for token in ("permission denied", "blocked by permission policy", "denied by rule"))
 
 
 def _single_file_patch_retry_note(state):
@@ -3721,15 +4310,34 @@ def _single_file_patch_retry_note(state):
     )
 
 
+def _patch_heuristics_allowed(state):
+    intent = str(getattr(state, "task_intent", "") or "").strip().lower()
+    return intent in {"edit_existing_file", "patch_existing_code"}
+
+
 def run(
     prompt,
+    continue_update="",
     logger=print,
     stop_checker=None,
     model_timeout_handler=None,
     rescue_decider=None,
     max_iterations_handler=None,
+    permission_decider=None,
 ):
     state = _build_state(prompt)
+    try:
+        ensure_session_meta(
+            _session_path(),
+            state.session_id,
+            project_root=state.active_project_root,
+            prompt=state.goal,
+            task_fingerprint=state.task_fingerprint,
+        )
+        append_prompt_entry(_session_path(), state.session_id, state.goal, iteration=state.iteration_count)
+    except Exception:
+        pass
+
     os.makedirs(state.active_project_root, exist_ok=True)
     ensure_gitignore(state.active_project_root)
     if not git_is_repo(state.active_project_root):
@@ -3793,6 +4401,36 @@ def run(
         terminal_reason = ""
         run_executed_actions = 0
         run_blocked_actions = 0
+        run_commands_executed = False
+        continue_update_text = str(continue_update or "").strip()
+        inspect_read_observed = False
+        inspect_low_quality_attempts = 0
+        inspect_no_read_attempts = 0
+        inspect_read_required = bool(
+            state.task_intent in {"inspect_only", "read_only"}
+            and (state.source_readonly_files or state.target_files)
+        )
+
+        if continue_update_text:
+            log("CONTINUE MODE: ON")
+            history.append(
+                "CONTINUATION MODE: Continue from current workspace/session state. "
+                "Do not restart from scratch and do not repeat already completed steps."
+            )
+            previous_prompt = ""
+            if len(state.prompt_history) >= 2 and isinstance(state.prompt_history[-2], dict):
+                previous_prompt = str(state.prompt_history[-2].get("prompt") or "").strip()
+            if previous_prompt:
+                history.append("Previous user prompt:\n" + truncate_middle(previous_prompt, 1500))
+            previous_answer = str(getattr(state, "last_final_answer", "") or "").strip()
+            if previous_answer:
+                history.append("Previous final answer:\n" + truncate_middle(previous_answer, 1800))
+            elif state.last_useful_observation_summary:
+                history.append(
+                    "Previous useful observation:\n"
+                    + truncate_middle(state.last_useful_observation_summary, 900)
+                )
+            history.append("New follow-up request:\n" + truncate_middle(continue_update_text, 1500))
 
         log(f"MODE: {state.mode}")
         log(f"MODE CONTROL: {str(getattr(config, 'MODE_CONTROL', 'AUTO') or 'AUTO').strip().upper()}")
@@ -3800,8 +4438,14 @@ def run(
         log(f"MODE REASON: {state.mode_reason or 'unknown'}")
         log(f"TASK SHAPE: {state.task_shape or 'unknown'}")
         log(f"TASK SHAPE REASON: {state.task_shape_reason or 'n/a'}")
+        log(f"TASK INTENT: {state.task_intent or 'create_new_file'}")
         log(f"PATCH_FILES REPR: {repr(config.PATCH_FILES)}")
         log(f"ACTIVE PROJECT ROOT: {state.active_project_root}")
+        permission_context = permission_context_from_config()
+        state.permission_mode = str(permission_context.get("mode") or state.permission_mode or "workspace-write")
+        log(f"PERMISSION MODE: {state.permission_mode}")
+        if permission_context.get("summary"):
+            log(f"PERMISSION RULES: {permission_context.get('summary')}")
         if state.task_shape in TRANSFORM_TASK_SHAPES:
             source_preview = ", ".join(state.source_readonly_files[:12]) if state.source_readonly_files else "(none)"
             derived_preview = ", ".join(state.derived_allowed_files[:12]) if state.derived_allowed_files else "(none)"
@@ -3810,7 +4454,8 @@ def run(
             log(f"LARGE FILE MODE: {state.large_file_mode}")
             log("PATCH HEURISTICS: disabled")
         else:
-            log("PATCH HEURISTICS: enabled" if state.mode == "patch" else "PATCH HEURISTICS: disabled")
+            patch_heuristics_enabled = state.mode == "patch" and _patch_heuristics_allowed(state)
+            log("PATCH HEURISTICS: enabled" if patch_heuristics_enabled else "PATCH HEURISTICS: disabled")
         if _rescue_mode() == "OFF":
             log(f"RESCUE SUPPRESSED: {_rescue_suppressed_reason()}")
             log("LOCAL FALLBACK STEP: active (OpenAI rescue disabled)")
@@ -3888,7 +4533,7 @@ def run(
             if (previous_profile and previous_profile != state.task_profile) or (previous_route and previous_route != state.model_route):
                 log(f"ROUTE ESCALATION REASON: {state.route_reason or 'profile/route change'}")
 
-            if state.mode == "patch":
+            if state.mode == "patch" and _patch_heuristics_allowed(state):
                 _refresh_patch_context(state)
                 stale_detected, stale_reason = _detect_stale_error_context(
                     state.active_patch_target,
@@ -3981,6 +4626,11 @@ def run(
                     state.patch_phase = "patch_target"
                     _save_session_state(state)
                     continue
+            elif state.mode == "patch":
+                state.patch_hotspot_candidates = []
+                state.patch_hotspot_label = ""
+                state.patch_exact_snippet = ""
+                state.patch_task_intent = ""
             if state.mode == "create":
                 if state.task_shape == "transform_copy_task":
                     log(f"TRANSFORM PHASE: {state.transform_phase}")
@@ -4100,30 +4750,48 @@ def run(
                     log(f"PARSE PATH: {parse_path}")
                 consecutive_parse_errors = 0
             except Exception as e:
-                message = str(e)
-                log(message)
-                history.append(_compact_parse_error_for_history(message))
-                if state.mode == "patch" and state.single_file_task:
-                    fallback_note = _single_file_patch_retry_note(state)
-                    if fallback_note not in history[-4:]:
-                        log("PATCH PARSE FALLBACK -> REQUEST ANCHORED OR CHUNKED RETRY")
-                        history.append(fallback_note)
-                consecutive_parse_errors += 1
-                if consecutive_parse_errors >= config.MAX_PARSE_ERRORS and _hard_rescue_handoff(
-                    state, history, log, reason=message, rescue_decider=rescue_decider
-                ):
-                    consecutive_parse_errors = 0
-                    _save_session_state(state)
-                    continue
-                if consecutive_parse_errors >= config.MAX_PARSE_ERRORS:
-                    log("STOP: repeated parse errors")
-                    if _attempt_local_fallback(state, history, log, reason=message):
+                if state.task_intent in {"inspect_only", "read_only", "run_command_only"}:
+                    raw_answer = str(raw_text or "").strip()
+                    if raw_answer and not _is_done_marker(raw_answer):
+                        data = {
+                            "plan": "raw_text_answer",
+                            "reasoning_short": raw_answer,
+                            "actions": [],
+                            "parse_path": "raw_text_answer",
+                        }
+                        log("PARSE PATH: raw_text_answer")
+                        consecutive_parse_errors = 0
+                    else:
+                        data = None
+                else:
+                    data = None
+                if data is not None:
+                    pass
+                else:
+                    message = str(e)
+                    log(message)
+                    history.append(_compact_parse_error_for_history(message))
+                    if state.mode == "patch" and state.single_file_task:
+                        fallback_note = _single_file_patch_retry_note(state)
+                        if fallback_note not in history[-4:]:
+                            log("PATCH PARSE FALLBACK -> REQUEST ANCHORED OR CHUNKED RETRY")
+                            history.append(fallback_note)
+                    consecutive_parse_errors += 1
+                    if consecutive_parse_errors >= config.MAX_PARSE_ERRORS and _hard_rescue_handoff(
+                        state, history, log, reason=message, rescue_decider=rescue_decider
+                    ):
                         consecutive_parse_errors = 0
                         _save_session_state(state)
                         continue
-                    terminal_reason = "repeated parse errors"
-                    break
-                continue
+                    if consecutive_parse_errors >= config.MAX_PARSE_ERRORS:
+                        log("STOP: repeated parse errors")
+                        if _attempt_local_fallback(state, history, log, reason=message):
+                            consecutive_parse_errors = 0
+                            _save_session_state(state)
+                            continue
+                        terminal_reason = "repeated parse errors"
+                        break
+                    continue
 
             if stop_requested():
                 log("STOP REQUESTED")
@@ -4169,7 +4837,7 @@ def run(
                     terminal_reason = "transform_verified_success"
                     _save_session_state(state)
                     break
-            if state.mode == "patch":
+            if state.mode == "patch" and _patch_heuristics_allowed(state):
                 switched, reason = _negotiate_hotspot_from_actions(state, actions)
                 if switched:
                     log(f"HOTSPOT NEGOTIATION: {reason}")
@@ -4220,27 +4888,105 @@ def run(
                 continue
 
             if not actions:
-                if state.last_runtime_error:
-                    msg = "EMPTY DONE BLOCKED: runtime or verify error still exists"
+                if state.task_intent in {"inspect_only", "read_only", "run_command_only"}:
+                    final_answer = _extract_final_answer_text(
+                        data,
+                        raw_text=raw_text,
+                        task_intent=state.task_intent,
+                    )
+                    if state.task_intent in {"inspect_only", "read_only"} and inspect_read_required and not inspect_read_observed:
+                        inspect_no_read_attempts += 1
+                        if inspect_no_read_attempts <= 1:
+                            msg = "INSPECT QUALITY GATE: no file inspection evidence -> read target first"
+                            log(msg)
+                            history.append(msg)
+                            history.append(
+                                "You have not read the target file yet. Use read_file or find_in_file first, "
+                                "then provide concrete findings. Do not return a plan."
+                            )
+                            _save_session_state(state)
+                            continue
+                        warning = (
+                            "LOW QUALITY FINAL ANSWER WARNING: model returned final answer without reading "
+                            "the required target file"
+                        )
+                        log(warning)
+                        history.append(warning)
+                        terminal_reason = "INSPECT READ NOT PERFORMED"
+                        _save_session_state(state)
+                        break
+                    if state.task_intent in {"inspect_only", "read_only"} and inspect_read_observed:
+                        if _is_low_quality_inspect_answer(final_answer):
+                            inspect_low_quality_attempts += 1
+                            if inspect_low_quality_attempts <= 1:
+                                msg = "INSPECT QUALITY GATE: plan/intention answer rejected -> request concrete findings"
+                                log(msg)
+                                history.append(msg)
+                                history.append(
+                                    "You already read the file. Provide the actual findings now. "
+                                    "Do not return a plan. Do not call tools unless needed."
+                                )
+                                _save_session_state(state)
+                                continue
+                            warning = (
+                                "LOW QUALITY FINAL ANSWER WARNING: model returned plan/intention text twice "
+                                "after read-only inspection"
+                            )
+                            log(warning)
+                            history.append(warning)
+                            terminal_reason = "LOW QUALITY FINAL ANSWER"
+                            _save_session_state(state)
+                            break
+                        inspect_low_quality_attempts = 0
+                        inspect_no_read_attempts = 0
+
+                    if final_answer:
+                        state.last_final_answer = str(final_answer).strip()
+                        log("FINAL ANSWER BEGIN")
+                        for row in str(final_answer).splitlines():
+                            text_row = str(row or "").strip()
+                            if text_row:
+                                log(f"FINAL ANSWER: {text_row}")
+                        log("FINAL ANSWER END")
+                        log("NO CHANGES MADE (READ-ONLY TASK)")
+                        log("No files were modified.")
+                        if not run_commands_executed:
+                            log("No commands were executed.")
+                        history.append("FINAL ANSWER: " + truncate_middle(final_answer, 1200))
+                outputs_ok = True
+                missing = []
+                if state.task_shape == "transform_copy_task":
+                    outputs_ok, missing = _transform_outputs_exist(state)
+                empty_decision = decide_empty_done(
+                    mode=state.mode,
+                    task_intent=state.task_intent,
+                    task_shape=state.task_shape,
+                    transform_outputs_ready=bool(outputs_ok),
+                    transform_missing=list(missing or []),
+                    transform_verify_ok=bool(state.transform_last_verify_ok),
+                    runtime_error_present=bool(state.last_runtime_error),
+                    permission_blocked=_last_error_is_permission_block(state),
+                    no_progress_streak=int(getattr(state, "no_progress_streak", 0) or 0),
+                )
+                if empty_decision.stop and empty_decision.outcome == "blocked":
+                    msg = "EMPTY DONE AFTER PERMISSION BLOCK -> STOP"
+                    log(msg)
+                    history.append(msg)
+                    terminal_reason = empty_decision.reason
+                    _save_session_state(state)
+                    break
+                if not empty_decision.stop:
+                    msg = empty_decision.reason
                     log(msg)
                     history.append(msg)
                     _save_session_state(state)
                     continue
-                if state.task_shape == "transform_copy_task":
-                    outputs_ok, missing = _transform_outputs_exist(state)
-                    if not outputs_ok:
-                        msg = f"EMPTY DONE BLOCKED: missing required transform outputs -> {', '.join(missing)}"
-                        log(msg)
-                        history.append(msg)
-                        _save_session_state(state)
-                        continue
-                    if not state.transform_last_verify_ok:
-                        msg = "EMPTY DONE BLOCKED: verification has not passed for transform outputs"
-                        log(msg)
-                        history.append(msg)
-                        _save_session_state(state)
-                        continue
-                if config.ALLOW_EMPTY_DONE_RETRY and not empty_done_retry_used and not state.progress_happened:
+                if (
+                    state.task_intent not in {"inspect_only", "read_only", "run_command_only"}
+                    and config.ALLOW_EMPTY_DONE_RETRY
+                    and not empty_done_retry_used
+                    and not state.progress_happened
+                ):
                     empty_done_retry_used = True
                     msg = "EMPTY DONE TOO EARLY -> RETRY. You did nothing yet."
                     log(msg)
@@ -4249,7 +4995,7 @@ def run(
                     continue
                 log("DONE")
                 finished_success = True
-                terminal_reason = "model returned done with no pending runtime error"
+                terminal_reason = empty_decision.reason
                 break
 
             executed_count = 0
@@ -4342,8 +5088,13 @@ def run(
 
                     action_key = json.dumps(action, ensure_ascii=False, sort_keys=True)
                     repeated_count = state.duplicate_action_cache.get(action_key, 0)
-                    if repeated_count >= config.REPEAT_ACTION_LIMIT:
-                        msg = f"BLOCK REPEATED ACTION: {action.get('type')}"
+                    repeat_decision = decide_repeated_action(
+                        repeated_count=int(repeated_count or 0),
+                        repeat_limit=int(config.REPEAT_ACTION_LIMIT or 0),
+                        action_type=action.get("type"),
+                    )
+                    if repeat_decision.blocked:
+                        msg = repeat_decision.reason
                         log(msg)
                         history.append(msg)
                         history.append(
@@ -4410,6 +5161,7 @@ def run(
                                 state,
                                 project_root_override=action_root,
                                 stop_checker=stop_requested,
+                                permission_decider=permission_decider,
                             )
                             if not targeted_read:
                                 transport_text, cache_entry = _structured_large_read_observation(
@@ -4430,6 +5182,7 @@ def run(
                             state,
                             project_root_override=action_root,
                             stop_checker=stop_requested,
+                            permission_decider=permission_decider,
                         )
                     if staged_action:
                         metadata = dict(observation.metadata or {})
@@ -4437,6 +5190,20 @@ def run(
                         metadata["staged"] = True
                         observation.metadata = metadata
                         observation.summary = observation.summary + " [staged]"
+
+                    _attach_tool_result_envelope(action, observation, state)
+                    try:
+                        append_journal_event(
+                            _session_path(),
+                            "tool_result",
+                            {
+                                "session_id": state.session_id,
+                                "iteration": int(state.iteration_count or 0),
+                                "envelope": dict(state.last_tool_envelope or {}),
+                            },
+                        )
+                    except Exception:
+                        pass
 
                     executed_count += 1
                     run_executed_actions += 1
@@ -4473,6 +5240,12 @@ def run(
                         observation.tool in PROGRESS_TOOLS
                         or bool((observation.metadata or {}).get("progress"))
                     )
+                    read_only_work_signal = (
+                        state.task_intent in {"inspect_only", "read_only", "run_command_only"}
+                        and observation.ok
+                        and observation.tool in {"read_file", "find_in_file", "run_cmd"}
+                    )
+                    progress_signal = progress_signal or read_only_work_signal
                     if progress_signal:
                         iteration_progress = True
                         state.progress_happened = True
@@ -4486,8 +5259,15 @@ def run(
                         or (observation.changed and observation.tool in PROGRESS_TOOLS)
                     ):
                         meaningful_materialization = True
+                    if (
+                        state.task_intent in {"inspect_only", "read_only"}
+                        and observation.ok
+                        and observation.tool in {"read_file", "find_in_file"}
+                    ):
+                        inspect_read_observed = True
 
                     if observation.tool == "run_cmd":
+                        run_commands_executed = True
                         had_run_cmd = True
                         if not observation.ok:
                             iteration_error = observation.details or observation.summary
@@ -4648,8 +5428,10 @@ def run(
                         "patch_lines",
                     } and not observation.ok:
                         critical_generation_failed = True
-                    if observation.tool in {"off_target_patch_action", "action_format_violation"}:
+                    if observation.tool in {"off_target_patch_action", "action_format_violation", "permission_denied"}:
                         run_blocked_actions += 1
+                        if observation.tool == "permission_denied":
+                            history.append("PERMISSION POLICY BLOCK: choose allowed action or request approval.")
                         break
                     if critical_generation_failed:
                         break
@@ -4895,12 +5677,17 @@ def run(
                     state.patch_broad_patch_streak = 0
 
             if meaningful_materialization and config.AUTO_GIT_CHECKPOINTS:
+                log(f"GIT CHECKPOINT TARGET: selected_root={state.active_project_root}")
                 ok, msg = git_checkpoint(
                     state.active_project_root,
                     f"checkpoint iter {iteration + 1}: {state.mode}",
                 )
                 log("GIT CHECKPOINT " + ("OK" if ok else "ERR"))
                 if msg:
+                    for line in str(msg).splitlines():
+                        clean = str(line or "").strip()
+                        if clean.startswith("repo_root=") or clean.startswith("branch=") or clean.startswith("remote="):
+                            log(f"GIT CHECKPOINT CONTEXT: {clean}")
                     log(msg)
 
             should_stop, stop_reason = _completion_decision(
@@ -4911,18 +5698,9 @@ def run(
                 verify_observation=verify_observation,
                 meaningful_materialization=meaningful_materialization,
             )
-            if should_stop and state.task_shape == "transform_copy_task":
-                outputs_ok, missing = _transform_outputs_exist(state)
-                if not outputs_ok:
-                    should_stop = False
-                    stop_reason = f"TRANSFORM DONE BLOCKED: missing outputs -> {', '.join(missing)}"
-                    log(stop_reason)
-                    history.append(stop_reason)
-                elif not state.transform_last_verify_ok:
-                    should_stop = False
-                    stop_reason = "TRANSFORM DONE BLOCKED: verify has not passed for required outputs"
-                    log(stop_reason)
-                    history.append(stop_reason)
+            if not should_stop and str(stop_reason or "").startswith("TRANSFORM DONE BLOCKED:"):
+                log(stop_reason)
+                history.append(stop_reason)
             if should_stop:
                 if state.mode == "patch":
                     state.patch_phase = "complete"
@@ -4940,18 +5718,34 @@ def run(
             else:
                 state.no_progress_streak += 1
                 log("NO REAL PROGRESS -> CONTINUE")
-                if state.no_progress_streak >= 2:
-                    if state.mode == "create" and state.create_strategy == "chunked_rewrite":
-                        log("NO-PROGRESS SHIFT: chunked_rewrite -> write_file")
-                        state.create_strategy = "write_file"
-                        state.create_strategy_reason = "no-progress strategy shift"
-                        state.create_phase = "fix_existing_file" if (state.last_written_files or state.created_files) else "initial_create"
-                        _reset_chunk_session(state, reason="no-progress strategy shift", clear_rewrite_state=False)
-                    elif state.mode == "patch":
-                        log("NO-PROGRESS SHIFT: refresh patch grounding")
-                        state.patch_phase = "inspect_target"
-                if state.no_progress_streak >= 4:
-                    fail_reason = "repeated no real progress"
+                no_progress_decision = decide_no_progress(
+                    mode=state.mode,
+                    task_intent=state.task_intent,
+                    verify_ok=bool(verify_observation and verify_observation.ok),
+                    had_run_cmd=bool(had_run_cmd),
+                    active_patch_target=state.active_patch_target,
+                    touched_paths=list(touched_paths or []),
+                    meaningful_materialization=bool(meaningful_materialization),
+                    runtime_error_present=bool(state.last_runtime_error),
+                    no_progress_streak=int(state.no_progress_streak or 0),
+                    create_strategy=state.create_strategy,
+                )
+                if no_progress_decision.stop:
+                    log(no_progress_decision.reason)
+                    _save_session_state(state)
+                    terminal_reason = no_progress_decision.reason
+                    break
+                if no_progress_decision.shift_chunk_to_write:
+                    log("NO-PROGRESS SHIFT: chunked_rewrite -> write_file")
+                    state.create_strategy = "write_file"
+                    state.create_strategy_reason = "no-progress strategy shift"
+                    state.create_phase = "fix_existing_file" if (state.last_written_files or state.created_files) else "initial_create"
+                    _reset_chunk_session(state, reason="no-progress strategy shift", clear_rewrite_state=False)
+                elif no_progress_decision.refresh_patch_grounding:
+                    log("NO-PROGRESS SHIFT: refresh patch grounding")
+                    state.patch_phase = "inspect_target"
+                if no_progress_decision.trigger_recovery:
+                    fail_reason = no_progress_decision.reason or "repeated no real progress"
                     if _hard_rescue_handoff(state, history, log, reason=fail_reason, rescue_decider=rescue_decider):
                         state.no_progress_streak = 0
                         _save_session_state(state)
@@ -4962,7 +5756,7 @@ def run(
                         continue
                     log("STOP: no progress after local fallback exhaustion")
                     _save_session_state(state)
-                    terminal_reason = "repeated no real progress"
+                    terminal_reason = fail_reason
                     break
             _save_session_state(state)
 
@@ -4980,6 +5774,21 @@ def run(
             f"stop_reason={terminal_reason or state.last_runtime_error or 'n/a'} "
             f"status={'success' if finished_success else 'stopped'} {output_status}"
         )
+        try:
+            append_journal_event(
+                _session_path(),
+                "run_summary",
+                {
+                    "session_id": state.session_id,
+                    "status": "success" if finished_success else "stopped",
+                    "stop_reason": terminal_reason or state.last_runtime_error or "n/a",
+                    "executed": int(run_executed_actions or 0),
+                    "blocked": int(run_blocked_actions or 0),
+                    "output_status": output_status,
+                },
+            )
+        except Exception:
+            pass
         flush_pending_log()
 
         if not finished_success:
@@ -5011,3 +5820,5 @@ def run(
         flush_pending_log()
         _save_session_state(state)
         return log_path
+
+

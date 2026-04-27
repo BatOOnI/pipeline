@@ -4,6 +4,7 @@ MODE_CONTROL = "AUTO"  # AUTO | FORCE_CREATE | FORCE_PATCH
 # LM Studio
 LMSTUDIO_URL = "http://127.0.0.1:1235/v1/chat/completions"
 LMSTUDIO_MODEL = "openai/gpt-oss-20b"
+LMSTUDIO_API_KEY = ""
 LMSTUDIO_TIMEOUT = 120
 
 # OpenAI
@@ -11,6 +12,12 @@ OPENAI_API_KEY = ""
 OPENAI_MODEL = "gpt-5.4-nano"
 OPENAI_RESCUE_ENABLED = True
 RESCUE_MODE = "OFF"  # OFF | ON | ASK_BEFORE_RESCUE
+
+# Permission flow
+PERMISSION_MODE = "workspace-write"  # read-only | workspace-write | danger-full-access | prompt | allow
+PERMISSION_ALLOW_RULES = ""  # e.g. "run_cmd:python*" or "read_file"
+PERMISSION_DENY_RULES = ""  # e.g. "run_cmd:git reset"
+PERMISSION_ASK_RULES = ""  # e.g. "run_cmd:*"
 
 # Runtime
 MAX_ITERATIONS = 10

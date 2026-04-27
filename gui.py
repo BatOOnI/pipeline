@@ -17,7 +17,9 @@ from git_tools import (
     git_set_remote,
     git_tag,
 )
+from preflight_doctor import run_preflight_doctor
 from providers import list_models
+from session_state_store import append_journal_event, journal_path_for
 from utils import approx_token_count, coerce_int, ensure_gitignore, open_path, read_json_file, write_json_file
 
 
@@ -113,6 +115,7 @@ class App:
         self.timeout_dialog_event = None
         self.iteration_limit_dialog = None
         self.iteration_limit_dialog_event = None
+        self.doctor_dialog = None
         self.settings_path = os.path.abspath(os.path.join(os.getcwd(), ".agent", "gui_settings.json"))
         self._saved_prompt_text = ""
         self._saved_session_base_prompt = ""
@@ -152,10 +155,6 @@ class App:
 
         self.prompt_chars_var = tk.StringVar(value="0")
         self.estimated_tokens_var = tk.StringVar(value="0")
-        self.prompt_char_limit_var = tk.StringVar(value=str(config.PROMPT_CHAR_LIMIT))
-        self.patch_files_var = tk.StringVar(value=config.PATCH_FILES)
-        self.patch_snippet_lines_var = tk.StringVar(value=str(config.PATCH_SNIPPET_LINES))
-        self.max_output_tokens_var = tk.StringVar(value=str(config.MAX_OUTPUT_TOKENS))
 
         self.repo_dir_var = tk.StringVar(value=os.getcwd())
         self.remote_url_var = tk.StringVar(value=config.DEFAULT_REMOTE_URL)
@@ -233,17 +232,13 @@ class App:
 
         metrics = ttk.Frame(composer_box)
         metrics.grid(row=1, column=0, sticky="we", pady=(8, 0))
-        for col in range(8):
+        for col in range(4):
             metrics.columnconfigure(col, weight=0)
-        metrics.columnconfigure(7, weight=1)
+        metrics.columnconfigure(3, weight=1)
         ttk.Label(metrics, text="Prompt chars").grid(row=0, column=0, sticky="w", padx=(0, 4))
         ttk.Entry(metrics, textvariable=self.prompt_chars_var, width=8, state="readonly").grid(row=0, column=1, sticky="w", padx=(0, 10))
         ttk.Label(metrics, text="Estimated tokens").grid(row=0, column=2, sticky="w", padx=(0, 4))
         ttk.Entry(metrics, textvariable=self.estimated_tokens_var, width=8, state="readonly").grid(row=0, column=3, sticky="w", padx=(0, 10))
-        ttk.Label(metrics, text="Prompt limit").grid(row=0, column=4, sticky="w", padx=(0, 4))
-        ttk.Entry(metrics, textvariable=self.prompt_char_limit_var, width=8).grid(row=0, column=5, sticky="w", padx=(0, 10))
-        ttk.Label(metrics, text="Max output tokens").grid(row=0, column=6, sticky="w", padx=(0, 4))
-        ttk.Entry(metrics, textvariable=self.max_output_tokens_var, width=8).grid(row=0, column=7, sticky="w")
 
         run_row = ttk.Frame(composer_box)
         run_row.grid(row=2, column=0, sticky="we", pady=(8, 0))
@@ -259,8 +254,6 @@ class App:
         ttk.Button(run_row, text="Run", command=self.run_selected_mode).grid(row=0, column=2, sticky="w", padx=(0, 6))
         ttk.Button(run_row, text="Stop", command=self.stop_pipeline).grid(row=0, column=3, sticky="w", padx=(0, 6))
         ttk.Button(run_row, text="Clear Session", command=lambda: self.clear_session(stop_running=True)).grid(row=0, column=4, sticky="w", padx=(0, 6))
-        ttk.Button(run_row, text="Fetch Models", command=self.fetch_models).grid(row=0, column=5, sticky="w", padx=(0, 6))
-        ttk.Button(run_row, text="Save API Keys", command=self.save_api_key).grid(row=0, column=6, sticky="w")
 
         anchor_row = ttk.Frame(composer_box)
         anchor_row.grid(row=3, column=0, sticky="we", pady=(6, 0))
@@ -320,12 +313,21 @@ class App:
         self.lm_model_combo = ttk.Combobox(provider_tab, textvariable=self.lm_model_var)
         self.lm_model_combo.grid(row=1, column=1, sticky="we", **pad)
         ttk.Label(provider_tab, text="LM API Key").grid(row=2, column=0, sticky="w", **pad)
-        ttk.Entry(provider_tab, textvariable=self.lm_key_var, show="*").grid(row=2, column=1, sticky="we", **pad)
+        lm_key_row = ttk.Frame(provider_tab)
+        lm_key_row.grid(row=2, column=1, sticky="we", **pad)
+        lm_key_row.columnconfigure(0, weight=1)
+        ttk.Entry(lm_key_row, textvariable=self.lm_key_var, show="*").grid(row=0, column=0, sticky="we")
+        ttk.Button(lm_key_row, text="Save API", command=self.save_api_key).grid(row=0, column=1, padx=(6, 0))
         ttk.Label(provider_tab, text="OpenAI Model").grid(row=3, column=0, sticky="w", **pad)
         self.oa_model_combo = ttk.Combobox(provider_tab, textvariable=self.oa_model_var)
         self.oa_model_combo.grid(row=3, column=1, sticky="we", **pad)
         ttk.Label(provider_tab, text="OpenAI API Key").grid(row=4, column=0, sticky="w", **pad)
-        ttk.Entry(provider_tab, textvariable=self.oa_key_var, show="*").grid(row=4, column=1, sticky="we", **pad)
+        oa_key_row = ttk.Frame(provider_tab)
+        oa_key_row.grid(row=4, column=1, sticky="we", **pad)
+        oa_key_row.columnconfigure(0, weight=1)
+        ttk.Entry(oa_key_row, textvariable=self.oa_key_var, show="*").grid(row=0, column=0, sticky="we")
+        ttk.Button(oa_key_row, text="Save API", command=self.save_api_key).grid(row=0, column=1, padx=(6, 0))
+        ttk.Button(provider_tab, text="Fetch Models", command=self.fetch_models).grid(row=5, column=1, sticky="e", **pad)
 
         project_tab = ttk.Frame(tabs)
         project_tab.columnconfigure(1, weight=1)
@@ -337,10 +339,13 @@ class App:
         project_root_row.columnconfigure(0, weight=1)
         ttk.Entry(project_root_row, textvariable=self.project_root_var).grid(row=0, column=0, sticky="we")
         ttk.Button(project_root_row, text="Browse", command=self.browse_project_root).grid(row=0, column=1, padx=(6, 0))
-        ttk.Label(project_tab, text="Patch files").grid(row=1, column=0, sticky="w", **pad)
-        ttk.Entry(project_tab, textvariable=self.patch_files_var).grid(row=1, column=1, sticky="we", **pad)
-        ttk.Label(project_tab, text="Patch snippet lines").grid(row=2, column=0, sticky="w", **pad)
-        ttk.Entry(project_tab, textvariable=self.patch_snippet_lines_var, width=12).grid(row=2, column=1, sticky="w", **pad)
+        ttk.Label(
+            project_tab,
+            text="Patch targeting and snippet scope are now automatic.",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Button(project_tab, text="Doctor / Preflight", command=self.run_doctor_preflight).grid(
+            row=2, column=1, sticky="e", **pad
+        )
 
         git_tab = ttk.Frame(tabs)
         git_tab.columnconfigure(1, weight=1)
@@ -403,6 +408,165 @@ class App:
             self.start_fresh_run()
             return
         self.start_pipeline()
+
+    def _doctor_summary_text(self, report):
+        summary = dict(report.get("summary") or {})
+        return (
+            f"Doctor summary: overall={summary.get('overall', 'WARN')} "
+            f"(OK={int(summary.get('ok', 0) or 0)}, "
+            f"WARN={int(summary.get('warn', 0) or 0)}, "
+            f"FAIL={int(summary.get('fail', 0) or 0)})"
+        )
+
+    def _doctor_journal_available(self):
+        session_path = os.path.abspath(os.path.join(os.getcwd(), config.SESSION_FILE))
+        journal_path = journal_path_for(session_path)
+        if os.path.exists(journal_path):
+            return True, session_path, journal_path
+        if os.path.exists(f"{journal_path}.1") or os.path.exists(f"{journal_path}.2") or os.path.exists(f"{journal_path}.3"):
+            return True, session_path, journal_path
+        return False, session_path, journal_path
+
+    def _log_doctor_report_to_journal(self, report):
+        available, session_path, _journal_path = self._doctor_journal_available()
+        if not available:
+            return False
+        payload = {
+            "summary": dict(report.get("summary") or {}),
+            "provider": str(report.get("provider") or ""),
+            "project_root": str(report.get("project_root") or ""),
+            "checks": list(report.get("results") or []),
+        }
+        append_journal_event(session_path, "doctor_result", payload)
+        return True
+
+    def _copy_doctor_summary(self, report):
+        lines = [self._doctor_summary_text(report)]
+        for row in list(report.get("results") or []):
+            lines.append(
+                f"- [{row.get('status', 'WARN')}] {row.get('label', '')}: {row.get('detail', '')}"
+            )
+        text = "\n".join(lines)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.log("DOCTOR: summary copied to clipboard")
+
+    def _show_doctor_dialog(self, report):
+        if self.doctor_dialog is not None:
+            try:
+                self.doctor_dialog.destroy()
+            except Exception:
+                pass
+            self.doctor_dialog = None
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Doctor / Preflight")
+        dialog.geometry("980x460")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(1, weight=1)
+
+        summary_text = self._doctor_summary_text(report)
+        summary = dict(report.get("summary") or {})
+        overall = str(summary.get("overall") or "WARN").upper()
+        color = "#1b5e20" if overall == "OK" else ("#8a6d1f" if overall == "WARN" else "#b71c1c")
+        ttk.Label(dialog, text=summary_text, foreground=color).grid(row=0, column=0, sticky="w", padx=12, pady=(12, 8))
+
+        table_wrap = ttk.Frame(dialog)
+        table_wrap.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
+        table_wrap.columnconfigure(0, weight=1)
+        table_wrap.rowconfigure(0, weight=1)
+
+        columns = ("check", "status", "detail")
+        table = ttk.Treeview(table_wrap, columns=columns, show="headings", height=14)
+        table.heading("check", text="Check")
+        table.heading("status", text="Status")
+        table.heading("detail", text="Detail")
+        table.column("check", width=290, anchor="w")
+        table.column("status", width=80, anchor="center")
+        table.column("detail", width=560, anchor="w")
+
+        for row in list(report.get("results") or []):
+            status = str(row.get("status") or "WARN").upper()
+            tag = "warn"
+            if status == "OK":
+                tag = "ok"
+            elif status == "FAIL":
+                tag = "fail"
+            table.insert(
+                "",
+                "end",
+                values=(row.get("label", ""), status, row.get("detail", "")),
+                tags=(tag,),
+            )
+
+        table.tag_configure("ok", foreground="#1b5e20")
+        table.tag_configure("warn", foreground="#8a6d1f")
+        table.tag_configure("fail", foreground="#b71c1c")
+
+        y_scroll = ttk.Scrollbar(table_wrap, orient="vertical", command=table.yview)
+        table.configure(yscrollcommand=y_scroll.set)
+        table.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+
+        btns = ttk.Frame(dialog)
+        btns.grid(row=2, column=0, sticky="e", padx=12, pady=(0, 12))
+        ttk.Button(btns, text="Copy Summary", command=lambda: self._copy_doctor_summary(report)).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="Close", command=dialog.destroy).pack(side="left")
+
+        self.doctor_dialog = dialog
+
+    def run_doctor_preflight(self):
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("Busy", "Pipeline is currently running. Stop it before running Doctor.")
+            return
+
+        self.apply_config()
+        self._save_gui_settings()
+        self.status_label.config(text="Doctor running...")
+        self.log("DOCTOR: preflight started")
+
+        project_root = self._normalize_project_root(self.project_root_var.get()) or config.ACTIVE_PROJECT_ROOT or ""
+        provider = str(self.provider_var.get() or config.PROVIDER or "lmstudio").strip().lower()
+
+        def job():
+            try:
+                report = run_preflight_doctor(
+                    project_root=project_root,
+                    selected_provider=provider,
+                    cwd=os.getcwd(),
+                )
+            except Exception as exc:
+                self.root.after(
+                    0,
+                    lambda: (
+                        self.status_label.config(text="Doctor failed"),
+                        self.log(f"DOCTOR FAIL: {exc}"),
+                        messagebox.showerror("Doctor / Preflight", str(exc)),
+                    ),
+                )
+                return
+
+            def finish():
+                self.status_label.config(text="Idle")
+                self.log("DOCTOR: " + self._doctor_summary_text(report))
+                for row in list(report.get("results") or []):
+                    self.log(f"DOCTOR {row.get('status', 'WARN')}: {row.get('label', '')} | {row.get('detail', '')}")
+                journal_logged = False
+                try:
+                    journal_logged = self._log_doctor_report_to_journal(report)
+                except Exception as exc:
+                    self.log(f"DOCTOR: journal logging failed ({exc})")
+                if journal_logged:
+                    self.log("DOCTOR: doctor_result event logged to journal")
+                else:
+                    self.log("DOCTOR: journal not present; skipped doctor_result event")
+                self._show_doctor_dialog(report)
+
+            self.root.after(0, finish)
+
+        threading.Thread(target=job, daemon=True).start()
 
     def _on_prompt_modified(self, _event=None):
         self.prompt_text.edit_modified(False)
@@ -679,10 +843,6 @@ class App:
         config.RUN_TIMEOUT = coerce_int(self.run_timeout_var.get(), 15, minimum=1, maximum=600)
         config.MODEL_TIMEOUT = coerce_int(self.model_timeout_var.get(), 120, minimum=5, maximum=3600)
         config.AUTO_RUN_COMMANDS = bool(self.auto_run_var.get())
-        config.PROMPT_CHAR_LIMIT = coerce_int(self.prompt_char_limit_var.get(), 12000, minimum=1500, maximum=50000)
-        config.PATCH_FILES = self.patch_files_var.get().strip()
-        config.PATCH_SNIPPET_LINES = coerce_int(self.patch_snippet_lines_var.get(), 80, minimum=10, maximum=400)
-        config.MAX_OUTPUT_TOKENS = coerce_int(self.max_output_tokens_var.get(), 2000, minimum=128, maximum=16000)
 
     def _load_gui_settings(self):
         data = read_json_file(self.settings_path, default={})
@@ -717,21 +877,12 @@ class App:
         project_root = self._normalize_project_root(data.get("project_root", ""))
         if project_root:
             self.project_root_var.set(project_root)
-        patch_files = str(data.get("patch_files", "")).strip()
-        if patch_files or "patch_files" in data:
-            self.patch_files_var.set(patch_files)
         if "max_iterations" in data:
             self.max_iter_var.set(str(data.get("max_iterations")))
         if "run_timeout" in data:
             self.run_timeout_var.set(str(data.get("run_timeout")))
         if "model_timeout" in data:
             self.model_timeout_var.set(str(data.get("model_timeout")))
-        if "prompt_char_limit" in data:
-            self.prompt_char_limit_var.set(str(data.get("prompt_char_limit")))
-        if "patch_snippet_lines" in data:
-            self.patch_snippet_lines_var.set(str(data.get("patch_snippet_lines")))
-        if "max_output_tokens" in data:
-            self.max_output_tokens_var.set(str(data.get("max_output_tokens")))
         if "auto_run_commands" in data:
             self.auto_run_var.set(bool(data.get("auto_run_commands")))
         run_mode = str(data.get("run_mode", "")).strip()
@@ -759,13 +910,9 @@ class App:
             "lm_model": self.lm_model_var.get().strip(),
             "openai_model": self.oa_model_var.get().strip(),
             "project_root": self._normalize_project_root(self.project_root_var.get()),
-            "patch_files": self.patch_files_var.get().strip(),
             "max_iterations": self.max_iter_var.get().strip(),
             "run_timeout": self.run_timeout_var.get().strip(),
             "model_timeout": self.model_timeout_var.get().strip(),
-            "prompt_char_limit": self.prompt_char_limit_var.get().strip(),
-            "patch_snippet_lines": self.patch_snippet_lines_var.get().strip(),
-            "max_output_tokens": self.max_output_tokens_var.get().strip(),
             "auto_run_commands": bool(self.auto_run_var.get()),
         }
         write_json_file(self.settings_path, payload)

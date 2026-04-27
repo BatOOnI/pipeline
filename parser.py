@@ -462,6 +462,11 @@ def _raw_code_to_actions(text: str, active_target: str):
     }
 
 
+def _is_done_token(text: str) -> bool:
+    cleaned = (text or "").strip().lower()
+    return bool(re.fullmatch(r"done[.!?]*", cleaned))
+
+
 def parse_response(text, active_target=None, expected_file_count=None, single_file_task=False, target_hint=None):
     if text is None:
         raise Exception("PARSE_ERROR: empty response")
@@ -480,6 +485,13 @@ def parse_response(text, active_target=None, expected_file_count=None, single_fi
     cleaned = _strip_wrappers(_strip_code_fences(str(text)))
     if not cleaned:
         raise Exception("PARSE_ERROR: empty response")
+    if _is_done_token(cleaned):
+        return {
+            "plan": "model completion marker",
+            "reasoning_short": "model returned done token",
+            "parse_path": "done_token",
+            "actions": [],
+        }
 
     json_errors = []
     root_candidate = _extract_root_json_candidate(cleaned)

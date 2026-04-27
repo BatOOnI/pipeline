@@ -1,4 +1,4 @@
-import json
+﻿import json
 import threading
 import time
 
@@ -62,6 +62,13 @@ def _lmstudio_models_url(lmstudio_url):
         if suffix in url:
             return url.rsplit(suffix, 1)[0] + "/models"
     return url.rstrip("/") + "/models"
+
+
+def _lmstudio_headers(api_key=None):
+    token = (api_key or config.LMSTUDIO_API_KEY or "").strip()
+    if not token:
+        return None
+    return {"Authorization": f"Bearer {token}"}
 
 
 def _openai_use_max_completion_tokens(model_name):
@@ -146,19 +153,20 @@ def _wait_for_model_result(handle, provider_name, timeout_seconds, timeout_handl
     return handle.result
 
 
-def call_model(
-    prompt: str,
-    provider_override=None,
-    max_output_tokens=None,
-    timeout_handler=None,
-    timeout_seconds=None,
-    stop_checker=None,
-) -> str:
-    provider = (provider_override or config.PROVIDER).lower().strip()
-    max_output_tokens = max_output_tokens or config.MAX_OUTPUT_TOKENS
-    timeout_seconds = timeout_seconds or config.MODEL_TIMEOUT
+class ProviderAdapter:
+    name = ""
 
-    if provider == "lmstudio":
+    def call_model(self, prompt, max_output_tokens, timeout_seconds, timeout_handler, stop_checker):
+        raise NotImplementedError
+
+    def list_models(self, lmstudio_url=None, openai_api_key=None, lmstudio_api_key=None):
+        raise NotImplementedError
+
+
+class LmStudioProviderAdapter(ProviderAdapter):
+    name = "lmstudio"
+
+    def call_model(self, prompt, max_output_tokens, timeout_seconds, timeout_handler, stop_checker):
         payload = {
             "model": config.LMSTUDIO_MODEL,
             "messages": [{"role": "user", "content": prompt}],
@@ -169,7 +177,7 @@ def call_model(
         thread = threading.Thread(
             target=_request_worker,
             args=(handle, "LMSTUDIO", config.LMSTUDIO_URL),
-            kwargs={"payload": payload},
+            kwargs={"headers": _lmstudio_headers(), "payload": payload},
             daemon=True,
         )
         thread.start()
@@ -181,7 +189,24 @@ def call_model(
             stop_checker=stop_checker,
         )
 
-    if provider == "openai":
+    def list_models(self, lmstudio_url=None, openai_api_key=None, lmstudio_api_key=None):
+        url = _lmstudio_models_url(lmstudio_url or config.LMSTUDIO_URL)
+        try:
+            response = requests.get(
+                url,
+                headers=_lmstudio_headers(lmstudio_api_key),
+                timeout=max(5, int(config.MODEL_TIMEOUT)),
+            )
+        except requests.RequestException as exc:
+            raise Exception(f"LMSTUDIO MODEL LIST FAILED: {exc}") from exc
+        _raise_for_http_error(response, "LMSTUDIO")
+        return _extract_model_ids(response.json(), self.name)
+
+
+class OpenAIProviderAdapter(ProviderAdapter):
+    name = "openai"
+
+    def call_model(self, prompt, max_output_tokens, timeout_seconds, timeout_handler, stop_checker):
         if not config.OPENAI_API_KEY.strip():
             raise Exception("OPENAI_API_KEY is empty in config.py / GUI field")
 
@@ -199,6 +224,7 @@ def call_model(
             payload["max_completion_tokens"] = max_output_tokens
         else:
             payload["max_tokens"] = max_output_tokens
+
         handle = ModelRequestHandle()
         thread = threading.Thread(
             target=_request_worker,
@@ -215,20 +241,7 @@ def call_model(
             stop_checker=stop_checker,
         )
 
-    raise Exception(f"Unknown PROVIDER: {provider_override or config.PROVIDER}")
-
-
-def list_models(provider_override=None, lmstudio_url=None, openai_api_key=None):
-    provider = (provider_override or config.PROVIDER).lower().strip()
-
-    if provider == "lmstudio":
-        url = _lmstudio_models_url(lmstudio_url or config.LMSTUDIO_URL)
-        try:
-            response = requests.get(url, timeout=max(5, int(config.MODEL_TIMEOUT)))
-        except requests.RequestException as exc:
-            raise Exception(f"LMSTUDIO MODEL LIST FAILED: {exc}") from exc
-        _raise_for_http_error(response, "LMSTUDIO")
-    elif provider == "openai":
+    def list_models(self, lmstudio_url=None, openai_api_key=None, lmstudio_api_key=None):
         api_key = (openai_api_key or config.OPENAI_API_KEY or "").strip()
         if not api_key:
             raise Exception("OpenAI API key is required to list models.")
@@ -241,10 +254,16 @@ def list_models(provider_override=None, lmstudio_url=None, openai_api_key=None):
         except requests.RequestException as exc:
             raise Exception(f"OPENAI MODEL LIST FAILED: {exc}") from exc
         _raise_for_http_error(response, "OPENAI")
-    else:
-        raise Exception(f"Model listing is not supported for provider: {provider}")
+        return _extract_model_ids(response.json(), self.name)
 
-    data = response.json()
+
+_PROVIDER_ADAPTERS = {
+    "lmstudio": LmStudioProviderAdapter(),
+    "openai": OpenAIProviderAdapter(),
+}
+
+
+def _extract_model_ids(data, provider_name):
     models = []
     for item in data.get("data", []):
         model_id = item.get("id")
@@ -253,5 +272,40 @@ def list_models(provider_override=None, lmstudio_url=None, openai_api_key=None):
 
     unique_models = sorted(dict.fromkeys(models))
     if not unique_models:
-        raise Exception(f"No models returned by {provider}.")
+        raise Exception(f"No models returned by {provider_name}.")
     return unique_models
+
+
+def _resolve_provider_adapter(provider_override=None):
+    provider_name = (provider_override or config.PROVIDER).lower().strip()
+    adapter = _PROVIDER_ADAPTERS.get(provider_name)
+    if adapter is None:
+        raise Exception(f"Unknown PROVIDER: {provider_override or config.PROVIDER}")
+    return adapter
+
+
+def call_model(
+    prompt: str,
+    provider_override=None,
+    max_output_tokens=None,
+    timeout_handler=None,
+    timeout_seconds=None,
+    stop_checker=None,
+) -> str:
+    adapter = _resolve_provider_adapter(provider_override)
+    return adapter.call_model(
+        prompt=prompt,
+        max_output_tokens=max_output_tokens or config.MAX_OUTPUT_TOKENS,
+        timeout_seconds=timeout_seconds or config.MODEL_TIMEOUT,
+        timeout_handler=timeout_handler,
+        stop_checker=stop_checker,
+    )
+
+
+def list_models(provider_override=None, lmstudio_url=None, openai_api_key=None, lmstudio_api_key=None):
+    adapter = _resolve_provider_adapter(provider_override)
+    return adapter.list_models(
+        lmstudio_url=lmstudio_url,
+        openai_api_key=openai_api_key,
+        lmstudio_api_key=lmstudio_api_key,
+    )

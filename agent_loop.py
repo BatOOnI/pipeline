@@ -49,6 +49,14 @@ from runtime_supervision import (
     decide_no_progress,
     decide_repeated_action,
 )
+from runtime_trace import append_runtime_trace
+from run_summary import (
+    build_output_status,
+    build_safe_run_summary,
+    next_safe_action,
+    summarize_blocked_observations,
+)
+from context_compaction import compact_runtime_history
 from utils import coerce_int, ensure_gitignore, is_subpath, read_json_file, truncate_middle, write_json_file
 
 
@@ -2174,9 +2182,13 @@ def _prompt_budget(level):
 
 def _compact_history(history, level):
     _, history_items, history_chars = _prompt_budget(level)
-    items = history[-history_items:] if history else []
-    joined = "\n".join(items)
-    return truncate_middle(joined, history_chars)
+    compacted, _stats = compact_runtime_history(
+        history or [],
+        level=int(level or 0),
+        max_items=history_items,
+        max_chars=history_chars,
+    )
+    return compacted
 
 
 def _read_target_text(path, project_root):
@@ -4386,6 +4398,20 @@ def run(
         def stop_requested():
             return bool(stop_checker and stop_checker())
 
+        def trace(stage, severity="info", message="", **data):
+            try:
+                append_runtime_trace(
+                    _session_path(),
+                    session_id=state.session_id,
+                    iteration=int(getattr(state, "iteration_count", 0) or 0),
+                    stage=stage,
+                    severity=severity,
+                    message=message,
+                    data=data,
+                )
+            except Exception:
+                pass
+
         def request_max_iteration_extension(current_iteration, current_limit):
             if not callable(max_iterations_handler):
                 return "kill"
@@ -4490,6 +4516,18 @@ def run(
                 next_required = _chunk_next_required_action(state)
                 if next_required:
                     log(f"CHUNK NEXT REQUIRED ACTION: {next_required}")
+
+        trace(
+            "run_start",
+            "info",
+            f"mode={state.mode} provider={state.current_provider}",
+            mode=state.mode,
+            task_shape=state.task_shape,
+            task_intent=state.task_intent,
+            provider=state.current_provider,
+            route=state.model_route,
+            project_root=state.active_project_root,
+        )
 
         for iteration in range(1000000):
             current_limit = max(1, coerce_int(config.MAX_ITERATIONS, 10, minimum=1, maximum=100000))
@@ -4672,6 +4710,16 @@ def run(
             )
             prompt_payload = build_prompt(prompt, history, state)
             log(f"PROMPT: {len(prompt_payload)} chars")
+            trace(
+                "iter_start",
+                "info",
+                f"iter={iteration + 1}",
+                iter=iteration + 1,
+                route=state.model_route,
+                provider=state.current_provider,
+                task_profile=state.task_profile,
+                prompt_chars=len(prompt_payload),
+            )
             try:
                 raw = call_model(
                     prompt_payload,
@@ -4685,6 +4733,14 @@ def run(
                 message = str(e)
                 log(message)
                 history.append(message)
+                trace(
+                    "model_error",
+                    "error",
+                    message,
+                    iter=iteration + 1,
+                    provider=state.current_provider,
+                    route=state.model_route,
+                )
                 if "MODEL REQUEST KILLED BY USER" in message:
                     if stop_requested():
                         log("STOP REQUESTED")
@@ -4723,6 +4779,15 @@ def run(
                 log(f"RAW RESPONSE COLLAPSED: {collapsed_reason} ({len(raw_text)} chars)")
             else:
                 log(f"RAW RESPONSE: {truncate_middle(raw_text, 900)}")
+            trace(
+                "model_response",
+                "info",
+                "response received",
+                iter=iteration + 1,
+                chars=len(raw_text),
+                collapsed=bool(collapsed_reason),
+                collapse_reason=collapsed_reason or "",
+            )
 
             if stop_requested():
                 log("STOP REQUESTED")
@@ -4748,6 +4813,13 @@ def run(
                 parse_path = str(data.get("parse_path") or "")
                 if parse_path:
                     log(f"PARSE PATH: {parse_path}")
+                trace(
+                    "parse_ok",
+                    "info",
+                    parse_path or "parsed",
+                    iter=iteration + 1,
+                    parse_path=parse_path or "",
+                )
                 consecutive_parse_errors = 0
             except Exception as e:
                 if state.task_intent in {"inspect_only", "read_only", "run_command_only"}:
@@ -4760,6 +4832,13 @@ def run(
                             "parse_path": "raw_text_answer",
                         }
                         log("PARSE PATH: raw_text_answer")
+                        trace(
+                            "parse_ok",
+                            "info",
+                            "raw_text_answer",
+                            iter=iteration + 1,
+                            parse_path="raw_text_answer",
+                        )
                         consecutive_parse_errors = 0
                     else:
                         data = None
@@ -4771,6 +4850,13 @@ def run(
                     message = str(e)
                     log(message)
                     history.append(_compact_parse_error_for_history(message))
+                    trace(
+                        "parse_error",
+                        "warn",
+                        message,
+                        iter=iteration + 1,
+                        parse_errors=consecutive_parse_errors + 1,
+                    )
                     if state.mode == "patch" and state.single_file_task:
                         fallback_note = _single_file_patch_retry_note(state)
                         if fallback_note not in history[-4:]:
@@ -5207,6 +5293,15 @@ def run(
 
                     executed_count += 1
                     run_executed_actions += 1
+                    trace(
+                        "action_result",
+                        "info" if bool(getattr(observation, "ok", True)) else "warn",
+                        str(getattr(observation, "summary", "") or ""),
+                        iter=iteration + 1,
+                        action_type=action.get("type", ""),
+                        tool=getattr(observation, "tool", ""),
+                        ok=bool(getattr(observation, "ok", True)),
+                    )
                     log(observation.summary)
                     if observation.details:
                         log(observation.details)
@@ -5705,6 +5800,14 @@ def run(
                 if state.mode == "patch":
                     state.patch_phase = "complete"
                 log(stop_reason)
+                trace(
+                    "terminal_decision",
+                    "info",
+                    stop_reason,
+                    iter=iteration + 1,
+                    reason=stop_reason,
+                    mode=state.mode,
+                )
                 _save_session_state(state)
                 finished_success = True
                 terminal_reason = stop_reason
@@ -5732,6 +5835,14 @@ def run(
                 )
                 if no_progress_decision.stop:
                     log(no_progress_decision.reason)
+                    trace(
+                        "terminal_decision",
+                        "warn",
+                        no_progress_decision.reason,
+                        iter=iteration + 1,
+                        reason=no_progress_decision.reason,
+                        mode=state.mode,
+                    )
                     _save_session_state(state)
                     terminal_reason = no_progress_decision.reason
                     break
@@ -5755,36 +5866,66 @@ def run(
                         _save_session_state(state)
                         continue
                     log("STOP: no progress after local fallback exhaustion")
+                    trace(
+                        "terminal_decision",
+                        "error",
+                        fail_reason or "no progress after local fallback exhaustion",
+                        iter=iteration + 1,
+                        reason=fail_reason or "",
+                        mode=state.mode,
+                    )
                     _save_session_state(state)
                     terminal_reason = fail_reason
                     break
             _save_session_state(state)
 
-        output_status = "(none)"
-        if state.task_shape == "transform_copy_task":
-            outputs_ok, missing = _transform_outputs_exist(state)
-            if outputs_ok:
-                output_status = "outputs=ok"
-            else:
-                output_status = f"outputs_missing={','.join(missing)}"
-        elif state.touched_files:
-            output_status = f"outputs={len(state.touched_files)} touched"
-        log(
-            f"RUN SUMMARY: executed={run_executed_actions} blocked={run_blocked_actions} "
-            f"stop_reason={terminal_reason or state.last_runtime_error or 'n/a'} "
-            f"status={'success' if finished_success else 'stopped'} {output_status}"
+        output_status = build_output_status(
+            state.task_shape,
+            state.touched_files,
+            outputs_ok=outputs_ok if state.task_shape == "transform_copy_task" else True,
+            missing_outputs=missing if state.task_shape == "transform_copy_task" else [],
         )
+        summary_line, summary_payload = build_safe_run_summary(
+            finished_success=bool(finished_success),
+            stop_reason=terminal_reason or state.last_runtime_error or "n/a",
+            executed_actions=run_executed_actions,
+            blocked_actions=run_blocked_actions,
+            output_status=output_status,
+        )
+        log(summary_line)
+        trace(
+            "run_end",
+            "info" if bool(finished_success) else "warn",
+            summary_payload.get("stop_reason", "n/a"),
+            status=summary_payload.get("status", "stopped"),
+            status_detail=summary_payload.get("status_detail", "stopped"),
+            executed=summary_payload.get("executed", 0),
+            blocked=summary_payload.get("blocked", 0),
+            output_status=summary_payload.get("output_status", "(none)"),
+            risk_flags=summary_payload.get("risk_flags", []),
+        )
+        if not finished_success:
+            risk_flags = ",".join(summary_payload.get("risk_flags") or []) or "(none)"
+            log(
+                "RUN SAFETY: "
+                f"detail={summary_payload.get('status_detail', 'stopped')} "
+                f"flags={risk_flags} "
+                f"next={summary_payload.get('next_safe_action', next_safe_action('stopped', []))}"
+            )
         try:
             append_journal_event(
                 _session_path(),
                 "run_summary",
                 {
                     "session_id": state.session_id,
-                    "status": "success" if finished_success else "stopped",
-                    "stop_reason": terminal_reason or state.last_runtime_error or "n/a",
-                    "executed": int(run_executed_actions or 0),
-                    "blocked": int(run_blocked_actions or 0),
-                    "output_status": output_status,
+                    "status": summary_payload.get("status", "stopped"),
+                    "status_detail": summary_payload.get("status_detail", "stopped"),
+                    "stop_reason": summary_payload.get("stop_reason", "n/a"),
+                    "executed": int(summary_payload.get("executed", 0) or 0),
+                    "blocked": int(summary_payload.get("blocked", 0) or 0),
+                    "output_status": summary_payload.get("output_status", output_status),
+                    "risk_flags": list(summary_payload.get("risk_flags") or []),
+                    "next_safe_action": summary_payload.get("next_safe_action", ""),
                 },
             )
         except Exception:
@@ -5792,17 +5933,13 @@ def run(
         flush_pending_log()
 
         if not finished_success:
-            blocked = [
-                line for line in history[-14:]
-                if any(token in _normalize_prompt_text(line) for token in ("blocked", "violation", "missing", "failed", "rejected"))
-            ]
-            blocked_preview = " | ".join(blocked[-4:]) if blocked else "(none)"
+            blocked_preview = summarize_blocked_observations(history, max_items=4, max_len=600)
             log("FAILURE SUMMARY:")
             log(f"- detected task shape: {state.task_shape}")
             log(f"- mode: {state.mode}")
             log(f"- route/provider: {state.model_route} ({state.current_provider})")
             log(f"- rescue status: {_rescue_mode()} ({_rescue_suppressed_reason() if _rescue_mode() != 'ON' else 'enabled'})")
-            log(f"- terminal reason: {terminal_reason or state.last_runtime_error or 'max iterations or unresolved state'}")
+            log(f"- terminal reason: {summary_payload.get('stop_reason') or 'max iterations or unresolved state'}")
             next_route_hint = "standard create"
             if state.task_shape in TRANSFORM_TASK_SHAPES:
                 next_route_hint = "transform_copy_task with tool-first bounded analysis"
@@ -5814,7 +5951,7 @@ def run(
                 derived_preview = ", ".join(state.derived_allowed_files[:8]) if state.derived_allowed_files else "(none)"
                 log(f"- source read-only: {source_preview}")
                 log(f"- derived allowed: {derived_preview}")
-            log(f"- blocked/failed observations: {truncate_middle(blocked_preview, 600)}")
+            log(f"- blocked/failed observations: {blocked_preview}")
 
         log(f"LOG SAVED TO: {log_path}")
         flush_pending_log()

@@ -82,23 +82,76 @@ def git_has_committable_changes(repo_dir):
     return ok, msg.strip()
 
 
+def _git_repo_context(repo_dir):
+    target_root = os.path.abspath(repo_dir)
+    branch = ""
+    remote = ""
+    repo_root = ""
+    if git_is_repo(target_root):
+        ok_root, root_msg = _run_git(["rev-parse", "--show-toplevel"], cwd=target_root)
+        if ok_root and str(root_msg or "").strip():
+            repo_root = os.path.abspath(str(root_msg).splitlines()[0].strip())
+        ok_branch, branch_msg = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=target_root)
+        if ok_branch and str(branch_msg or "").strip():
+            branch = str(branch_msg).splitlines()[0].strip()
+        ok_remote, remote_msg = _run_git(["remote", "get-url", "origin"], cwd=target_root)
+        if ok_remote and str(remote_msg or "").strip():
+            remote = str(remote_msg).splitlines()[0].strip()
+    return {
+        "target_root": target_root,
+        "repo_root": repo_root,
+        "branch": branch,
+        "remote": remote,
+    }
+
+
+def git_checkpoint_context(repo_dir):
+    return _git_repo_context(repo_dir)
+
+
 def git_checkpoint(repo_dir, message):
-    if not git_is_repo(repo_dir):
-        ok, msg = git_init(repo_dir)
+    target_root = os.path.abspath(repo_dir)
+    if os.path.isfile(target_root):
+        return False, f"Refusing checkpoint: target is a file, not a repo root ({target_root})"
+    os.makedirs(target_root, exist_ok=True)
+
+    local_git_dir = os.path.isdir(os.path.join(target_root, ".git"))
+    if local_git_dir:
+        pass
+    elif git_is_repo(target_root):
+        context = _git_repo_context(target_root)
+        repo_root = context.get("repo_root") or target_root
+        if os.path.normcase(repo_root) != os.path.normcase(target_root):
+            ok, msg = git_init(target_root)
+            if not ok:
+                return False, (
+                    "Refusing checkpoint: repo root mismatch and failed to initialize local repo "
+                    f"(target={target_root}, repo_root={repo_root}) -> {msg}"
+                )
+    else:
+        ok, msg = git_init(target_root)
         if not ok:
             return False, msg
 
-    ok, msg = git_add_all(repo_dir)
+    ok, msg = git_add_all(target_root)
     if not ok:
         return False, msg
 
-    ok, status = git_has_committable_changes(repo_dir)
+    ok, status = git_has_committable_changes(target_root)
     if not ok:
         return False, status
-    if not status:
-        return True, "No git changes to commit"
 
-    return git_commit(repo_dir, message)
+    context = _git_repo_context(target_root)
+    context_lines = [
+        f"repo_root={context.get('repo_root') or target_root}",
+        f"branch={context.get('branch') or '(unknown)'}",
+        f"remote={context.get('remote') or '(none)'}",
+    ]
+    if not status:
+        return True, "\n".join(context_lines + ["No git changes to commit"])
+
+    ok, commit_msg = git_commit(target_root, message)
+    return ok, "\n".join(context_lines + ([commit_msg] if commit_msg else []))
 
 
 def git_restore(repo_dir, ref="HEAD"):

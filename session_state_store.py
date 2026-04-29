@@ -1,11 +1,26 @@
 ﻿import json
 import os
+import sys
 import time
 import uuid
 from pathlib import Path
 
 DEFAULT_MAX_JOURNAL_BYTES = 2_000_000
 DEFAULT_MAX_ROTATIONS = 3
+_WARNED_CONTEXTS = set()
+
+
+def _warn_internal(context: str, exc: Exception, once: bool = True) -> None:
+    key = str(context or "").strip() or "internal"
+    if once and key in _WARNED_CONTEXTS:
+        return
+    if once:
+        _WARNED_CONTEXTS.add(key)
+    try:
+        sys.stderr.write(f"[session warning] {key}: {exc}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 
 def now_ms() -> int:
@@ -24,7 +39,8 @@ def _rotate_journal(path: str, max_bytes: int = DEFAULT_MAX_JOURNAL_BYTES, max_f
         return
     try:
         size = os.path.getsize(path)
-    except Exception:
+    except Exception as exc:
+        _warn_internal("journal size probe failed", exc)
         return
     if size <= int(max_bytes):
         return
@@ -37,12 +53,12 @@ def _rotate_journal(path: str, max_bytes: int = DEFAULT_MAX_JOURNAL_BYTES, max_f
         try:
             if os.path.exists(dst):
                 os.remove(dst)
-        except Exception:
-            pass
+        except Exception as exc:
+            _warn_internal("journal rotate remove destination failed", exc)
         try:
             os.replace(src, dst)
-        except Exception:
-            pass
+        except Exception as exc:
+            _warn_internal("journal rotate replace failed", exc)
 
 
 def append_journal_event(
@@ -83,8 +99,8 @@ def ensure_session_meta(
     try:
         if os.path.exists(path) and os.path.getsize(path) > 0:
             return path
-    except Exception:
-        pass
+    except Exception as exc:
+        _warn_internal("session meta pre-check failed", exc)
 
     if not str(session_id or "").strip():
         session_id = uuid.uuid4().hex
@@ -154,7 +170,8 @@ def load_latest_session_snapshot(session_json_path: str, max_files: int = DEFAUL
                                     "prompt": prompt_text,
                                 }
                             )
-        except Exception:
+        except Exception as exc:
+            _warn_internal(f"session snapshot load failed: {candidate}", exc)
             continue
 
     if not latest_state and not latest_meta and not prompt_entries:
@@ -219,3 +236,4 @@ def state_snapshot_from_payload(payload: dict) -> dict:
         if key in payload:
             snapshot[key] = payload.get(key)
     return snapshot
+

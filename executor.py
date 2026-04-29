@@ -11,6 +11,8 @@ import subprocess
 import time
 import sys
 import tempfile
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 import config
 from contracts import Observation
@@ -75,6 +77,211 @@ def _write_text(path, content):
         content = content.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
     with open(path, "w", encoding="utf-8", newline="") as f:
         f.write(content)
+
+
+def _network_allowed():
+    return bool(getattr(config, "NETWORK_ENABLED", True))
+
+
+def _parse_allowed_hosts():
+    raw = str(getattr(config, "NETWORK_ALLOWED_HOSTS", "") or "")
+    if not raw.strip():
+        return []
+    parts = []
+    for token in re.split(r"[,;\n]", raw):
+        item = str(token or "").strip().lower()
+        if item:
+            parts.append(item.lstrip("."))
+    return parts
+
+
+def _validate_http_url(url):
+    text = str(url or "").strip()
+    if not text:
+        return "", "Missing url."
+    parsed = urlparse(text)
+    if parsed.scheme not in {"http", "https"}:
+        return "", "Only http/https URLs are allowed."
+    if not parsed.netloc:
+        return "", "URL must include host."
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return "", "URL host is missing."
+    allowed_hosts = _parse_allowed_hosts()
+    if allowed_hosts:
+        host_ok = any(host == allowed or host.endswith("." + allowed) for allowed in allowed_hosts)
+        if not host_ok:
+            return "", f"Host '{host}' is not allowed by NETWORK_ALLOWED_HOSTS."
+    return text, ""
+
+
+def http_get(url, max_chars=None, output_path=None, project_root=None):
+    if not _network_allowed():
+        return Observation(
+            False,
+            "HTTP BLOCKED",
+            changed=False,
+            details="Network access is disabled by configuration (NETWORK_ENABLED=OFF).",
+            tool="http_get",
+        )
+    normalized_url, err = _validate_http_url(url)
+    if err:
+        return Observation(False, "HTTP BLOCKED", changed=False, details=err, tool="http_get")
+    output_text = str(output_path or "").strip()
+    if not output_text:
+        return Observation(
+            False,
+            "HTTP GET FAILED",
+            changed=False,
+            details="http_get requires url and output_path",
+            tool="http_get",
+        )
+    try:
+        abs_output_path = _resolve_path(output_text, project_root=project_root)
+    except Exception as exc:
+        return Observation(
+            False,
+            "HTTP GET FAILED",
+            changed=False,
+            details=f"http_get output_path invalid: {exc}",
+            tool="http_get",
+        )
+
+    try:
+        byte_limit = max(256, int(getattr(config, "HTTP_GET_MAX_BYTES", 1000000) or 1000000))
+    except Exception:
+        byte_limit = 1000000
+    try:
+        char_limit = max(200, int(max_chars or 4000))
+    except Exception:
+        char_limit = 4000
+
+    req = Request(normalized_url, headers={"User-Agent": "pipeline-agent/1.0"})
+    try:
+        with urlopen(req, timeout=max(3, int(config.RUN_TIMEOUT or 15))) as response:
+            status = int(getattr(response, "status", 200) or 200)
+            content_type = str(response.headers.get("Content-Type", "") or "")
+            data = response.read(byte_limit + 1)
+            truncated = len(data) > byte_limit
+            if truncated:
+                data = data[:byte_limit]
+    except Exception as exc:
+        return Observation(
+            False,
+            f"HTTP GET FAILED: {normalized_url}",
+            changed=False,
+            details=str(exc),
+            tool="http_get",
+        )
+
+    parent = os.path.dirname(abs_output_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    try:
+        with open(abs_output_path, "wb") as out:
+            out.write(data)
+    except Exception as exc:
+        return Observation(
+            False,
+            "HTTP GET FAILED",
+            changed=False,
+            details=f"Could not save output_path: {exc}",
+            tool="http_get",
+        )
+
+    text = data.decode("utf-8", errors="replace")
+    preview = text[:char_limit]
+    details = (
+        f"url={normalized_url}\nstatus={status}\ncontent_type={content_type}\n"
+        f"bytes={len(data)}{' (truncated)' if truncated else ''}\noutput_path={abs_output_path}\n\n{preview}"
+    )
+    return Observation(
+        True,
+        f"HTTP GET OK: {normalized_url}",
+        changed=True,
+        details=details,
+        tool="http_get",
+        path=abs_output_path,
+        metadata={"status": status, "bytes": len(data), "truncated": truncated, "touches_file": True},
+    )
+
+
+def download_file(url, path, project_root=None):
+    if not _network_allowed():
+        return Observation(
+            False,
+            "DOWNLOAD BLOCKED",
+            changed=False,
+            details="Network access is disabled by configuration (NETWORK_ENABLED=OFF).",
+            tool="download_file",
+        )
+    normalized_url, err = _validate_http_url(url)
+    if err:
+        return Observation(False, "DOWNLOAD BLOCKED", changed=False, details=err, tool="download_file")
+    try:
+        abs_path = _resolve_path(path, project_root=project_root)
+    except Exception as exc:
+        return Observation(False, f"DOWNLOAD FAILED: {path}", changed=False, details=str(exc), tool="download_file", path=str(path))
+
+    parent = os.path.dirname(abs_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    try:
+        max_bytes = max(1024, int(getattr(config, "DOWNLOAD_MAX_BYTES", 15000000) or 15000000))
+    except Exception:
+        max_bytes = 15000000
+
+    req = Request(normalized_url, headers={"User-Agent": "pipeline-agent/1.0"})
+    total = 0
+    status = 0
+    try:
+        with urlopen(req, timeout=max(3, int(config.RUN_TIMEOUT or 15))) as response, open(abs_path, "wb") as out:
+            status = int(getattr(response, "status", 200) or 200)
+            while True:
+                chunk = response.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    out.close()
+                    try:
+                        os.remove(abs_path)
+                    except Exception:
+                        pass
+                    return Observation(
+                        False,
+                        f"DOWNLOAD BLOCKED: {_rel_path(abs_path, project_root)}",
+                        changed=False,
+                        details=f"Download exceeds limit ({max_bytes} bytes).",
+                        tool="download_file",
+                        path=abs_path,
+                    )
+                out.write(chunk)
+    except Exception as exc:
+        try:
+            if os.path.exists(abs_path):
+                os.remove(abs_path)
+        except Exception:
+            pass
+        return Observation(
+            False,
+            f"DOWNLOAD FAILED: {_rel_path(abs_path, project_root)}",
+            changed=False,
+            details=str(exc),
+            tool="download_file",
+            path=abs_path,
+        )
+
+    rel = _rel_path(abs_path, project_root)
+    return Observation(
+        True,
+        f"Downloaded {rel}",
+        changed=True,
+        details=f"url={normalized_url}\nstatus={status}\nbytes={total}",
+        tool="download_file",
+        path=abs_path,
+        metadata={"status": status, "bytes": total, "touches_file": True},
+    )
 
 
 def _normalize_shell_script_content(path, content):
@@ -457,6 +664,15 @@ def write_file(path, content, project_root=None, patch_mode=False, allow_create=
 def find_in_file(path, query, project_root=None, context_lines=3):
     try:
         abs_path = _resolve_path(path, project_root=project_root)
+        if os.path.isdir(abs_path):
+            return Observation(
+                False,
+                f"find_in_file failed {_rel_path(abs_path, project_root)}",
+                changed=False,
+                details="find_in_file requires a file path, got directory. Use list_files or dir first.",
+                tool="find_in_file",
+                path=abs_path,
+            )
         content = _read_file(abs_path)
     except Exception as e:
         return Observation(False, f"find_in_file failed {path}", changed=False, details=str(e), tool="find_in_file", path=str(path))
@@ -1094,14 +1310,63 @@ def _is_path_like(arg):
     return bool(PATH_LIKE_RE.search(str(arg or "")))
 
 
+def _looks_like_url_token(arg):
+    text = str(arg or "").strip().strip('"').strip("'")
+    lowered = text.lower()
+    if not lowered:
+        return False
+    if lowered.startswith(("http://", "https://", "ftp://", "www.")):
+        return True
+    if "://" in lowered:
+        return True
+    if lowered.startswith(("http:\\\\", "https:\\\\", "ftp:\\\\")):
+        return True
+    return False
+
+
+def _normalize_malformed_url_token(arg):
+    text = str(arg or "").strip()
+    lowered = text.lower()
+    if lowered.startswith(("http:\\\\", "https:\\\\", "ftp:\\\\")):
+        fixed = text.replace("\\", "/")
+        if fixed.lower().startswith("http:/") and not fixed.lower().startswith("http://"):
+            fixed = "http://" + fixed[6:]
+        elif fixed.lower().startswith("https:/") and not fixed.lower().startswith("https://"):
+            fixed = "https://" + fixed[7:]
+        elif fixed.lower().startswith("ftp:/") and not fixed.lower().startswith("ftp://"):
+            fixed = "ftp://" + fixed[5:]
+        return fixed
+    return text
+
+
+def _normalize_windows_cmd_invocation(args):
+    if not isinstance(args, list) or not args:
+        return args
+    normalized = [str(part) for part in args]
+    first = os.path.basename(normalized[0]).lower().replace(".exe", "")
+    if first == "cmd" and len(normalized) > 1:
+        second = normalized[1].strip().lower()
+        if second in {"\\c", "\\\\c"}:
+            normalized[1] = "/c"
+    for i in range(1, len(normalized)):
+        if _looks_like_url_token(normalized[i]):
+            normalized[i] = _normalize_malformed_url_token(normalized[i])
+    return normalized
+
+
 def _validate_cmd_paths(args, project_root):
     if not project_root:
         return True, ""
 
     root = os.path.abspath(project_root)
+    first_cmd = os.path.basename(str(args[0] if args else "")).lower().replace(".exe", "")
     for arg in args[1:]:
         text = str(arg)
         if text.startswith("-"):
+            continue
+        if first_cmd == "cmd" and text.strip().lower() in {"/c", "/k", "\\c", "\\k"}:
+            continue
+        if _looks_like_url_token(text):
             continue
         if not _is_path_like(text):
             continue
@@ -1127,7 +1392,7 @@ def _prepare_cmd(cmd, project_root=None):
     if not isinstance(cmd, list) or not cmd:
         return None, "run_cmd requires a non-empty command"
 
-    cmd = [str(part) for part in cmd]
+    cmd = _normalize_windows_cmd_invocation([str(part) for part in cmd])
     ok, error = _validate_cmd_paths(cmd, project_root=project_root)
     if not ok:
         return None, error
@@ -1166,10 +1431,14 @@ def _normalize_simple_windows_launch(cmd, cwd=None, project_root=None):
 
 def run_cmd(cmd, cwd=None, project_root=None, stop_checker=None):
     project_root = project_root or cwd
-    normalized_cmd, normalized_cwd, normalization_note = _normalize_simple_windows_launch(
-        cmd, cwd=cwd, project_root=project_root
-    )
-    prepared, error = _prepare_cmd(normalized_cmd, project_root=project_root)
+    normalized_cwd = cwd
+    if normalized_cwd:
+        try:
+            normalized_cwd = _resolve_path(normalized_cwd, project_root=project_root or normalized_cwd)
+        except Exception as exc:
+            return Observation(False, f"CMD BLOCKED: {cmd}", changed=False, details=str(exc), tool="run_cmd")
+    normalization_note = ""
+    prepared, error = _prepare_cmd(cmd, project_root=project_root)
     if error:
         return Observation(False, f"CMD BLOCKED: {cmd}", changed=False, details=error, tool="run_cmd")
 

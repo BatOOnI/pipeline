@@ -9,6 +9,7 @@ TASK_INTENTS = {
     "transform_source_to_output",
     "inspect_only",
     "run_command_only",
+    "answer_only",
 }
 
 TERMINAL_OUTCOMES = {"success", "blocked", "retry", "failure"}
@@ -92,8 +93,39 @@ def infer_task_intent(user_prompt, existing_tokens=None, all_tokens=None, select
         "nie zmieniaj",
         "bez zmian",
         "tylko odczyt",
+        "do not create files",
+        "don't create files",
+        "no files",
+        "answer only",
+        "nie tworz plikow",
+        "nie twórz plików",
+        "nie tworz pliku",
+        "nie twórz pliku",
     )
     has_no_change_guard = any(marker in text for marker in no_change_markers)
+    answer_only_markers = (
+        "answer only",
+        "odpowiedz tylko",
+        "powiedz tylko",
+        "tylko odpowiedz",
+        "tylko odpowiedź",
+        "czy umiesz",
+        "czy mozesz",
+        "czy możesz",
+        "can you",
+    )
+    has_answer_only_marker = any(marker in text for marker in answer_only_markers)
+    answer_explain_markers = (
+        "tylko wyjasnij",
+        "wyjasnij ogolnie",
+        "wytlumacz ogolnie",
+        "jak to dziala",
+        "explain only",
+        "just explain",
+        "explain generally",
+        "how it works",
+    )
+    has_answer_explain_marker = any(marker in text for marker in answer_explain_markers)
     command_markers = (
         "run command",
         "run_cmd",
@@ -105,9 +137,50 @@ def infer_task_intent(user_prompt, existing_tokens=None, all_tokens=None, select
         "shell",
         "cmd",
     )
+    execution_markers = (
+        "pobierz",
+        "sciagnij",
+        "ściągnij",
+        "skonfiguruj",
+        "zainstaluj",
+        "uruchom",
+        "wykonaj",
+        "download",
+        "install",
+        "configure",
+        "run ",
+        "powershell",
+        "invoke-webrequest",
+        "invoke-restmethod",
+        "curl",
+        "wget",
+        "zrob to",
+        "zrób to",
+    )
     command_only_hints = ("just", "only", "report output", "and stop", "without changes", "do not modify")
     has_command_markers = any(marker in text for marker in command_markers)
+    has_execution_markers = any(marker in text for marker in execution_markers)
     has_command_only_hint = any(marker in text for marker in command_only_hints)
+
+    if (
+        has_no_change_guard
+        and has_answer_only_marker
+        and not has_transform_markers
+        and not has_inspect_words
+        and not has_command_markers
+    ):
+        return TaskIntentDecision("answer_only", "answer-only language with no-file constraint")
+
+    if (
+        has_answer_explain_marker
+        and not has_create_words
+        and not has_transform_markers
+        and not has_command_markers
+        and not has_edit_words
+        and not has_inspect_words
+        and not has_existing_targets
+    ):
+        return TaskIntentDecision("answer_only", "direct explanation request")
 
     if has_inspect_words and has_no_change_guard and not has_create_words and not has_transform_markers:
         return TaskIntentDecision("inspect_only", "inspection-only language with no-change constraint")
@@ -120,6 +193,9 @@ def infer_task_intent(user_prompt, existing_tokens=None, all_tokens=None, select
 
     if has_many_targets and has_create_words and any(marker in text for marker in transform_output_markers):
         return TaskIntentDecision("transform_source_to_output", "source/output summary-style intent")
+
+    if has_execution_markers and not has_no_change_guard and not has_transform_markers:
+        return TaskIntentDecision("run_command_only", "imperative execution/setup intent")
 
     if has_command_markers and has_command_only_hint and not has_create_words and not has_transform_markers:
         return TaskIntentDecision("run_command_only", "command-only execution intent")
@@ -176,6 +252,11 @@ def evaluate_terminal_outcome(
         return TerminalOutcomeDecision("success", "MODEL INDICATED COMPLETION -> STOP")
 
     if mode == "create":
+        if task_intent == "answer_only":
+            if plan_done:
+                return TerminalOutcomeDecision("success", "MODEL INDICATED COMPLETION -> STOP")
+            return TerminalOutcomeDecision("retry", "ANSWER-ONLY RESPONSE IN PROGRESS")
+
         if (
             task_intent == "edit_existing_file"
             and int(no_progress_streak or 0) >= 2

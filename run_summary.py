@@ -48,6 +48,10 @@ def classify_terminal_state(finished_success: bool, stop_reason: str, blocked_ac
     if finished_success:
         return "success"
     reason = str(stop_reason or "").lower()
+    if reason.startswith("setup partial"):
+        return "partial"
+    if reason.startswith("setup blocked"):
+        return "blocked"
     if "permission" in reason and ("blocked" in reason or "denied" in reason):
         return "blocked"
     if int(blocked_actions or 0) > 0 and "blocked" in reason:
@@ -121,8 +125,13 @@ def build_safe_run_summary(
     output_status: str,
 ) -> Tuple[str, dict]:
     safe_reason = sanitize_summary_text(stop_reason, max_len=260) or "n/a"
-    status = "success" if finished_success else "stopped"
     status_detail = classify_terminal_state(finished_success, safe_reason, blocked_actions=blocked_actions)
+    if finished_success:
+        status = "success"
+    elif status_detail in {"blocked", "partial"}:
+        status = status_detail
+    else:
+        status = "stopped"
     risk_flags = derive_risk_flags(safe_reason, blocked_actions=blocked_actions)
     next_action = next_safe_action(status_detail, risk_flags)
 

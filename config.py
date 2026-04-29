@@ -18,6 +18,10 @@ PERMISSION_MODE = "workspace-write"  # read-only | workspace-write | danger-full
 PERMISSION_ALLOW_RULES = ""  # e.g. "run_cmd:python*" or "read_file"
 PERMISSION_DENY_RULES = ""  # e.g. "run_cmd:git reset"
 PERMISSION_ASK_RULES = ""  # e.g. "run_cmd:*"
+NETWORK_ENABLED = True  # allow run_cmd network access (curl/wget/git clone/http URLs/etc.)
+NETWORK_ALLOWED_HOSTS = ""  # optional CSV allowlist, e.g. "github.com,raw.githubusercontent.com"
+HTTP_GET_MAX_BYTES = 1000000
+DOWNLOAD_MAX_BYTES = 15000000
 
 # Runtime
 MAX_ITERATIONS = 10
@@ -50,6 +54,8 @@ ALLOW_EMPTY_DONE_RETRY = True
 REPEAT_ACTION_LIMIT = 2
 STALL_TRIGGER = 2
 PATCH_WRITE_MIN_RATIO = 0.55
+SETUP_MAX_SIDE_EFFECT_ACTIONS = 6
+SETUP_BLOCKED_COMMAND_REPEAT_LIMIT = 2
 
 # Git defaults
 DEFAULT_REMOTE_URL = "https://github.com/BatOOnI/pipeline"

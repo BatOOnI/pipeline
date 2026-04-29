@@ -118,7 +118,7 @@ def decide_completion(
         state_touched_files=state_touched_files,
     )
 
-    if task_intent in {"inspect_only", "run_command_only", "read_only"}:
+    if task_intent in {"inspect_only", "run_command_only", "read_only", "answer_only"}:
         if plan_done:
             return TerminalDecision(True, "success", "MODEL INDICATED COMPLETION -> STOP")
         return TerminalDecision(False, "retry", "READ-ONLY ANALYSIS IN PROGRESS -> CONTINUE")

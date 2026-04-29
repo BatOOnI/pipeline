@@ -27,7 +27,7 @@ MODE_RANK = {
     "danger-full-access": 2,
 }
 
-READ_ONLY_ACTIONS = {"read_file", "find_in_file"}
+READ_ONLY_ACTIONS = {"read_file", "find_in_file", "answer", "final_answer"}
 WORKSPACE_WRITE_ACTIONS = {
     "write_file",
     "replace_in_file",
@@ -39,6 +39,8 @@ WORKSPACE_WRITE_ACTIONS = {
     "append_file_chunk",
     "finalize_file_rewrite",
     "mkdir",
+    "http_get",
+    "download_file",
 }
 
 READ_ONLY_COMMANDS = {
@@ -99,6 +101,34 @@ READ_ONLY_GIT_SUBCOMMANDS = {
     "remote",
     "tag",
 }
+
+NETWORK_COMMAND_MARKERS = (
+    "curl",
+    "wget",
+    "invoke-webrequest",
+    "invoke-restmethod",
+    "http://",
+    "https://",
+    "ftp://",
+    "pip install",
+    "npm install",
+    "git clone",
+    "git fetch",
+    "git pull",
+)
+
+DESTRUCTIVE_BASE_COMMANDS = {
+    "rm",
+    "rmdir",
+    "rd",
+    "del",
+    "erase",
+    "remove-item",
+    "ri",
+    "format",
+}
+
+DESTRUCTIVE_GIT_SUBCOMMANDS = {"reset", "clean", "checkout"}
 
 
 @dataclass(frozen=True)
@@ -174,6 +204,105 @@ def _tokenize_command(command_text: str) -> List[str]:
         return shlex.split(text, posix=False)
     except Exception:
         return text.split()
+
+
+def _is_path_like_token(token: str) -> bool:
+    value = str(token or "").strip().strip("'\"")
+    if not value:
+        return False
+    lowered = value.lower()
+    if lowered.startswith(("http://", "https://", "ftp://")):
+        return False
+    if value.startswith("-") or value.startswith("/"):
+        # keep drive-letter paths like C:/x
+        if re.match(r"^[A-Za-z]:[\\/]", value):
+            return True
+        return False
+    if re.match(r"^[A-Za-z]:[\\/]", value):
+        return True
+    if value.startswith(("\\\\", "/")):
+        return True
+    if any(ch in value for ch in ("\\", "/")):
+        return True
+    if "." in value:
+        return True
+    return False
+
+
+def _resolve_candidate_path(token: str, project_root: str) -> str:
+    value = str(token or "").strip().strip("'\"")
+    if not value:
+        return ""
+    if lowered := value.lower():
+        if lowered.startswith(("http://", "https://", "ftp://")):
+            return ""
+    expanded = os.path.expandvars(os.path.expanduser(value))
+    if os.path.isabs(expanded):
+        return os.path.abspath(os.path.normpath(expanded))
+    base = os.path.abspath(project_root or os.getcwd())
+    return os.path.abspath(os.path.normpath(os.path.join(base, expanded)))
+
+
+def _is_within_workspace(path_value: str, project_root: str) -> bool:
+    try:
+        candidate = os.path.abspath(path_value)
+        root = os.path.abspath(project_root or os.getcwd())
+        return os.path.commonpath([candidate, root]) == root
+    except Exception:
+        return False
+
+
+def _run_cmd_uses_network(command_text: str, tokens: List[str]) -> bool:
+    lowered = str(command_text or "").strip().lower()
+    if any(marker in lowered for marker in NETWORK_COMMAND_MARKERS):
+        return True
+    if tokens:
+        first = os.path.basename(tokens[0]).lower().replace(".exe", "")
+        if first in {"curl", "wget"}:
+            return True
+        if first in {"pip", "pip3"} and "install" in [str(t).lower() for t in tokens[1:3]]:
+            return True
+        if first == "npm" and "install" in [str(t).lower() for t in tokens[1:3]]:
+            return True
+    return False
+
+
+def _destructive_paths_outside_workspace(command_text: str, tokens: List[str], project_root: str) -> List[str]:
+    if not tokens:
+        return []
+    first = os.path.basename(tokens[0]).lower().replace(".exe", "")
+    lowered = f" {str(command_text or '').lower()} "
+    is_destructive = first in DESTRUCTIVE_BASE_COMMANDS or any(token in lowered for token in DANGEROUS_TOKENS)
+    if first == "git":
+        sub = tokens[1].lower() if len(tokens) > 1 else ""
+        if sub in DESTRUCTIVE_GIT_SUBCOMMANDS:
+            is_destructive = True
+    if not is_destructive:
+        return []
+
+    candidate_tokens: List[str] = []
+    for token in tokens[1:]:
+        normalized = str(token or "").strip().strip("'\"")
+        if not normalized:
+            continue
+        if normalized.startswith("-"):
+            continue
+        if normalized in {"*", "."}:
+            continue
+        if _is_path_like_token(normalized):
+            candidate_tokens.append(normalized)
+
+    for match in re.findall(r"[A-Za-z]:\\[^\"'\s]+", command_text or ""):
+        candidate_tokens.append(match)
+
+    outside = []
+    for token in candidate_tokens:
+        resolved = _resolve_candidate_path(token, project_root)
+        if not resolved:
+            continue
+        if not _is_within_workspace(resolved, project_root):
+            outside.append(token)
+    return outside
 
 
 def classify_run_cmd_permission(cmd_value, project_root=None) -> str:
@@ -288,6 +417,49 @@ def authorize_action(
     args = dict(args or {})
     target_text = _rule_target_text(action, args)
     required_mode = required_mode_for_action(action, args, project_root=project_root)
+    network_enabled = bool(getattr(config, "NETWORK_ENABLED", True))
+
+    if action in {"answer", "final_answer"}:
+        return {
+            "allowed": True,
+            "current_mode": mode,
+            "required_mode": "read-only",
+            "reason": "Answer action is always allowed.",
+            "rule": "answer_always_allowed",
+        }
+
+    if action in {"http_get", "download_file"} and not network_enabled:
+        return {
+            "allowed": False,
+            "current_mode": mode,
+            "required_mode": required_mode,
+            "reason": "Network access is disabled by configuration (NETWORK_ENABLED=OFF).",
+            "rule": "network_disabled",
+        }
+
+    if action == "run_cmd":
+        command_text = _normalize_command_text(args.get("cmd", ""))
+        tokens = _tokenize_command(command_text)
+        if (not network_enabled) and _run_cmd_uses_network(command_text, tokens):
+            return {
+                "allowed": False,
+                "current_mode": mode,
+                "required_mode": required_mode,
+                "reason": "Network access is disabled by configuration (NETWORK_ENABLED=OFF).",
+                "rule": "network_disabled",
+            }
+        outside_targets = _destructive_paths_outside_workspace(command_text, tokens, project_root or os.getcwd())
+        if outside_targets:
+            preview = ", ".join(outside_targets[:4])
+            if len(outside_targets) > 4:
+                preview += ", ..."
+            return {
+                "allowed": False,
+                "current_mode": mode,
+                "required_mode": required_mode,
+                "reason": f"Destructive command targets path outside workspace: {preview}",
+                "rule": "outside_workspace_destructive",
+            }
 
     deny_rule = next((rule for rule in deny_rules if rule.matches(action, target_text)), None)
     if deny_rule is not None:

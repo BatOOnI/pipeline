@@ -1,6 +1,7 @@
 import os
 import re
 import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
@@ -19,8 +20,52 @@ from git_tools import (
 )
 from preflight_doctor import run_preflight_doctor
 from providers import list_models
-from session_state_store import append_journal_event, journal_path_for
+from local_presets import delete_local_preset, load_local_presets, upsert_local_preset
+from session_state_store import append_journal_event, journal_path_for, load_latest_session_snapshot
+from session_resume import build_resume_summary, format_resume_status
 from utils import approx_token_count, coerce_int, ensure_gitignore, open_path, read_json_file, write_json_file
+
+
+class _SimpleTooltip:
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = str(text or "")
+        self.tipwindow = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _show(self, _event=None):
+        if self.tipwindow or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 12
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+        except Exception:
+            return
+        tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = ttk.Label(
+            tw,
+            text=self.text,
+            justify="left",
+            background="#ffffe0",
+            relief="solid",
+            borderwidth=1,
+            padding=(6, 4),
+        )
+        label.pack()
+        self.tipwindow = tw
+
+    def _hide(self, _event=None):
+        tw = self.tipwindow
+        self.tipwindow = None
+        if tw is not None:
+            try:
+                tw.destroy()
+            except Exception:
+                pass
 
 
 class App:
@@ -45,6 +90,17 @@ class App:
         "SOURCE FILE POLICY:",
         "DERIVED FILES ALLOWED:",
         "LARGE FILE MODE:",
+        "PROMPT:",
+        "PARSE PATH:",
+        "RAW RESPONSE:",
+        "RAW RESPONSE COLLAPSED:",
+        "GIT CHECKPOINT TARGET:",
+        "GIT CHECKPOINT CONTEXT:",
+        "PROGRESS APPLIED -> CONTINUE",
+        "NO REAL PROGRESS -> CONTINUE",
+        "NO CHANGES MADE",
+        "No files were modified.",
+        "No commands were executed.",
         "GIT CHECKPOINT OK",
     )
 
@@ -115,8 +171,12 @@ class App:
         self.timeout_dialog_event = None
         self.iteration_limit_dialog = None
         self.iteration_limit_dialog_event = None
+        self.permission_dialog = None
+        self.permission_dialog_event = None
         self.doctor_dialog = None
         self.settings_path = os.path.abspath(os.path.join(os.getcwd(), ".agent", "gui_settings.json"))
+        self.presets_path = os.path.abspath(os.path.join(os.getcwd(), ".agent", "prompt_presets.json"))
+        self._local_presets = {}
         self._saved_prompt_text = ""
         self._saved_session_base_prompt = ""
         self._session_base_prompt = ""
@@ -125,20 +185,27 @@ class App:
         self._active_collapse_lines = []
         self._log_records = []
         self._iter_record_seq = 1
+        self._permission_decision_cache = {}
+        self._warned_internal_contexts = set()
+        self._last_log_ts = time.monotonic()
+        self._run_watchdog_token = 0
 
         self._build_vars()
         self._load_gui_settings()
+        self._load_local_presets_state()
         self._build_ui()
         self._apply_loaded_prompt()
         self._bind_events()
         self._refresh_prompt_metrics()
         self._update_session_anchor()
+        self._refresh_resume_state(load_prompt=False, write_log=False)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_vars(self):
         self.provider_var = tk.StringVar(value=config.PROVIDER)
         self.mode_control_var = tk.StringVar(value=str(getattr(config, "MODE_CONTROL", "AUTO") or "AUTO").upper())
         self.rescue_mode_var = tk.StringVar(value=str(getattr(config, "RESCUE_MODE", "OFF") or "OFF").upper())
+        self.permission_mode_var = tk.StringVar(value=str(getattr(config, "PERMISSION_MODE", "workspace-write") or "workspace-write").strip().lower())
         self.lm_url_var = tk.StringVar(value=config.LMSTUDIO_URL)
         self.lm_model_var = tk.StringVar(value=config.LMSTUDIO_MODEL)
         self.lm_key_var = tk.StringVar(value=str(getattr(config, "LMSTUDIO_API_KEY", "") or ""))
@@ -149,9 +216,13 @@ class App:
         self.run_timeout_var = tk.StringVar(value=str(config.RUN_TIMEOUT))
         self.model_timeout_var = tk.StringVar(value=str(config.MODEL_TIMEOUT))
         self.auto_run_var = tk.BooleanVar(value=config.AUTO_RUN_COMMANDS)
+        self.network_enabled_var = tk.BooleanVar(value=bool(getattr(config, "NETWORK_ENABLED", True)))
         self.collapse_logs_var = tk.BooleanVar(value=True)
+        self.wrap_logs_var = tk.BooleanVar(value=True)
         self.run_mode_var = tk.StringVar(value="Start")
         self.session_anchor_var = tk.StringVar(value="Session anchor: (none)")
+        self.resume_status_var = tk.StringVar(value="Resume: no prior session state")
+        self.preset_name_var = tk.StringVar(value="")
 
         self.prompt_chars_var = tk.StringVar(value="0")
         self.estimated_tokens_var = tk.StringVar(value="0")
@@ -198,6 +269,7 @@ class App:
         log_toolbar = ttk.Frame(log_box)
         log_toolbar.grid(row=0, column=0, sticky="we", pady=(0, 4))
         ttk.Checkbutton(log_toolbar, text="Collapse Repeats", variable=self.collapse_logs_var, command=self._on_collapse_toggle).pack(side="left")
+        ttk.Checkbutton(log_toolbar, text="Wrap Lines", variable=self.wrap_logs_var, command=self._on_wrap_toggle).pack(side="left", padx=(8, 0))
         ttk.Label(log_toolbar, text="Legend: green=success, yellow=progress, red=errors, blue=sections").pack(side="left", padx=(12, 0))
         ttk.Button(log_toolbar, text="Clear View", command=self._clear_log_view).pack(side="right")
 
@@ -219,8 +291,10 @@ class App:
         y_scroll.grid(row=0, column=1, sticky="ns")
         x_scroll = ttk.Scrollbar(log_body, orient="horizontal", command=self.log_text.xview)
         x_scroll.grid(row=1, column=0, sticky="we")
+        self.log_x_scroll = x_scroll
         self.log_text.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
         self._init_log_tags()
+        self._apply_log_wrap_mode()
 
         composer_box = ttk.LabelFrame(main, text="Prompt Composer", padding=(8, 8, 8, 8))
         composer_box.grid(row=2, column=0, sticky="we", pady=(8, 0))
@@ -247,7 +321,7 @@ class App:
         ttk.Combobox(
             run_row,
             textvariable=self.run_mode_var,
-            values=["Start", "Start Fresh", "Continue"],
+            values=["Start", "Start Fresh", "Continue", "Resume"],
             width=12,
             state="readonly",
         ).grid(row=0, column=1, sticky="w", padx=(6, 10))
@@ -258,6 +332,23 @@ class App:
         anchor_row = ttk.Frame(composer_box)
         anchor_row.grid(row=3, column=0, sticky="we", pady=(6, 0))
         ttk.Label(anchor_row, textvariable=self.session_anchor_var, foreground="#2f4f6f").pack(side="left")
+        ttk.Button(anchor_row, text="Resume Status", command=self.refresh_resume_status).pack(side="right", padx=(6, 0))
+        ttk.Button(anchor_row, text="Load Last Prompt", command=self.load_last_prompt_from_session).pack(side="right")
+
+        resume_row = ttk.Frame(composer_box)
+        resume_row.grid(row=4, column=0, sticky="we", pady=(4, 0))
+        ttk.Label(resume_row, textvariable=self.resume_status_var, foreground="#355e8d").pack(side="left")
+
+        preset_row = ttk.Frame(composer_box)
+        preset_row.grid(row=5, column=0, sticky="we", pady=(6, 0))
+        ttk.Label(preset_row, text="Preset").pack(side="left")
+        self.preset_combo = ttk.Combobox(preset_row, textvariable=self.preset_name_var, width=28)
+        self.preset_combo.pack(side="left", padx=(6, 8))
+        ttk.Button(preset_row, text="Save", command=self.save_prompt_preset).pack(side="left", padx=(0, 6))
+        ttk.Button(preset_row, text="Load", command=self.load_prompt_preset).pack(side="left", padx=(0, 6))
+        ttk.Button(preset_row, text="Insert", command=self.insert_prompt_preset).pack(side="left", padx=(0, 6))
+        ttk.Button(preset_row, text="Delete", command=self.delete_prompt_preset).pack(side="left")
+        self._refresh_preset_values()
 
         self.advanced_panel = ttk.LabelFrame(main, text="Advanced Settings", padding=(8, 8, 8, 8))
         self.advanced_panel.grid(row=3, column=0, sticky="we", pady=(8, 0))
@@ -302,6 +393,22 @@ class App:
             state="readonly",
         ).grid(row=2, column=3, sticky="w", **pad)
         ttk.Checkbutton(runtime_tab, text="Auto run commands", variable=self.auto_run_var).grid(row=3, column=0, columnspan=2, sticky="w", **pad)
+        network_toggle = ttk.Checkbutton(runtime_tab, text="Internet for run_cmd", variable=self.network_enabled_var)
+        network_toggle.grid(row=4, column=0, columnspan=2, sticky="w", **pad)
+        _SimpleTooltip(
+            network_toggle,
+            "Controls network for tool actions: run_cmd/http_get/download_file.\n"
+            "OFF blocks network calls by the pipeline tools.\n"
+            "Does not disable provider API traffic (LM Studio/OpenAI).",
+        )
+        ttk.Label(runtime_tab, text="Permission mode").grid(row=3, column=2, sticky="w", **pad)
+        ttk.Combobox(
+            runtime_tab,
+            textvariable=self.permission_mode_var,
+            values=["workspace-write", "read-only", "danger-full-access", "prompt", "allow"],
+            width=20,
+            state="readonly",
+        ).grid(row=3, column=3, sticky="w", **pad)
 
         provider_tab = ttk.Frame(tabs)
         provider_tab.columnconfigure(1, weight=1)
@@ -399,8 +506,125 @@ class App:
         preview = anchor if len(anchor) <= 160 else (anchor[:157].rstrip() + "...")
         self.session_anchor_var.set(f"Session anchor: {preview}")
 
+    def _warn_internal(self, context, exc, once=True):
+        key = str(context or "").strip() or "internal"
+        if once and key in self._warned_internal_contexts:
+            return
+        if once:
+            self._warned_internal_contexts.add(key)
+        message = f"INTERNAL WARNING: {key}: {exc}"
+        if hasattr(self, "log_text"):
+            try:
+                self.log(message)
+                return
+            except Exception:
+                pass
+        try:
+            print(message)
+        except Exception:
+            pass
+
+    def _load_local_presets_state(self):
+        try:
+            self._local_presets = load_local_presets(self.presets_path)
+        except Exception as exc:
+            self._local_presets = {}
+            self._warn_internal("local preset load failed", exc)
+
+    def _refresh_preset_values(self):
+        names = list(self._local_presets.keys())
+        if hasattr(self, "preset_combo"):
+            self.preset_combo["values"] = names
+        current = str(self.preset_name_var.get() or "").strip()
+        if not current and names:
+            self.preset_name_var.set(names[0])
+        elif current and current not in self._local_presets:
+            if names:
+                self.preset_name_var.set(names[0])
+
+    def _default_preset_name(self):
+        prompt = self.prompt_text.get("1.0", "end-1c").strip() if hasattr(self, "prompt_text") else ""
+        if not prompt:
+            return ""
+        first_line = prompt.splitlines()[0].strip()
+        cleaned = re.sub(r"\s+", " ", first_line)
+        if len(cleaned) > 48:
+            cleaned = cleaned[:48].rstrip()
+        return cleaned
+
+    def save_prompt_preset(self):
+        name = str(self.preset_name_var.get() or "").strip() or self._default_preset_name()
+        prompt = self.prompt_text.get("1.0", "end-1c").strip()
+        if not name:
+            messagebox.showwarning("Preset", "Enter preset name first.")
+            return
+        if not prompt:
+            messagebox.showwarning("Preset", "Prompt is empty.")
+            return
+        try:
+            self._local_presets = upsert_local_preset(self.presets_path, name, prompt)
+        except Exception as exc:
+            messagebox.showerror("Preset", str(exc))
+            return
+        self.preset_name_var.set(name)
+        self._refresh_preset_values()
+        self._save_gui_settings()
+        self.log(f"PRESET SAVED: {name}")
+
+    def load_prompt_preset(self):
+        name = str(self.preset_name_var.get() or "").strip()
+        if not name:
+            messagebox.showwarning("Preset", "Select preset first.")
+            return
+        text = str(self._local_presets.get(name) or "").strip()
+        if not text:
+            messagebox.showwarning("Preset", "Preset not found.")
+            return
+        self.prompt_text.delete("1.0", "end")
+        self.prompt_text.insert("1.0", text)
+        self.prompt_text.edit_modified(False)
+        self._refresh_prompt_metrics()
+        self._save_gui_settings()
+        self.log(f"PRESET LOADED: {name}")
+
+    def insert_prompt_preset(self):
+        name = str(self.preset_name_var.get() or "").strip()
+        if not name:
+            messagebox.showwarning("Preset", "Select preset first.")
+            return
+        text = str(self._local_presets.get(name) or "").strip()
+        if not text:
+            messagebox.showwarning("Preset", "Preset not found.")
+            return
+        current = self.prompt_text.get("1.0", "end-1c")
+        if current.strip():
+            self.prompt_text.insert("end", "\n\n" + text)
+        else:
+            self.prompt_text.insert("1.0", text)
+        self.prompt_text.edit_modified(False)
+        self._refresh_prompt_metrics()
+        self._save_gui_settings()
+        self.log(f"PRESET INSERTED: {name}")
+
+    def delete_prompt_preset(self):
+        name = str(self.preset_name_var.get() or "").strip()
+        if not name:
+            messagebox.showwarning("Preset", "Select preset first.")
+            return
+        if not messagebox.askyesno("Preset", f"Delete preset '{name}'?"):
+            return
+        self._local_presets = delete_local_preset(self.presets_path, name)
+        if self.preset_name_var.get().strip() == name:
+            self.preset_name_var.set("")
+        self._refresh_preset_values()
+        self._save_gui_settings()
+        self.log(f"PRESET DELETED: {name}")
+
     def run_selected_mode(self):
         mode = str(self.run_mode_var.get() or "").strip().lower()
+        if mode == "resume":
+            self.start_resume_run()
+            return
         if mode == "continue":
             self.start_continue_run()
             return
@@ -408,6 +632,60 @@ class App:
             self.start_fresh_run()
             return
         self.start_pipeline()
+
+    def _current_session_paths(self):
+        session_path = os.path.abspath(os.path.join(os.getcwd(), config.SESSION_FILE))
+        journal_path = journal_path_for(session_path)
+        journal_present = bool(
+            os.path.exists(journal_path)
+            or os.path.exists(f"{journal_path}.1")
+            or os.path.exists(f"{journal_path}.2")
+            or os.path.exists(f"{journal_path}.3")
+        )
+        return session_path, journal_path, journal_present
+
+    def _load_resume_summary(self):
+        session_path, _journal_path, journal_present = self._current_session_paths()
+        snapshot = load_latest_session_snapshot(session_path)
+        if not snapshot:
+            snapshot = read_json_file(session_path, default={})
+            if not isinstance(snapshot, dict):
+                snapshot = {}
+        return build_resume_summary(
+            snapshot,
+            session_path=session_path,
+            journal_present=journal_present,
+        )
+
+    def _refresh_resume_state(self, load_prompt=False, write_log=True):
+        summary = self._load_resume_summary()
+        self.resume_status_var.set(format_resume_status(summary))
+        base_prompt = str(summary.get("base_prompt") or "").strip()
+        latest_prompt = str(summary.get("latest_prompt") or "").strip()
+        if base_prompt and not str(self._session_base_prompt or "").strip():
+            self._session_base_prompt = base_prompt
+        if load_prompt and latest_prompt:
+            self.prompt_text.delete("1.0", "end")
+            self.prompt_text.insert("1.0", latest_prompt)
+            self.prompt_text.edit_modified(False)
+            self._refresh_prompt_metrics()
+        self._update_session_anchor()
+        if write_log:
+            if summary.get("has_state"):
+                self.log("RESUME STATUS: state loaded from session/journal")
+            else:
+                self.log("RESUME STATUS: no existing session state found")
+        return summary
+
+    def refresh_resume_status(self):
+        self._refresh_resume_state(load_prompt=False, write_log=True)
+
+    def load_last_prompt_from_session(self):
+        summary = self._refresh_resume_state(load_prompt=True, write_log=True)
+        if summary.get("has_state") and str(summary.get("latest_prompt") or "").strip():
+            self.log("RESUME PROMPT: loaded last prompt from session state")
+        else:
+            self.log("RESUME PROMPT: no stored prompt found")
 
     def _doctor_summary_text(self, report):
         summary = dict(report.get("summary") or {})
@@ -586,12 +864,20 @@ class App:
         if rescue_mode not in {"OFF", "ON", "ASK_BEFORE_RESCUE"}:
             rescue_mode = "OFF"
         config.RESCUE_MODE = rescue_mode
+        config.PERMISSION_MODE = self._normalize_permission_mode(self.permission_mode_var.get())
+        config.NETWORK_ENABLED = bool(self.network_enabled_var.get())
 
     def _normalize_project_root(self, path):
         path = str(path or "").strip()
         if not path:
             return ""
         return os.path.abspath(os.path.normpath(path))
+
+    def _normalize_permission_mode(self, value):
+        mode = str(value or "workspace-write").strip().lower()
+        if mode not in {"read-only", "workspace-write", "danger-full-access", "prompt", "allow"}:
+            mode = "workspace-write"
+        return mode
 
     def _clear_log_view(self):
         self.log_text.delete("1.0", "end")
@@ -601,6 +887,18 @@ class App:
         if not self.collapse_logs_var.get():
             self._flush_pending_collapse_to_records()
         self._render_log_view()
+
+    def _on_wrap_toggle(self):
+        self._apply_log_wrap_mode()
+
+    def _apply_log_wrap_mode(self):
+        wrap_enabled = bool(self.wrap_logs_var.get())
+        self.log_text.configure(wrap=("word" if wrap_enabled else "none"))
+        if hasattr(self, "log_x_scroll") and self.log_x_scroll is not None:
+            if wrap_enabled:
+                self.log_x_scroll.grid_remove()
+            else:
+                self.log_x_scroll.grid(row=1, column=0, sticky="we")
 
     def _reset_log_collapse_state(self):
         self._meta_last_values = {}
@@ -782,6 +1080,7 @@ class App:
         self.root.after(0, lambda: self._append_log(msg))
 
     def _append_log(self, msg):
+        self._last_log_ts = time.monotonic()
         text = str(msg)
         lines = text.splitlines() or [text]
         collapse_enabled = bool(self.collapse_logs_var.get())
@@ -819,6 +1118,41 @@ class App:
         self._render_log_view()
         self.log_text.see("end")
 
+    def _start_run_watchdog(self):
+        self._run_watchdog_token += 1
+        token = self._run_watchdog_token
+        self._last_log_ts = time.monotonic()
+
+        def tick():
+            if token != self._run_watchdog_token:
+                return
+            worker = self.worker
+            if worker is None or not worker.is_alive():
+                return
+            # Keep watchdog silent to avoid noisy repeated log spam while model is working.
+            self.root.after(3000, tick)
+
+        self.root.after(3000, tick)
+
+    def _start_worker_bootstrap_probe(self):
+        token = self._run_watchdog_token
+
+        def probe():
+            if token != self._run_watchdog_token:
+                return
+            worker = self.worker
+            status = str(self.status_label.cget("text") or "")
+            if worker is None:
+                if status == "Running":
+                    self._append_log("RUNNING: worker not initialized yet.")
+                return
+            if not worker.is_alive() and status == "Running":
+                self._append_log("ERROR: worker exited before pipeline emitted startup logs.")
+                self.status_label.config(text="Failed")
+                return
+
+        self.root.after(2200, probe)
+
     def apply_config(self):
         config.PROVIDER = self.provider_var.get().strip()
         mode_control = str(self.mode_control_var.get() or "AUTO").strip().upper()
@@ -831,6 +1165,9 @@ class App:
             rescue_mode = "OFF"
         self.rescue_mode_var.set(rescue_mode)
         config.RESCUE_MODE = rescue_mode
+        permission_mode = self._normalize_permission_mode(self.permission_mode_var.get())
+        self.permission_mode_var.set(permission_mode)
+        config.PERMISSION_MODE = permission_mode
         config.LMSTUDIO_URL = self.lm_url_var.get().strip()
         config.LMSTUDIO_MODEL = self.lm_model_var.get().strip()
         config.LMSTUDIO_API_KEY = self.lm_key_var.get().strip()
@@ -843,6 +1180,7 @@ class App:
         config.RUN_TIMEOUT = coerce_int(self.run_timeout_var.get(), 15, minimum=1, maximum=600)
         config.MODEL_TIMEOUT = coerce_int(self.model_timeout_var.get(), 120, minimum=5, maximum=3600)
         config.AUTO_RUN_COMMANDS = bool(self.auto_run_var.get())
+        config.NETWORK_ENABLED = bool(self.network_enabled_var.get())
 
     def _load_gui_settings(self):
         data = read_json_file(self.settings_path, default={})
@@ -865,6 +1203,9 @@ class App:
         rescue_mode = str(data.get("rescue_mode", "")).strip().upper()
         if rescue_mode in {"OFF", "ON", "ASK_BEFORE_RESCUE"}:
             self.rescue_mode_var.set(rescue_mode)
+        permission_mode = self._normalize_permission_mode(data.get("permission_mode", ""))
+        if permission_mode:
+            self.permission_mode_var.set(permission_mode)
         lm_model = str(data.get("lm_model", "")).strip()
         if lm_model:
             self.lm_model_var.set(lm_model)
@@ -885,9 +1226,16 @@ class App:
             self.model_timeout_var.set(str(data.get("model_timeout")))
         if "auto_run_commands" in data:
             self.auto_run_var.set(bool(data.get("auto_run_commands")))
+        if "network_enabled" in data:
+            self.network_enabled_var.set(bool(data.get("network_enabled")))
+        if "wrap_logs" in data:
+            self.wrap_logs_var.set(bool(data.get("wrap_logs")))
         run_mode = str(data.get("run_mode", "")).strip()
-        if run_mode in {"Start", "Start Fresh", "Continue"}:
+        if run_mode in {"Start", "Start Fresh", "Continue", "Resume"}:
             self.run_mode_var.set(run_mode)
+        preset_name = str(data.get("preset_name", "")).strip()
+        if preset_name:
+            self.preset_name_var.set(preset_name)
         self._saved_prompt_text = str(data.get("last_prompt", "") or "")
         self._saved_session_base_prompt = str(data.get("session_base_prompt", "") or "")
         self._session_base_prompt = str(self._saved_session_base_prompt or "").strip()
@@ -903,9 +1251,11 @@ class App:
             "last_prompt": prompt_value,
             "session_base_prompt": str(self._session_base_prompt or ""),
             "run_mode": str(self.run_mode_var.get() or "Start"),
+            "preset_name": str(self.preset_name_var.get() or "").strip(),
             "provider": self.provider_var.get().strip(),
             "mode_control": self.mode_control_var.get().strip().upper(),
             "rescue_mode": self.rescue_mode_var.get().strip().upper(),
+            "permission_mode": self._normalize_permission_mode(self.permission_mode_var.get()),
             "lm_url": self.lm_url_var.get().strip(),
             "lm_model": self.lm_model_var.get().strip(),
             "openai_model": self.oa_model_var.get().strip(),
@@ -914,6 +1264,8 @@ class App:
             "run_timeout": self.run_timeout_var.get().strip(),
             "model_timeout": self.model_timeout_var.get().strip(),
             "auto_run_commands": bool(self.auto_run_var.get()),
+            "network_enabled": bool(self.network_enabled_var.get()),
+            "wrap_logs": bool(self.wrap_logs_var.get()),
         }
         write_json_file(self.settings_path, payload)
 
@@ -1120,6 +1472,134 @@ class App:
                 self.root.after(0, lambda: close_dialog("kill"))
         return decision["value"]
 
+    def _permission_request_key(self, request):
+        if not isinstance(request, dict):
+            return ""
+        action = str(request.get("action_type") or "").strip().lower()
+        required_mode = str(request.get("required_mode") or "").strip().lower()
+        target = str(request.get("target") or "").strip().lower()
+        if not target and isinstance(request.get("args"), dict):
+            args = dict(request.get("args") or {})
+            target = str(args.get("path") or args.get("cmd") or "").strip().lower()
+        return f"{action}|{required_mode}|{target}"
+
+    def handle_permission_request(self, request):
+        request = dict(request or {})
+        cache_key = self._permission_request_key(request)
+        if cache_key and cache_key in self._permission_decision_cache:
+            cached_allowed = bool(self._permission_decision_cache.get(cache_key))
+            if cached_allowed:
+                return {"decision": "allow", "reason": "Approved by remembered decision for this run."}
+            return {"decision": "deny", "reason": "Denied by remembered decision for this run."}
+
+        decision = {"value": {"decision": "deny", "reason": "Approval denied."}}
+        finished = threading.Event()
+
+        def close_dialog(result):
+            if finished.is_set():
+                return
+            decision["value"] = result
+            finished.set()
+            dialog = self.permission_dialog
+            self.permission_dialog = None
+            self.permission_dialog_event = None
+            if dialog is not None and dialog.winfo_exists():
+                dialog.grab_release()
+                dialog.destroy()
+
+        def show_dialog():
+            if self.permission_dialog is not None and self.permission_dialog.winfo_exists():
+                try:
+                    self.permission_dialog.destroy()
+                except Exception:
+                    pass
+
+            action_type = str(request.get("action_type") or "").strip()
+            current_mode = str(request.get("current_mode") or "").strip()
+            required_mode = str(request.get("required_mode") or "").strip()
+            reason = str(request.get("reason") or "Permission check requires confirmation.").strip()
+            target = str(request.get("target") or "").strip()
+            args = dict(request.get("args") or {})
+            if not target:
+                target = str(args.get("path") or args.get("cmd") or "").strip()
+            target_preview = target if len(target) <= 220 else (target[:217].rstrip() + "...")
+            details = (
+                f"Action: {action_type or '(unknown)'}\n"
+                f"Current mode: {current_mode or '(unknown)'}\n"
+                f"Required mode: {required_mode or '(unknown)'}\n"
+                f"Target: {target_preview or '(none)'}\n\n"
+                f"Reason:\n{reason}"
+            )
+
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Permission Approval")
+            dialog.transient(self.root)
+            dialog.grab_set()
+            try:
+                dialog.attributes("-topmost", True)
+                dialog.after(400, lambda: dialog.attributes("-topmost", False))
+            except Exception:
+                pass
+            dialog.resizable(False, False)
+            ttk.Label(
+                dialog,
+                text="Pipeline requested an action that needs approval.",
+                foreground="#8a6d1f",
+            ).pack(anchor="w", padx=14, pady=(12, 8))
+            body = tk.Text(dialog, height=10, width=88, wrap="word")
+            body.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+            body.insert("1.0", details)
+            body.configure(state="disabled")
+
+            btns = ttk.Frame(dialog)
+            btns.pack(fill="x", padx=14, pady=(0, 12))
+
+            def choose(allow, remember=False):
+                result = {
+                    "decision": "allow" if allow else "deny",
+                    "reason": "Approved by user." if allow else "Denied by user.",
+                }
+                if remember and cache_key:
+                    self._permission_decision_cache[cache_key] = bool(allow)
+                    result["reason"] = (
+                        "Approved and remembered for this run."
+                        if allow
+                        else "Denied and remembered for this run."
+                    )
+                self.log(
+                    f"PERMISSION PROMPT: {'allow' if allow else 'deny'} "
+                    f"action={action_type or '(unknown)'} remember={'yes' if remember else 'no'}"
+                )
+                close_dialog(result)
+
+            ttk.Button(btns, text="Allow Once", command=lambda: choose(True, remember=False)).pack(side="left", padx=(0, 6))
+            ttk.Button(btns, text="Allow + Remember", command=lambda: choose(True, remember=True)).pack(side="left", padx=(0, 12))
+            ttk.Button(btns, text="Deny Once", command=lambda: choose(False, remember=False)).pack(side="left", padx=(0, 6))
+            ttk.Button(btns, text="Deny + Remember", command=lambda: choose(False, remember=True)).pack(side="left")
+
+            dialog.protocol("WM_DELETE_WINDOW", lambda: choose(False, remember=False))
+            self.permission_dialog = dialog
+            self.permission_dialog_event = finished
+
+            def poll_dialog():
+                if finished.is_set():
+                    return
+                if self.stop_flag:
+                    close_dialog({"decision": "deny", "reason": "Run stopping; permission request cancelled."})
+                    return
+                dialog.after(200, poll_dialog)
+
+            poll_dialog()
+
+        self.root.after(0, show_dialog)
+        while not finished.wait(0.2):
+            if self.stop_flag:
+                self.root.after(
+                    0,
+                    lambda: close_dialog({"decision": "deny", "reason": "Run stopping; permission request cancelled."}),
+                )
+        return decision["value"]
+
     def _launch_pipeline(self, prompt, run_mode_label="MODE: run_start", continue_update=""):
         if self.worker and self.worker.is_alive():
             messagebox.showinfo("Busy", "Pipeline is already running.")
@@ -1132,12 +1612,25 @@ class App:
         self.apply_config()
         self._save_gui_settings()
         self.stop_flag = False
+        self._permission_decision_cache = {}
         self._clear_log_view()
         self.status_label.config(text="Running")
         self._append_log(run_mode_label)
+        self._append_log("RUNNING: starting worker thread...")
+        self._start_run_watchdog()
+        self._start_worker_bootstrap_probe()
+        followup = str(continue_update or "").strip()
+        if followup:
+            self._append_log("CONTINUE PROMPT BEGIN")
+            for row in followup.splitlines():
+                line = str(row or "").rstrip()
+                if line:
+                    self._append_log(f"CONTINUE PROMPT: {line}")
+            self._append_log("CONTINUE PROMPT END")
 
         def job():
             try:
+                self.log("RUNNING: worker thread started, entering pipeline loop...")
                 pipeline_run(
                     prompt,
                     continue_update=continue_update,
@@ -1146,6 +1639,7 @@ class App:
                     model_timeout_handler=self.handle_model_timeout,
                     rescue_decider=self.handle_rescue_request,
                     max_iterations_handler=self.handle_iteration_limit,
+                    permission_decider=self.handle_permission_request,
                 )
                 self.log("PIPELINE FINISHED")
                 if config.ACTIVE_PROJECT_ROOT:
@@ -1168,6 +1662,7 @@ class App:
         if started:
             self._session_base_prompt = prompt
             self._update_session_anchor()
+            self._refresh_resume_state(load_prompt=False, write_log=False)
             self._save_gui_settings()
 
     def start_continue_run(self):
@@ -1176,6 +1671,9 @@ class App:
             messagebox.showwarning("Missing continue prompt", "Enter a small follow-up instruction first.")
             return
         base_prompt = str(self._session_base_prompt or "").strip()
+        if not base_prompt:
+            self._refresh_resume_state(load_prompt=False, write_log=False)
+            base_prompt = str(self._session_base_prompt or "").strip()
         if not base_prompt:
             base_prompt = str(self._saved_session_base_prompt or "").strip()
         if not base_prompt:
@@ -1188,10 +1686,29 @@ class App:
             continue_update=followup_prompt,
         )
         if started:
-            self.prompt_text.delete("1.0", "end")
-            self.prompt_text.edit_modified(False)
-            self._refresh_prompt_metrics()
             self._update_session_anchor()
+            self._refresh_resume_state(load_prompt=False, write_log=False)
+
+    def start_resume_run(self):
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("Busy", "Pipeline is already running.")
+            return
+        summary = self._refresh_resume_state(load_prompt=False, write_log=False)
+        base_prompt = str(summary.get("base_prompt") or "").strip()
+        if not base_prompt:
+            messagebox.showwarning("Resume unavailable", "No previous session prompt found. Use Start first.")
+            return
+        followup_prompt = self.prompt_text.get("1.0", "end").strip()
+        if not followup_prompt:
+            followup_prompt = "Continue from current session state. Finish remaining work only."
+        started = self._launch_pipeline(
+            base_prompt,
+            run_mode_label="MODE: run_resume",
+            continue_update=followup_prompt,
+        )
+        if started:
+            self.log("RESUME MODE: continuing from last session snapshot/journal")
+            self._refresh_resume_state(load_prompt=False, write_log=False)
 
     def start_fresh_run(self):
         if self.worker and self.worker.is_alive():
@@ -1211,12 +1728,13 @@ class App:
         project_root = self._normalize_project_root(self.project_root_var.get()) or config.ACTIVE_PROJECT_ROOT or ""
         try:
             clear_runtime_session(project_root or None)
-        except Exception:
-            pass
+        except Exception as exc:
+            self._warn_internal("clear runtime session failed", exc)
         config.ACTIVE_PROJECT_ROOT = ""
         self._session_base_prompt = ""
         self._saved_session_base_prompt = ""
         self._update_session_anchor()
+        self._refresh_resume_state(load_prompt=False, write_log=False)
         self._save_gui_settings()
         self.status_label.config(text="Session cleared")
         self.log("SESSION CLEARED")
@@ -1301,8 +1819,8 @@ class App:
         try:
             self.apply_config()
             self._save_gui_settings()
-        except Exception:
-            pass
+        except Exception as exc:
+            self._warn_internal("save settings on close failed", exc)
         self.root.destroy()
 
 

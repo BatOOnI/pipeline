@@ -169,6 +169,7 @@ def _action_aliases(action_type: str):
         "open_file": "read_file",
         "execute": "run_cmd",
         "run": "run_cmd",
+        "final_answer": "answer",
     }
     return aliases.get(action_type, action_type)
 
